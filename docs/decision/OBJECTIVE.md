@@ -6,9 +6,10 @@ a Jev-compatible API on top of one hardened, high-performance llama.cpp process.
 
 - Reference implementation: one fork primitive (`llama_memory_seq_cp`), generic
   `contexts` + `schema` shape only.
-- This implementation: keeps the generic shape as a compatibility alias and adds
-  the Jev `state` + `questions` shape, three fork strategies, a classifier answer
-  head, cancellation, and diagnostics.
+- This implementation: keeps the generic shape as a second front-end and adds
+  the Jev `state` + `questions` shape, three fork strategies, cancellation, and
+  diagnostics. The classifier answer head and its separate context were
+  removed; every readout uses full logits on the shared context.
 
 Everything below was measured on the same machine and the same GPU. Numbers are
 warm (`cache_prompt=true`), one context, `mode=auto`, flash attention off,
@@ -25,9 +26,10 @@ the same context, and the same model context parameters (`n_ctx=2048`,
   worktree, linked against the reference `llama-decision`, calls
   `engine::decide_batch`. The reference options have no `fork`; it always uses
   `seq_cp`.
-- This implementation: `bench-decision` with `--fork restore` (the explicit full
-  save/restore path) and with the default `auto` (hybrid on a recurrent/hybrid
-  model, copy on a dense model).
+- This implementation: the same engine driven by `test-decision-engine` with
+  the fork oracle, and by the server decision tests; the fork strategies
+  (`auto` = hybrid on a recurrent/hybrid model, copy on a dense model) and the
+  explicit `restore` path are exercised through the test harness.
 
 The fixture scores four fields: one 3-way enum, one boolean, one 4-level
 integer, and one 3-level number. Warm means the second call, so the cached
@@ -124,7 +126,8 @@ model's own token paths for the schema literals; there are no answer types, no
 calibrated confidence, and no natural-language options. One request is one
 schema; there is no session, permutations, temperature, head, or diagnostics.
 
-This implementation accepts the same legacy shape unchanged, plus the Jev shape:
+This implementation accepts the same generic shape as a second front-end, plus
+the Jev shape:
 
 ```json
 { "state": "...",
@@ -138,9 +141,9 @@ This implementation accepts the same legacy shape unchanged, plus the Jev shape:
 
 and returns `answers{}` with per-type payloads: `noul` (probability of yes),
 `choice` (`choice`, `probabilities`, `confidence`), `score` (`score`,
-`probabilities`, `legend`, `confidence`), plus optional `head` and
+`probabilities`, `legend`, `confidence`), plus optional
 `diagnostics`. This is a typed, calibrated, natural-language contract; the
-legacy shape is the JSON-literal subset.
+generic shape is the JSON-literal subset.
 
 The deeper difference is the readout:
 
@@ -149,8 +152,7 @@ The deeper difference is the readout:
   free-text options.
 - The Jev readout: score one verified label token per option, over a label pool
   built from the chat template boundary. This is what lets arbitrary
-  natural-language `criteria` become scorable, and it is the same label set the
-  optional classifier head reads.
+  natural-language `criteria` become scorable.
 
 Meaning in practice: the reference is a fast constrained-JSON endpoint. The
 implementation is a decision service. The Jev shape is a superset in
@@ -203,9 +205,9 @@ Implementation notes [Local]:
   `confidence_profile: "local"` returns `1 - H/log K` as `confidence`. The default
   stays `(N*p_max - 1)/(N - 1)`, matching Jev. `certainty` is unaffected by the
   profile. The profile changes only the reported concentration; probabilities are identical.
-- The benchmark surfaces record both: `bench-decision --json` reports
-  `metrics.<field>.{confidence,certainty}`, and the frozen readout baselines store both per
-  question.
+- The benchmark surfaces record both: the frozen readout baselines store
+  `confidence` and `certainty` per question, and the response `certainty` is
+  reported when `diagnostics` is set.
 - Definitions: `inverse_entropy_confidence` and `winner_share` in
   `tools/parallel-decision/decision-protocol.cpp`.
 ## 5. Process and hardening differences
@@ -221,13 +223,13 @@ decisions on one scheduler thread. This implementation adds:
   reference calls `handle_decision` directly and blocks them.
 - Guaranteed cleanup: `clear_pool_seqs` runs on every exit, so a failed or
   cancelled decision cannot leave cells that starve chat.
-- A classifier-only context and answer head, with a capability probe and an
-  automatic fallback to full logits; an explicit `head=selected` request is
-  refused when the model cannot serve it.
-- Diagnostics: contract hash, template hash, head fallback reason, and adapter
+- A single full-logits path on the shared context: the classifier-only
+  context and answer head were removed, so a decision never duplicates the KV
+  cache.
+- Diagnostics: contract hash, template hash, and adapter
   scope, plus `certainty` on choice/score.
-- Adapter scoping: the head path is refused with adapters configured, and the
-  full path reads base-scope logits.
+- Adapter scoping: decision decodes run on the base model, scoped while
+  chat applies its adapters.
 
 The reference is much simpler to read and maintain. Its failure modes are also
 simpler: no cancellation inside a multi-second decision, no yield, no
@@ -238,10 +240,10 @@ diagnostics, no typed answers.
 Target: one engine core, a Jev-compatible public API, and a hardened process
 behind it. Concretely:
 
-1. **Keep the Jev shape as the public contract, keep the legacy shape as an
-   alias.** Route both shapes through one scorer so the answer path cannot
-   drift (this implementation already does this). Do not grow a second scorer
-   for the legacy shape.
+1. **Keep the Jev shape as the public contract, keep the generic shape as a
+   second front-end.** Route both shapes through one scorer so the answer path
+   cannot drift (this implementation already does this). Do not grow a second
+   scorer for the generic shape.
 
 2. **Keep the hybrid default and the fork oracle.** It is at parity with the
    reference and gives a byte-level guarantee. Do not "simplify" to plain
@@ -258,19 +260,17 @@ behind it. Concretely:
 4. **Adopt the reference's lean engine surface as the single core.** The
    reference's `decide`/`decide_batch`, `score_branches`, `compile_schema`, and
    `render_prompt` are the right shape. Keep the additions (fork axis,
-   letter readout, head) as options on that core, not as parallel code.
+   letter readout) as options on that core, not as parallel code.
 
 5. **Keep the hardening.** Cancellation, yielding, cleanup on every exit, the
-   head capability probe and fallback, and the adapter scope guard are the
+   base-model adapter scope, and the admission and fairness gates are the
    difference between a demo endpoint and a service. Preserve them, and keep
    the admission and fairness gates that bound a decision's effect on chat.
 
 6. **Make the Jev envelope exact.** `usage.output_tokens` must stay 0 (a
-   decision generates nothing), `legend` must echo the request verbatim, and
-   the head fast path must never change the winner: it may only speed up the
-   readout, and it must fall back to full logits on any miss. This
-   implementation already enforces winner equality in the head calibration; keep
-   that as a hard gate.
+   decision generates nothing) and `legend` must echo the request verbatim.
+   The single full-logits readout is the only path, so there is no fast path
+   that could change the winner; keep that as a hard gate.
 
 7. **Do not add a worker thread or a second context to make decisions
    concurrent.** The measured cost is small enough that cooperative yielding on
@@ -306,20 +306,17 @@ HSA_OVERRIDE_GFX_VERSION=11.0.0 ./build/bin/ref-bench MODEL \
     tests/fixtures/decision/contexts_schema.request.json auto
 ```
 
-This implementation:
+This implementation (the scratch `bench-decision` driver was removed; the fork
+oracle and the fixture are driven by the decision test harness):
 
 ```sh
-HSA_OVERRIDE_GFX_VERSION=11.0.0 ./build/bin/bench-decision \
-    --bench --model MODEL \
-    --fixture tests/fixtures/decision/contexts_schema.request.json --fork restore
-HSA_OVERRIDE_GFX_VERSION=11.0.0 ./build/bin/bench-decision \
-    --bench --model MODEL \
-    --fixture tests/fixtures/decision/contexts_schema.request.json --fork auto
+LLAMA_DECISION_TEST_MODEL=MODEL ./build/bin/test-decision-engine \
+    "decision engine harness(\\..*fork.*)?"
 ```
 
 The exactness control is the fork oracle test (`test-decision-fork`); it prints
-the `[fork control]` line per model. The probability comparison used
-`bench-decision --json --mode tree` on one side and the `PROBS` line from
+the `[fork control]` line per model. The probability comparison used the fork
+oracle's state-byte comparison on one side and the `PROBS` line from
 `ref-bench` on the other.
 
 Models measured: `lfm2.5-350m`, `lfm2.5-2.6b`, `qwen3.5-2b` (hybrid),

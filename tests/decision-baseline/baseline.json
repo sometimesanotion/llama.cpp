@@ -105,7 +105,7 @@
       "allowed_token_mass": 1.0,
       "full_vocab_argmax_id": -1,
       "option_logits": [
-       26.464126586914062,
+       26.464126586914063,
        31.677522659301758,
        31.164581298828125
       ]
@@ -115,12 +115,7 @@
      "input_tokens": 54,
      "output_tokens": 0,
      "cached_tokens": 0,
-     "state_cache_hit": false,
-     "head_mode": "selected"
-    },
-    "head": {
-     "mode": "selected",
-     "fallback": false
+     "state_cache_hit": false
     },
     "diagnostics": {
      "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
@@ -183,12 +178,7 @@
      "input_tokens": 56,
      "output_tokens": 0,
      "cached_tokens": 42,
-     "state_cache_hit": true,
-     "head_mode": "selected"
-    },
-    "head": {
-     "mode": "selected",
-     "fallback": false
+     "state_cache_hit": true
     },
     "diagnostics": {
      "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
@@ -239,28 +229,15 @@
      "scored_rows": 10
     }
    }
-  }
- },
- "gemma4_softcap": {
-  "note": "Provenance-pinned wiring oracle for the Gemma4 final-logit softcap. Gemma4 is the only supported classifier arch whose logits are softcapped and the fixture generator skips it, so this is recorded on a real Gemma4 model. The test runs only when LLAMA_DECISION_TEST_MODEL points at this model; it asserts the classifier predicate accepts, llama_model_classifier_rows writes this softcap and row width, the template/contract hashes and ftype match, and score_answer_rows applies softcap * tanh(dot / softcap).",
-  "model": "gemma-4-e4b-it-gguf/latest.gguf",
-  "recorded": "2026-09-24",
-  "backend_flags": "cpu,fa=0,n_ctx=256,ubatch=128,unified=1,swa=0; the row/softcap path is backend-independent",
-  "quantization": 15,
-  "softcap": 30.0,
-  "width": 2560,
-  "template_hash": "decision-prefix-v1:c19202a018540382",
-  "contract_hash": "f67ff4930df48fb3d844963abebdde1cb20f37033dc0f9c1be81f52065105176"
- },
- "cpu_oracle": {
+}
+  },
+  "cpu_oracle": {
   "model": "test-models/qwen35-dense.gguf",
   "pool": {
    "count": 36,
    "token_a": 65
   },
   "full": {
-   "head_active": false,
-   "head_reason": "",
    "cache_hit": false,
    "suffix_tokens": 79,
    "common_suffix_tokens": 0,
@@ -301,91 +278,6 @@
      "certainty": 0.33402881026268005
     }
    ]
-  },
-  "auto_fallback": {
-   "head_active": false,
-   "head_reason": "the decision context does not expose hidden states",
-   "cache_hit": true,
-   "suffix_tokens": 79,
-   "common_suffix_tokens": 0,
-   "leaf_suffix_tokens": 79,
-   "rows": 79,
-   "rounds": 1,
-   "questions": [
-    {
-     "options": 2,
-     "winner": 0,
-     "probs": [
-      0.5004202127456665,
-      0.4995797872543335
-     ],
-     "confidence": 5.094986386122713e-07,
-     "certainty": 0.5004202127456665
-    },
-    {
-     "options": 3,
-     "winner": 0,
-     "probs": [
-      0.33402881026268005,
-      0.3329627215862274,
-      0.33300846815109253
-     ],
-     "confidence": 9.916980886481852e-07,
-     "certainty": 0.33402881026268005
-    },
-    {
-     "options": 3,
-     "winner": 0,
-     "probs": [
-      0.33402881026268005,
-      0.3329627215862274,
-      0.33300846815109253
-     ],
-     "confidence": 9.916980886481852e-07,
-     "certainty": 0.33402881026268005
-    }
-   ]
-  },
-  "head_selection": {
-   "covered_available": true,
-   "covered_width": 256,
-   "covered_classifier": {
-    "active": true,
-    "reason": "",
-    "probs": [
-     0.5001824498176575,
-     0.49981752038002014
-    ]
-   },
-   "full_logits": {
-    "active": false,
-    "reason": "",
-    "probs": [
-     0.5001824498176575,
-     0.49981752038002014
-    ]
-   },
-   "full_context": {
-    "active": false,
-    "reason": "the decision context does not expose hidden states"
-   },
-   "unavailable": {
-    "active": false,
-    "reason": "synthetic unavailable head"
-   },
-   "null_head": {
-    "active": false,
-    "reason": ""
-   },
-   "covered_vs_full": {
-    "winners_match": true,
-    "total_variation": 0.0
-   }
-  },
-  "classifier_rows": {
-   "width": 256,
-   "softcap": 0.0,
-   "max_abs_dot_vs_logit": 3.263722985445694e-10
   }
  }
 }

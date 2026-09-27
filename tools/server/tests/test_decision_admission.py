@@ -355,7 +355,8 @@ CAPACITY_UNIT = "The customer was charged twice and asked for a refund. "
 
 
 def run_capacity_sweep(model):
-    bounded = Server(model, ["--decision-ctx-size", str(CAPACITY_CTX)])
+    # the decision runs on the shared context, so the bounded server sizes that context directly
+    bounded = Server(model, ["--ctx-size", str(CAPACITY_CTX)])
     bounded.start()
     control = None
     try:
@@ -414,7 +415,7 @@ def run_capacity_sweep(model):
         check(sharp[0] == 422 and flat[0] == 422,
               f"the reject is independent of confidence/temperature: {sharp[0]} {flat[0]}")
 
-        # M4.1: the decision context is bounded to the requested n_ctx when set. The sweep above
+        # the decision context is bounded by the shared chat n_ctx. The sweep above
         # proved every state past CAPACITY_CTX is rejected on the bounded server (requested size).
 
         # control group: the fitting request decides the same on a large-context server
@@ -431,8 +432,8 @@ def run_capacity_sweep(model):
         tv = sum(abs(lb["probabilities"][k] - cb["probabilities"][k]) for k in lb["probabilities"])
         check(tv <= 5e-2, f"the bounded and control distributions agree (TV={tv})")
 
-        # M4.1: without --decision-ctx-size the decision context reuses the chat n_ctx, so a state
-        # that the bounded (512) context rejected must be accepted on the control (8192) context.
+        # the decision shares the chat n_ctx, so a state that the bounded (512) context rejected
+        # must be accepted on the control (8192) context.
         status, _, text = control.post(capacity_body(CAPACITY_UNIT * first_reject))
         check(status == 200,
               f"the unbounded decision context serves a state beyond CAPACITY_CTX: {status} {text[:120]}")

@@ -29,13 +29,15 @@ branches share the context's cells.
 ./build/bin/llama-server -m model.gguf -ngl 99 -fa on -c 32768 --decision-seqs 24 --port 8096
 ```
 
-The letter readout runs on its own classifier-only context, which by default uses the model's context size.
-That context has no chat slots: its only sequences are the decision engine's, numbered from zero, while the
-shared chat context keeps the decision sequences above its slots. `--decision-ctx-size N` bounds the
-classifier context independently, so it does not reserve a second full-size KV cache.
-`N` is a cell budget: the request is checked against its peak use (the cached instructions plus every live
-question branch) before any decode. A request that does not fit is rejected with `422`, returns no decision,
-and leaves no partial state; the next request still succeeds. The decision path never truncates a prompt.
+The readout runs full logits on the shared chat context. There is no
+classifier-only context and no answer head: every decision reads output rows
+from the one context chat uses, so a decision cannot duplicate the KV cache.
+The decision sequences sit above the chat slots (n_parallel ..
+n_parallel + n_seq_decision). The engine estimates the request's peak KV use
+(the cached instructions plus every live question branch) before any decode.
+A request that does not fit is rejected with `422`, returns no decision, and
+leaves no partial state; the next request still succeeds. The decision path
+never truncates a prompt.
 
 With a presets file, one loaded model serves chat and decisions:
 
@@ -191,8 +193,8 @@ is empty. Unknown top-level request fields are ignored; unknown fields inside a 
 
 By default the response is the strict Jev envelope: `answers` plus
 `usage{input_tokens,output_tokens:0}`. Pass `"diagnostics": true` to additionally get `certainty`,
-the `head` and `diagnostics` objects, and the extra usage counters
-(`cached_tokens`, `state_cache_hit`, `head_mode`). The answers themselves are identical either way.
+the `diagnostics` object, and the extra usage counters
+(`cached_tokens`, `state_cache_hit`). The answers themselves are identical either way.
 
 Both shapes are served by `POST /v1/decision`, the canonical route. `POST /decision` is a deprecated
 alias for the same handler; use `/v1/decision`. `model` is optional and echoed back verbatim;
@@ -200,12 +202,16 @@ alias for the same handler; use `/v1/decision`. `model` is optional and echoed b
 
 ### Live session (`id_slot`)
 
-Both shapes accept `id_slot` (and an optional `session_pos`) to answer about a chat slot that already
-holds decoded state, so the transcript is not re-prefilled. The slot must exist and hold state; a
-`session_pos` that does not exactly continue it is a 422. The generic shape scores one context per
-session request; the Jev shape appends the questions as a fresh user turn through the slot's chat
-template and runs full logits (the classifier context cannot fork a chat slot). A fork that cannot
-reproduce the slot state (an explicit `copy` on a recurrent/hybrid model) is refused. The source slot
+Both shapes accept `id_slot` (and optional `session_pos` and `turn`) to answer about a chat slot
+that already holds decoded state, so the transcript is not re-prefilled. The slot must exist and
+hold state; a `session_pos` that does not exactly continue it is a 422. The generic shape scores
+one context per session request; the Jev shape appends the questions as a fresh user turn through
+the slot's chat template and runs full logits on the shared context. The server answers through an
+owned snapshot: on the first decision for the slot's current turn it serializes the slot's decoded
+state into a decision-owned arena sequence (`--decision-arena-seqs`), later decisions in the same
+turn fork the arena sequence, and the snapshot is released when the slot decodes past it (a new
+completed turn). One retained turn per slot; the opaque `turn` tag pins it, and a mismatched
+`turn` is a 422. A decision on an in-flight slot is a 422. The source slot
 is never mutated, and the response reports `session_fork`, `source_slot` and `session_pos`
 additively.
 
@@ -227,25 +233,12 @@ that the next save reuses. The active request keeps a device-format copy for its
 branches, so a warm prefix restores device-to-device while a later save cannot corrupt an older
 cache entry.
 
-### Selected answer head
-
-The letter readout can score answer rows from the model's output table instead of projecting the
-whole vocabulary (`head: "selected"`, or `"auto"` to use it when available). It runs on a
-classifier-only context that shares the weights and stops at the post-norm hidden state. An arch is
-eligible only when its graph can stop there and its output table is a plain contiguous matrix
-(`llama_model_classifier_supported`, the one capability predicate shared by the context guard, the
-row reader and this probe). If the model also carries a per-id output bias, that bias must be
-readable as a contiguous 1-D vector over the vocabulary; an unreadable bias makes the head
-unavailable instead of silently scoring without it. A zero bias is kept and adds zero; it is not
-treated as "no bias". `head: "auto"` falls back to full logits when the head is unavailable; an
-explicit `head: "selected"` on an incompatible model is a 400.
-
 ### Usage and diagnostics
 
 `usage` always reports `input_tokens` (state + cached prefix) and `output_tokens` (always 0, nothing
-is generated). With `"diagnostics": true` it also reports `cached_tokens`, `state_cache_hit`, and
-`head_mode`; every answer additionally carries `certainty`, and the response carries
-`diagnostics.contract_hash` (see below) and a `head` object describing the readout path. These are
+is generated). With `"diagnostics": true` it also reports `cached_tokens` and `state_cache_hit`;
+every answer additionally carries `certainty`, and the response carries
+`diagnostics.contract_hash` (see below). These are
 for inspection only; they never change an answer, and they are omitted from the default envelope.
 
 ### Contract hash and diagnostics
@@ -282,8 +275,8 @@ caching, routing or persistence on `confidence` or `certainty` alone, and never
 present them as probability of being correct. `tests/decision-baseline/accuracy_report.json`
 reports winner agreement, Brier and ECE per model and framing; confidence never gates any of it.
 
-Admission is not part of this axis. `--decision-ctx-size` bounds the classifier context by token
-cells, and each request is accepted or rejected by its token footprint alone, never by
+Admission is not part of this axis. The engine's peak-KV preflight check
+accepts or rejects each request by its token footprint alone, never by
 `confidence`/`certainty`. A low-confidence and a high-confidence request of the same length get the
 same outcome.
 
@@ -294,14 +287,20 @@ from 1.0 and the recorded provenance does not match the running model, quantizat
 template and backend flags, the server refuses the profile instead of silently applying it.
 With no file the default stays 1.0.
 
-### Two readouts, one engine
+### Two front-ends, one engine
 
-The unified wire is Jev's: `state` (or `contexts` for the multi-context extension) plus typed
-`questions`, scored as declared answer labels and returned as one closed distribution per typed
-question. The engine also carries the trie scorer underneath (every option is a token path; the
-letter readout is a thin layer over it, not a second implementation). Both share the prefix cache,
-the branch scorer, the softmax and the SWA clamp. The legacy `contexts`+`schema` request form
-(boolean/enum/integer/number field types) is retired.
+The two wire shapes are both producers of the engine's `field_input[]`, so they
+share the prefix cache, the branch scorer, the softmax and the SWA clamp:
+
+- The Jev shape: `state` (or `contexts` for the multi-context extension) plus
+  typed `questions`, scored as declared answer labels and returned as one closed
+  distribution per typed question.
+- The generic `schema` shape: a JSON Schema or compact typed fields compiled by
+  `generic_frontend` into the same `field_input[]`, returned as a typed record.
+
+A body with `questions` selects the Jev front-end; a body with `schema` selects
+the generic front-end; a body carrying both is a 400. The letter readout is a
+thin layer over the trie scorer, not a second implementation.
 
 Letter labels are resolved at the framed answer boundary, not in isolation. A SentencePiece /
 `add_space_prefix` vocabulary tokenizes a bare `A` as the space-prefixed form in isolation but

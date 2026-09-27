@@ -417,9 +417,6 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
-
-        // if true, only extract embeddings at scored positions, no logits
-        bool classifier_only;
     };
 
     struct llama_model_tensor_override {
@@ -587,9 +584,6 @@ extern "C" {
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
-
-    // True when the context was created with classifier_only (hidden states at scored positions, no logits).
-    LLAMA_API  bool                      llama_context_classifier_only(const struct llama_context * ctx);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);

@@ -2,8 +2,6 @@
  "backend": "cpu",
  "model": "test-models/qwen35-dense.gguf",
  "readout": {
-  "head_active": false,
-  "head_reason": "the decision context does not expose hidden states",
   "cache_hit": false,
   "suffix_tokens": 79,
   "common_suffix_tokens": 0,
@@ -44,12 +42,11 @@
     "certainty": 0.33402881026268005
    }
   ],
-  "head_mode": "full",
   "label_pool_size": 36
  },
  "timings": {
-  "prefill_ms": 329.77686400000005,
-  "scoring_ms": 16.08461
+  "prefill_ms": 7.596275,
+  "scoring_ms": 7.579154
  },
- "note": "Frozen readout of the committed decision corpus. The deterministic core (probabilities, winners, confidence = 1 - H/log K, certainty = max p, head mode, label-pool size) is a contract; the timing block is recorded for context and excluded from the byte diff."
+ "note": "Frozen readout of the committed decision corpus. The deterministic core (probabilities, winners, confidence = 1 - H/log K, certainty = max p, label-pool size) is a contract; the timing block is recorded for context and excluded from the byte diff."
 }

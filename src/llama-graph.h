@@ -1041,16 +1041,6 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
-    // A classifier-only context stops after the post-norm hidden state: the graph output is the
-    // embedding, not the vocabulary logits. Returns true when the caller must return.
-    bool finish_classifier_only(ggml_tensor * cur) {
-        if (!cparams.classifier_only) {
-            return false;
-        }
-        ggml_build_forward_expand(gf, cur);
-        return true;
-    }
-
     //
     // common
     //

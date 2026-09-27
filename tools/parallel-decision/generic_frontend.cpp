@@ -1,0 +1,344 @@
+#include "generic_frontend.h"
+
+#include "chat.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace llama_decision {
+
+namespace {
+
+std::string json_text(const std::string & s) {
+    return common_json(s).dump();
+}
+
+// The typed double as a JSON number: an integral value stays integral so a whole-valued quantile
+// or aggregate serializes without a ".0".
+common_json json_number(double x) {
+    const long long r = std::llround(x);
+    if (std::fabs(x - (double) r) < 1e-9) {
+        return common_json(r);
+    }
+    return common_json(x);
+}
+
+// Builds one field spec from a schema entry. `json_schema` selects the JSON Schema field naming
+// and the numeric step key ("multipleOf" vs "step"). Values are 1-255 and unique; the numeric
+// grid reuses the shared numeric_grid encoder (D5).
+generic_field_spec make_field(const std::string & name, const std::string & type, const std::string & description,
+                              const common_json & spec, bool json_schema) {
+    generic_field_spec f;
+    f.name        = name;
+    f.description = description;
+    const std::string kind = type;
+    if (kind == "boolean") {
+        f.type    = "boolean";
+        f.values  = { common_json(true), common_json(false) };
+        f.encoded = { "true", "false" };
+    } else if (kind == "enum" || kind == "choice" || kind == "selection") {
+        const char * key = spec.contains("enum") ? "enum" : "choices";
+        if (!spec.contains(key) || !spec.at(key).is_array()) {
+            throw semantic_error("field \"" + name + "\": enum fields need a list of choices");
+        }
+        f.type = "enum";
+        for (const auto & c : spec.at(key)) {
+            if (!c.is_string()) {
+                throw semantic_error("field \"" + name + "\": enum choices must be strings");
+            }
+            const std::string v = c.get<std::string>();
+            f.values.push_back(common_json(v));
+            f.encoded.push_back(json_text(v));
+        }
+    } else if (kind == "integer") {
+        if (!spec.contains("minimum") || !spec.contains("maximum") ||
+            !spec.at("minimum").is_number_integer() || !spec.at("maximum").is_number_integer()) {
+            throw semantic_error("field \"" + name + "\": integer fields need integer minimum and maximum");
+        }
+        const long long lo = spec.at("minimum").get<long long>();
+        const long long hi = spec.at("maximum").get<long long>();
+        if (hi < lo || hi - lo + 1 > (long long) DECISION_MAX_NUMERIC_VALUES) {
+            throw semantic_error("field \"" + name + "\": integer bounds must define 1-" +
+                                 std::to_string(DECISION_MAX_NUMERIC_VALUES) + " values");
+        }
+        f.type = "integer";
+        for (const auto & gv : numeric_grid((double) lo, (double) hi, 1.0)) {
+            f.values.push_back(common_json((long long) gv.value));
+            f.encoded.push_back(gv.text);
+        }
+    } else if (kind == "number") {
+        const char * step_key = json_schema ? "multipleOf" : "step";
+        if (!spec.contains("minimum") || !spec.contains("maximum") || !spec.contains(step_key)) {
+            throw semantic_error("field \"" + name + "\": number fields need minimum, maximum and " + step_key);
+        }
+        const double lo   = spec.at("minimum").get<double>();
+        const double hi   = spec.at("maximum").get<double>();
+        const double step = spec.at(step_key).get<double>();
+        if (!(step > 0) || !(hi >= lo)) {
+            throw semantic_error("field \"" + name + "\": number needs ordered bounds and a positive step");
+        }
+        f.type = "number";
+        for (const auto & gv : numeric_grid(lo, hi, step)) {
+            f.values.push_back(common_json(gv.value));
+            f.encoded.push_back(gv.text);
+        }
+    } else {
+        throw semantic_error("field \"" + name + "\": supported types are boolean, enum, integer and number");
+    }
+    if (f.values.empty() || f.values.size() > DECISION_MAX_NUMERIC_VALUES) {
+        throw semantic_error("field \"" + name + "\" needs 1-" + std::to_string(DECISION_MAX_NUMERIC_VALUES) +
+                             " allowed values");
+    }
+    for (size_t a = 0; a < f.encoded.size(); ++a) {
+        for (size_t b = 0; b < a; ++b) {
+            if (f.encoded[a] == f.encoded[b]) {
+                throw semantic_error("field \"" + name + "\" has duplicate allowed values");
+            }
+        }
+    }
+    const std::string agg = spec.value("aggregate", spec.value("x-aggregate", std::string("mode")));
+    const bool        numeric = f.type == "integer" || f.type == "number";
+    if (agg != "mode" && !(numeric && (agg == "median" || agg == "mean"))) {
+        throw semantic_error("field \"" + name + "\": aggregate must be mode, or median/mean for numeric fields");
+    }
+    f.aggregate = agg;
+    return f;
+}
+
+// The numeric grid values as doubles, index-aligned with the encoded values.
+std::vector<double> numeric_values(const generic_field_spec & f) {
+    std::vector<double> out;
+    out.reserve(f.values.size());
+    for (const auto & v : f.values) {
+        out.push_back(v.is_number_integer() ? (double) v.get<long long>() : v.get<double>());
+    }
+    return out;
+}
+
+} // namespace
+
+request_shape select_request_shape(const common_json & body) {
+    if (!body.is_object()) {
+        return request_shape::none;
+    }
+    const bool has_questions = body.contains("questions");
+    const bool has_schema    = body.contains("schema");
+    if (has_questions && has_schema) {
+        throw std::invalid_argument("request must be either questions or schema, not both");
+    }
+    if (has_schema) {
+        return request_shape::generic;
+    }
+    if (has_questions || body.contains("state")) {
+        return request_shape::jev;
+    }
+    return request_shape::none;
+}
+
+compiled_schema compile_schema(const common_json & schema, const std::string & instructions) {
+    if (!schema.is_object()) {
+        throw semantic_error("\"schema\" must be an object");
+    }
+    compiled_schema cs;
+    const bool json_schema = schema.contains("properties");
+    const common_json & props = json_schema ? schema.at("properties") : schema;
+    if (!props.is_object() || props.size() < 1 || props.size() > 32) {
+        throw semantic_error("the schema must define 1-32 fields");
+    }
+    for (const auto & e : props.items()) {
+        const common_json & spec = e.value();
+        if (!spec.is_object()) {
+            throw semantic_error("field \"" + e.key() + "\" must be an object");
+        }
+        std::string type = spec.value("type", std::string());
+        if (spec.contains("enum")) {
+            type = "enum";
+        }
+        std::string description = spec.value("description", std::string());
+        if (!json_schema && description.empty()) {
+            throw semantic_error("field \"" + e.key() + "\" needs a description");
+        }
+        cs.specs.push_back(make_field(e.key(), type, description, spec, json_schema));
+    }
+
+    std::string catalog;
+    for (size_t si = 0; si < cs.specs.size(); ++si) {
+        const generic_field_spec & f = cs.specs[si];
+        // the value's common leading characters are fixed in the suffix; only the rest is scored
+        std::string common = f.encoded[0];
+        for (const auto & v : f.encoded) {
+            size_t c = 0;
+            while (c < std::min(common.size(), v.size()) && common[c] == v[c]) {
+                ++c;
+            }
+            common.resize(c);
+        }
+        cs.specs[si].common = common;
+        field_input in;
+        in.suffix = "  " + json_text(f.name) + ": " + common;
+        for (const auto & v : f.encoded) {
+            in.candidates.push_back(v.substr(common.size()));
+        }
+        cs.inputs.push_back(std::move(in));
+
+        std::string allowed;
+        for (size_t i = 0; i < f.encoded.size(); ++i) {
+            allowed += (i ? ", " : "") + f.encoded[i];
+        }
+        catalog += (catalog.empty() ? "" : "\n") + json_text(f.name) +
+                   (f.description.empty() ? "" : ": " + f.description) + "\nAllowed values: " + allowed;
+    }
+    cs.catalogue   = catalog;
+    cs.system_text = "Select the requested field value from its allowed values, based on the context. "
+                     "Respond with the JSON value only.\n\nFields:\n" + catalog + "\n" + instructions;
+    return cs;
+}
+
+common_json generic_field_record(const generic_field_spec & spec, const field_result & fr) {
+    const int idx = fr.winner;
+    if (idx < 0 || idx >= (int) spec.values.size()) {
+        throw std::runtime_error("field \"" + spec.name + "\" has no selected value");
+    }
+    common_json f = common_json::object();
+    const bool  numeric = spec.type == "integer" || spec.type == "number";
+    // the numeric spread summary and aggregate reuse the Jev value-space quantile over the grid
+    if (numeric && fr.probs.size() == spec.values.size()) {
+        const std::vector<double> values = numeric_values(spec);
+        common_json interval = common_json::array();
+        interval.push_back(json_number(value_quantile(fr.probs, values, 0.10)));
+        interval.push_back(json_number(value_quantile(fr.probs, values, 0.90)));
+        f["interval_p10_p90"] = interval;
+        double agg = values[idx]; // mode
+        if (spec.aggregate == "median") {
+            agg = value_quantile(fr.probs, values, 0.5);
+        } else if (spec.aggregate == "mean") {
+            agg = 0.0;
+            for (size_t i = 0; i < fr.probs.size(); ++i) {
+                agg += (double) fr.probs[i] * values[i];
+            }
+        }
+        f["aggregate"] = json_number(agg);
+    }
+    f["value"]        = spec.values[idx];
+    f["probability"]  = (double) (fr.probs.size() == spec.values.size() ? fr.probs[idx] : fr.path_score);
+    f["scored_nodes"] = fr.scored_nodes;
+    f["tree"]         = fr.tree;
+    return f;
+}
+
+common_json assemble(const compiled_schema & cs, const result & r) {
+    common_json decision = common_json::object();
+    common_json fields   = common_json::object();
+    for (size_t i = 0; i < cs.specs.size(); ++i) {
+        if (i >= r.fields.size()) {
+            throw std::runtime_error("the scored result is missing field \"" + cs.specs[i].name + "\"");
+        }
+        const common_json record = generic_field_record(cs.specs[i], r.fields[i]);
+        decision[cs.specs[i].name] = record.at("value");
+        fields[cs.specs[i].name]   = record;
+    }
+    common_json out = common_json::object();
+    out["decision"] = decision;
+    out["fields"]   = fields;
+    return out;
+}
+
+std::pair<std::string, std::string> render_schema_prompt(const common_chat_templates * tmpls, bool use_jinja,
+                                                         const std::string & system_text, const std::string & context) {
+    if (tmpls == nullptr) {
+        return { system_text + "\nContext:\n", context + "\nOutput:\n{\n" };
+    }
+    const auto split = split_chat_template(tmpls, use_jinja, system_text, false);
+    return { split.first, context + split.second + "{\n" };
+}
+
+std::string generic_cache_tag(const common_chat_templates * tmpls, bool use_jinja,
+                              const std::string & system_text) {
+    const auto split = tmpls != nullptr ? split_chat_template(tmpls, use_jinja, system_text, false)
+                                        : std::make_pair(system_text + "\n", std::string("\n"));
+    return make_prefix_tag(system_text, split.second, GENERIC_PROMPT_VERSION);
+}
+
+generic_request parse_generic_request(const common_json & body) {
+    if (!body.is_object()) {
+        throw semantic_error("request must be an object");
+    }
+    generic_request req;
+
+    // the model is required and echoed back, matching the Jev contract
+    if (!body.contains("model") || body.at("model").is_null()) {
+        throw semantic_error("model is required");
+    }
+    if (!body.at("model").is_string()) {
+        throw semantic_error("model must be a string");
+    }
+    req.model = body.at("model").get<std::string>();
+
+    if (!body.contains("schema") || !body.at("schema").is_object()) {
+        throw semantic_error("\"schema\" must be an object");
+    }
+    req.schema = body.at("schema");
+
+    if (body.contains("instructions") && !body.at("instructions").is_null()) {
+        if (!body.at("instructions").is_string()) {
+            throw semantic_error("instructions must be a string");
+        }
+        req.instructions = body.at("instructions").get<std::string>();
+    }
+
+    // the evidence source (state/contexts/session) is orthogonal to the front-end
+    req.evidence = parse_evidence(body);
+    req.session  = parse_session_ref(body);
+    if (!req.evidence.state_present && req.evidence.contexts.empty() && !req.session.present) {
+        throw semantic_error("state (or contexts or id_slot) is required");
+    }
+
+    if (body.contains("mode") && !body.at("mode").is_null()) {
+        if (!body.at("mode").is_string()) {
+            throw semantic_error("mode must be a string");
+        }
+        req.mode = body.at("mode").get<std::string>();
+        if (req.mode != "auto" && req.mode != "tree" && req.mode != "greedy") {
+            throw semantic_error("mode must be auto, tree or greedy");
+        }
+    }
+    if (body.contains("tree_max") && !body.at("tree_max").is_null()) {
+        if (!body.at("tree_max").is_number_integer()) {
+            throw semantic_error("tree_max must be an integer");
+        }
+        req.tree_max = (size_t) body.at("tree_max").get<long long>();
+    }
+    if (body.contains("cache_prompt") && !body.at("cache_prompt").is_null()) {
+        if (!body.at("cache_prompt").is_boolean()) {
+            throw semantic_error("cache_prompt must be a boolean");
+        }
+        req.allow_cache = body.at("cache_prompt").get<bool>();
+    }
+
+    return req;
+}
+
+std::vector<field_input> session_field_inputs(const compiled_schema & cs,
+                                              const std::string & before, const std::string & after) {
+    std::vector<field_input> out;
+    out.reserve(cs.specs.size());
+    for (size_t i = 0; i < cs.specs.size(); ++i) {
+        const generic_field_spec & f = cs.specs[i];
+        const field_input &        in = cs.inputs[i];
+        // the fresh user turn carries the catalogue, then the JSON answer opens after the
+        // assistant-open (`after`); every suffix shares this framing so the plan hoists it
+        field_input framed;
+        framed.suffix      = before + "\n" + cs.catalogue + "\n" + after + "{\n  " + json_text(f.name) + ": " + f.common;
+        framed.candidates  = in.candidates;
+        framed.temperature = in.temperature;
+        out.push_back(std::move(framed));
+    }
+    return out;
+}
+
+} // namespace llama_decision

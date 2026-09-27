@@ -103,16 +103,10 @@ silently default).
   one seeded distinct shuffle, per-order softmax then mean by semantic key
   (seeded by `(seed, qid)`; noul second order = swapped). Values above the cap
   are accepted and capped; document the measured cost (~1.1x for 2).
-* `head` (optional, string): scoring path. Omit or `""` for auto; `"full"`
-  forces full-vocabulary logits on the shared context; `"selected"` requests
-  the answer-head fast path. The default path uses the head when
-  it is available and silently falls back to full logits otherwise; an explicit
-  `head: "selected"` on an unavailable head is a client error (400).
 * `diagnostics` (optional, bool, default `false`): when `true`, the response
-  additionally carries the `head` object, the `diagnostics` object, `certainty`,
-  and the extra `usage` counters
-  (`cached_tokens`, `state_cache_hit`, `head_mode`). The default `false` keeps
-  the response to the strict Jev envelope (Section 3).
+  additionally carries the `diagnostics` object, `certainty`, and the extra
+  `usage` counters (`cached_tokens`, `state_cache_hit`). The default `false`
+  keeps the response to the strict Jev envelope (Section 3).
 * `confidence_profile` (optional, string, `"jev"` (default) or `"local"`): how
   the `confidence` value on `choice`/`score` is computed. `"jev"` (the default)
   selects the documented Jev compatibility value `(N*p_max - 1)/(N - 1)`, clamped
@@ -207,16 +201,21 @@ typed grid, answered with the winning value and an optional scalar `aggregate`.
   The per-context `answers`/`usage` match the single-state shapes; `timings` is
   batch level. The `contexts` key is the one extension over Jev.
 
-The legacy `contexts`+`schema` request form (boolean/enum/integer/number field
-types) is retired; the unified shape above is the contract.
+This is one of two request front-ends served on `/v1/decision`; the other is
+the generic typed-schema form (Section 2.5). A body is dispatched on its
+top-level shape: `questions` selects the Jev front-end, `schema` selects the
+generic front-end, and a body carrying both is a 400. Both terminate at the
+same engine, so the two shapes cannot drift.
 
-### 2.4 Live-session request (`id_slot`, `session_pos`)
+### 2.4 Live-session request (`id_slot`, `session_pos`, `turn`)
 
 The unified shape accepts an optional `id_slot` (int) so the decision is answered about
 a chat slot that already holds decoded state, without re-prefilling the
 transcript. `session_pos` (int) optionally pins the continuation position; it
 requires `id_slot` and must equal the slot's next position exactly, otherwise the
-request is a 422 (a shifted position is never scored silently).
+request is a 422 (a shifted position is never scored silently). `turn` (string)
+optionally pins the retained-turn identity; a mismatched `turn` is a 422, never a
+silent answer about a different turn.
 
 * The slot must exist, not be released, and hold decoded state. These are
   capability checks only: an unknown, released, or empty slot is a 4xx with a
@@ -227,16 +226,67 @@ request is a 422 (a shifted position is never scored silently).
   rendered through the slot's chat template; the transcript is not re-injected
   as `state`, and the request `state` is still required by the shape but not
   re-decoded.
-* Session readout runs full-logits on the shared context, because the
-  classifier-only context has its own cache and cannot fork a chat slot. An
-  explicit `head: "selected"` on a session is a 400.
+* Session readout runs full-logits on the shared context, like the stateless
+  path. There is no classifier context and no answer head.
 * A session fork is exact: `copy` is refused on a recurrent/hybrid model (it
   would not reproduce the slot state), `hybrid`/`restore`/`auto` are accepted.
-* The source slot is never mutated: a decision reads it only to fork. After the
-  request, chat on that slot and a repeat decision both keep working.
+* The source slot is never mutated: a decision reads it only to snapshot. After
+  the request, chat on that slot and a repeat decision both keep working.
 * The response reports the fork additively: `session_fork: true`, `source_slot`,
-  and `session_pos`. With `diagnostics: true`, `diagnostics.permutations`
-  reports the pass count used.
+  and `session_pos` (and `turn` when the request set one). With
+  `diagnostics: true`, `diagnostics.permutations` reports the pass count used.
+
+#### Session snapshot substrate
+
+A session decision never forks the live slot. The server keeps a decision-owned
+arena of reserved sequences (`--decision-arena-seqs N`, default `n_parallel`):
+- On the first decision referencing a slot's current turn, the server
+  serializes the slot's decoded state in the self-contained host format
+  (`llama_state_seq_*`) and restores it into a free arena sequence. This is the
+  on-demand snapshot trigger: a turn that is never queried produces no snapshot.
+- Later decisions in the same turn fork the arena sequence
+  (`decide_batch_from_seq`) instead of the slot, so the source survives the
+  slot's KV being cleared and reused by `cache_idle_slots`.
+- The retained-turn policy keeps one snapshot per slot. When the slot decodes
+  past the snapshot's position (a completed new turn), the snapshot is released
+  before the next decision. A slot with no decoded state (no `pos_max`) cannot
+  have advanced, so a cleared slot still matches its snapshot.
+- A decision on an in-flight slot (`is_processing()`) is a 422: it measures
+  task validity (is the turn complete), never confidence.
+- An arena that is full (every sequence holds a snapshot) is a 422 naming the
+  arena; raise `--decision-arena-seqs` to hold more retained turns.
+
+### 2.5 Generic typed-schema front-end (`schema`)
+
+The second producer of engine fields, additive to the Jev contract. A body with
+a top-level `schema` (and no `questions`) selects this front-end; both present
+is a 400. The generic shape accepts either compact typed fields or a JSON
+Schema object with `properties`:
+
+```json
+{"model": "qwen3-4b", "instructions": "Answer each field.",
+ "schema": {"category": {"type": "enum", "choices": ["billing","technical"],
+                         "description": "Ticket type"},
+            "urgent": {"type": "boolean", "description": "Needs urgent handling?"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 5}},
+ "state": "Customer asks for a refund of $42, order arrived broken."}
+```
+
+* Field types: `enum` (choices list), `boolean`, `integer` (integer
+  `minimum`/`maximum`), `number` (numeric `minimum`/`maximum`/`step`, or
+  `multipleOf` in a JSON Schema). Each field is compiled to the same
+  `field_input` the Jev front-end produces, and scored by the same engine.
+  Numeric fields take `aggregate` (`mode` default, `median`, `mean`).
+* Response: `{model, results: [...], usage, timings}`. Each result matches one
+  context (or the single `state`): `{decision: {field: value, ...},
+  fields: {field: {value, probability, scored_nodes, tree}}, usage}`. Numeric
+  fields add `interval_p10_p90` and `aggregate` to their field record.
+* Options: `mode` (`auto` default, `tree`, `greedy`), `tree_max` (default 128),
+  `cache_prompt` (default true). Evidence (`state`, `contexts`, or a session
+  `id_slot`/`turn`) is orthogonal to the front-end and behaves as in Section 2.3.
+* The generic front-end reuses the Jev engine, label pool, temperature and
+  permutation machinery; it never re-implements field compilation or branch
+  scoring.
 
 ---
 
@@ -264,16 +314,15 @@ The default response is exactly the Jev envelope:
 ```
 
 With `diagnostics: true` the same answers are returned with additive fields:
-`certainty` on choice/score/numeric, the `head` and `diagnostics` objects, the
-extra `usage` counters, the `timings` object, and the score/numeric spread
-summaries (`median`, `interval_p10_p90`). The answers themselves
-are byte-identical either way.
+`certainty` on choice/score/numeric, the `diagnostics` object, the extra `usage`
+counters, the `timings` object, and the score/numeric spread summaries
+(`median`, `interval_p10_p90`). The answers themselves are byte-identical
+either way.
 
 ```json
 {
   "usage": {"input_tokens": N, "output_tokens": 0,
-            "cached_tokens": M, "state_cache_hit": true|false,
-            "head_mode": "selected"|"full"},
+            "cached_tokens": M, "state_cache_hit": true|false},
   "timings": {"prefill_ms": ..., "scoring_ms": ..., "total_ms": ...,
               "rounds": ..., "rows": ...}
 }
@@ -324,16 +373,14 @@ are byte-identical either way.
   `usage.input_tokens` includes cache hits + warmup and counts a shared prefix
   ONCE. The default `usage` carries only `input_tokens` and `output_tokens`;
   with `diagnostics: true` it also carries `cached_tokens` and
-  `state_cache_hit`, which expose prefix-cache behavior, and `head_mode`.
-* When `diagnostics: true`, the response carries two additive objects beyond the
-  frozen Jev shape. `head` reports how the answer was read out
-  (`mode: selected|full`, `fallback`, and a `reason` when it fell back).
-  `diagnostics` reports the readout identity (`contract_hash`, `prompt_version`,
-  `model`, `quantization`, `template_hash`, `backend_flags`, `label_pool_size`),
-  the adapter scope (`adapters_configured`, `adapter_scope`), and timings
-  (`prefill_ms`, `scoring_ms`, `suffix_tokens`, `common_suffix_tokens`). These
-  are additive and never change an answer. The default response omits all of
-  them.
+  `state_cache_hit`, which expose prefix-cache behavior.
+* When `diagnostics: true`, the response carries one additive object beyond the
+  frozen Jev shape. `diagnostics` reports the readout identity (`contract_hash`,
+  `prompt_version`, `model`, `quantization`, `template_hash`, `backend_flags`,
+  `label_pool_size`), the adapter scope (`adapters_configured`,
+  `adapter_scope`), and timings (`prefill_ms`, `scoring_ms`, `suffix_tokens`,
+  `common_suffix_tokens`). These are additive and never change an answer. The
+  default response omits them.
 
 ### 3.2 Worked example
 
@@ -367,7 +414,7 @@ Response (default envelope):
 ```
 
 The same request with `"diagnostics": true` keeps the answers byte-identical
-and adds `certainty`, the `head`/`diagnostics` objects, and
+and adds `certainty`, the `diagnostics` object, and
 the extra usage counters:
 
 ```json
@@ -377,9 +424,7 @@ the extra usage counters:
             "probabilities": {"billing": 0.9999, "support": 0.0001},
             "confidence": 0.999, "certainty": 0.9999}},
  "usage": {"input_tokens": 412, "output_tokens": 0,
-           "cached_tokens": 180, "state_cache_hit": false,
-           "head_mode": "selected"},
- "head": {"mode": "selected", "fallback": false},
+           "cached_tokens": 180, "state_cache_hit": false},
  "diagnostics": {"contract_hash": "...", "adapters_configured": false, "adapter_scope": "base"}}
 ```
 
@@ -463,6 +508,7 @@ same value.
 | answer-label pool | `LABEL_POOL_CAP` (equal to `DECISION_MAX_CHOICE_OPTIONS`) |
 | request body | `LLAMA_DECISION_MAX_BODY` (default 2 MiB) |
 | concurrent decisions | `LLAMA_DECISION_MAX_QUEUE` (default 4), then 429/529 |
+| retained session snapshots | one per chat slot; `--decision-arena-seqs` sets the arena pool |
 | trie fields / values per field | 1-32 fields, 1-255 values |
 
 The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (255); the label-pool
@@ -512,7 +558,7 @@ Rules:
 * Prompt-injection corpus for `safe_data`: `<|turn>`, `{REASON:`, `__media__`,
   backticks, and nested arrays/objects.
 * Diagnostics to log per request: `prefix/suffix tokens`, `cache_hit`, `waves`,
-  `queue_ms`. These catch prompt-drift and head-mismatch before users do.
+  `queue_ms`. These catch prompt-drift and readout drift before users do.
 * Policy: the model's `confidence`/`certainty` NEVER gates admission,
   caching, routing, or persistence.
 
@@ -531,8 +577,12 @@ Rules:
   surface-form values.
 - **branch / trunk / prefix**: one KV sequence per scored path; a trunk is
   `shared prefix + context`; the prefix is the cacheable head.
-- **session fork**: answering `id_slot` by forking the slot's decoded state
+- **session fork**: answering `id_slot` by forking the slot's owned snapshot
   instead of re-prefilling `state`; the source slot is read-only.
+- **session snapshot / retained turn**: the arena copy of a completed turn's
+  decoded state, taken on the first decision for that turn, reused by later
+  decisions in the same turn, and released when the turn advances. One retained
+  turn per slot. `turn` is the opaque client tag that pins the snapshot.
 - **producer confidence vs task value**: two DIFFERENT axes (Section 6). Never
   use a confidence number to gate caching/admission/correctness.
 - **closed-world probabilities**: `probabilities` are conditional on the

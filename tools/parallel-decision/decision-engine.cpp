@@ -201,47 +201,6 @@ std::vector<float> softmax(const std::vector<float> & logits, float temperature)
     return out;
 }
 
-int classifier_head::index_of(llama_token id) const {
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] == id) {
-            return (int) i;
-        }
-    }
-    return -1;
-}
-
-std::vector<float> score_answer_rows(const float * hidden, const classifier_head & head, const tokens_t & cands) {
-    if (hidden == nullptr) {
-        throw std::invalid_argument("scoring answer rows needs a hidden state");
-    }
-    if (!head.available()) {
-        throw std::invalid_argument("scoring answer rows needs an available answer head");
-    }
-    const size_t width = (size_t) head.width;
-    std::vector<float> out;
-    out.reserve(cands.size());
-    for (llama_token t : cands) {
-        const int r = head.index_of(t);
-        if (r < 0) {
-            throw std::runtime_error("the selected answer head is missing a candidate row");
-        }
-        const float * row = head.rows.data() + (size_t) r * width;
-        double dot = 0.0;
-        for (size_t k = 0; k < width; ++k) {
-            dot += (double) hidden[k] * (double) row[k];
-        }
-        float v = (float) dot;
-        if (!head.bias.empty()) {
-            v += head.bias[(size_t) r];
-        }
-        if (head.softcap != 0.0f) {
-            v = head.softcap * std::tanh(v / head.softcap);
-        }
-        out.push_back(v);
-    }
-    return out;
-}
-
 std::string make_prefix_tag(const std::string & system_text, const std::string & after,
                             const std::string & prompt_version) {
     // the trailing separator byte keeps the same chained FNV-1a as the pre-refactor mixing
@@ -648,85 +607,10 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
     return result;
 }
 
-bool engine::head_covers(const classifier_head & head, const tokens_t & cands) const {
-    for (llama_token t : cands) {
-        if (head.index_of(t) < 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool engine::classifier_only() const {
-    return llama_context_classifier_only(ctx);
-}
-
-bool engine::select_scoring_head(const compiled_fields & plan, const options & opt, std::string * reason) const {
-    if (reason != nullptr) {
-        reason->clear();
-    }
-    const classifier_head * head = opt.head;
-    if (head == nullptr) {
-        return false;
-    }
-    if (!head->available()) {
-        if (reason != nullptr) {
-            *reason = head->reason.empty() ? "the selected answer head is unavailable" : head->reason;
-        }
-        return false;
-    }
-    if (!llama_context_classifier_only(ctx)) {
-        if (reason != nullptr) {
-            *reason = "the decision context does not expose hidden states";
-        }
-        return false;
-    }
-    if (llama_model_n_embd_out(model) != (int32_t) head->width) {
-        if (reason != nullptr) {
-            *reason = "the answer-row width does not match the hidden state width";
-        }
-        return false;
-    }
-    if (plan.p == nullptr) {
-        return true;
-    }
-    for (const auto & fd : plan.p->fields) {
-        if (fd.use_tree) {
-            for (const auto & opts : fd.node_options) {
-                if (!head_covers(*head, opts)) {
-                    if (reason != nullptr) {
-                        *reason = "the answer head does not cover every candidate token";
-                    }
-                    return false;
-                }
-            }
-        } else {
-            for (const auto & p : fd.paths) {
-                if (!head_covers(*head, p)) {
-                    if (reason != nullptr) {
-                        *reason = "the answer head does not cover every candidate token";
-                    }
-                    return false;
-                }
-            }
-        }
-    }
-    return true;
-}
-
 void engine::gather_candidates(int out_idx, const tokens_t & cands, branch_score & out) {
-    if (head_active_) {
-        const float * embd = llama_get_embeddings_ith(ctx, out_idx);
-        if (embd != nullptr) {
-            out.cand_logits = score_answer_rows(embd, *head_, cands);
-            return;
-        }
-    }
     const float * logits = llama_get_logits_ith(ctx, out_idx);
     if (logits == nullptr) {
-        // A classifier-only context produces hidden states, not logits, so the answer head must
-        // cover the candidates; reaching here means a caller paired the wrong context and head.
-        throw std::runtime_error("no logits for the scored position: a classifier-only context needs an answer head that covers every candidate");
+        throw std::runtime_error("no logits for the scored decision position");
     }
     for (llama_token t : cands) {
         out.cand_logits.push_back(logits[t]);
@@ -742,8 +626,6 @@ result engine::decide(const std::string & shared_text, const std::string & conte
     r.rounds        = b.rounds;
     r.prefill_ms    = b.prefill_ms;
     r.scoring_ms    = b.scoring_ms;
-    r.head_active   = b.head_active;
-    r.head_reason   = b.head_reason;
     return r;
 }
 
@@ -905,21 +787,6 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
     const size_t                        suffix_tokens   = plan.suffix_tokens;
     const size_t                        leaf_suffix_tokens = plan.leaf_suffix_tokens;
 
-    head_        = opt.head;
-    head_active_ = false;
-    head_reason_.clear();
-    if (opt.head != nullptr) {
-        if (select_scoring_head(plan, opt, &head_reason_)) {
-            head_active_ = true;
-        }
-    }
-    // A classifier-only context produces hidden states, not logits, so scoring needs an answer
-    // head that covers every candidate. Reaching here without one is a caller error; fail before
-    // any decode instead of letting gather_candidates read a null logits buffer.
-    if (llama_context_classifier_only(ctx) && !head_active_) {
-        throw unsupported_error("a classifier-only decision context requires an answer head that covers every candidate");
-    }
-
     // every trunk decodes its context plus the hoisted suffix head; branches start after it
     std::vector<tokens_t> tails = prefixes;
     if (!plan_common.empty()) {
@@ -964,7 +831,7 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
     if (peak > budget) {
         throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
                              " tokens but the context holds " + std::to_string(budget) +
-                             " (raise --decision-ctx-size)");
+                             " (raise --ctx-size)");
     }
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -1014,8 +881,6 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
         }
         run_trunk_wave(out, plan, runs, opt.bypass);
     }
-    out.head_active = head_active_;
-    out.head_reason = head_reason_;
     return out;
 }
 
@@ -1116,8 +981,6 @@ void engine::run_trunk_wave(batch_result & out, const compiled_fields & plan, co
         result & r = out.items[runs[i].out_index];
         r.context_tokens       = runs[i].context_tokens;
         r.rows                 = total;
-        r.head_active          = head_active_;
-        r.head_reason          = head_reason_;
         r.suffix_tokens        = suffix_tokens;
         r.common_suffix_tokens = plan.common_suffix_tokens;
         r.leaf_suffix_tokens   = leaf_suffix_tokens;
@@ -1163,18 +1026,6 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     llama_synchronize(ctx);
     check_cancel();
 
-    head_        = opt.head;
-    head_active_ = false;
-    head_reason_.clear();
-    if (opt.head != nullptr) {
-        if (select_scoring_head(plan, opt, &head_reason_)) {
-            head_active_ = true;
-        }
-    }
-    if (llama_context_classifier_only(ctx) && !head_active_) {
-        throw unsupported_error("a classifier-only decision context requires an answer head that covers every candidate");
-    }
-
     // only the plan's suffix head is left to decode: the source already carries the session text
     tokens_t head = tokenize(tail_before_common, false);
     head.insert(head.end(), plan.p->plan_common.begin(), plan.p->plan_common.end());
@@ -1203,7 +1054,7 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     if (peak > budget) {
         throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
                              " tokens but the context holds " + std::to_string(budget) +
-                             " (raise --decision-ctx-size)");
+                             " (raise --ctx-size)");
     }
 
     // A restore or hybrid fork loads the parent from a saved state; a copy fork ignores it. Saving
@@ -1233,8 +1084,6 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     };
     run_trunk_wave(out, plan, runs, opt.bypass);
 
-    out.head_active = head_active_;
-    out.head_reason = head_reason_;
     return out;
 }
 

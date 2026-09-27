@@ -165,6 +165,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         params.kv_unified = true;
     }
 
+    // one retained-turn snapshot per slot by default; an explicit --decision-arena-seqs wins
+    if (params.n_seq_decision > 0 && params.n_seq_arena == 0) {
+        params.n_seq_arena = params.n_parallel;
+    }
+
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
     // or with -c 0 for max context
     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&

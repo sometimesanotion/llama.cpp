@@ -329,9 +329,9 @@ Implementation notes [Local]:
   where Jev is undocumented). The default stays `(N*p_max - 1)/(N - 1)`, matching Jev.
   `certainty` is unaffected by the profile. The profile changes only the reported
   concentration; probabilities are identical.
-- The benchmark surfaces record both: `bench-decision --json` reports
-  `metrics.<field>.{confidence,certainty}`, and the frozen readout baselines store both per
-  question.
+- The benchmark surfaces record both: the frozen readout baselines store
+  `confidence` and `certainty` per question, and the response reports
+  `certainty` when `diagnostics` is set.
 - Definitions: `inverse_entropy_confidence`, `winner_share` and `jev_winner_share_confidence` in
   `tools/parallel-decision/decision-protocol.cpp`.
 

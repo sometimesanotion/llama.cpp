@@ -3,15 +3,17 @@
 #define private public
 #include "decision-engine.h"
 #undef private
-#include "../src/llama-ext.h"  // staging API: classifier answer-head predicate and row reader
+#include "../src/llama-ext.h"  // staging API: sequence-state debug transfer counters
 #include "chat.h"
 #include "common.h"
 #include "decision-protocol.h"
+#include "generic_frontend.h"
 #include "ggml-backend.h"
 #include "json.h"
 #include "labels.h"
 #include "letter_readout.h"
 #include "llama.h"
+#include "session_arena.h"
 #include "speculative.h"
 #include "testing.h"
 
@@ -265,82 +267,7 @@ static void test_softmax(testing & t) {
 
 // The answer-row scoring math takes no context, so it is covered with synthetic hidden states,
 // rows, bias and softcap instead of a model.
-static llama_decision::classifier_head fake_answer_head() {
-    llama_decision::classifier_head head;
-    head.ids   = { 10, 11, 12 };
-    head.width = 3;
-    head.rows  = {
-         1.0f, 2.0f, 3.0f, // id 10
-         0.0f, 1.0f, 0.0f, // id 11
-        -1.0f, 0.0f, 1.0f, // id 12
-    };
-    return head;
-}
 
-static void test_score_answer_rows(testing & t) {
-    const std::vector<float> hidden = { 1.0f, 0.0f, 1.0f };
-    const llama_decision::tokens_t cands = { 10, 11, 12 };
-
-    t.test("answer rows score dot products plus the output bias", [&](testing & t) {
-        auto head = fake_answer_head();
-        head.bias = { 0.5f, 0.0f, 2.0f };
-        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
-        t.assert_equal("one score per candidate", (size_t) 3, v.size());
-        assert_close(t, "row 10 plus bias", 4.5, v[0], 1e-5);
-        assert_close(t, "row 11 plus bias", 0.0, v[1], 1e-5);
-        assert_close(t, "row 12 plus bias", 2.0, v[2], 1e-5);
-    });
-
-    t.test("an empty bias adds nothing", [&](testing & t) {
-        auto head = fake_answer_head();
-        head.softcap = 0.0f;
-        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
-        assert_close(t, "row 10 unchanged", 4.0, v[0], 1e-5);
-        assert_close(t, "row 11 unchanged", 0.0, v[1], 1e-5);
-        assert_close(t, "row 12 unchanged", 0.0, v[2], 1e-5);
-    });
-
-    t.test("a nonzero softcap bounds every score", [&](testing & t) {
-        auto head = fake_answer_head();
-        head.bias    = { 0.5f, 0.0f, 2.0f };
-        head.softcap = 2.0f;
-        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
-        assert_close(t, "softcapped row 10", 2.0 * std::tanh(4.5 / 2.0), v[0], 1e-5);
-        assert_close(t, "softcapped row 11", 0.0, v[1], 1e-5);
-        assert_close(t, "softcapped row 12", 2.0 * std::tanh(2.0 / 2.0), v[2], 1e-5);
-    });
-
-    t.test("a zero softcap leaves the score alone", [&](testing & t) {
-        auto head = fake_answer_head();
-        head.bias    = { 0.5f, 0.0f, 2.0f };
-        head.softcap = 0.0f;
-        const auto v = llama_decision::score_answer_rows(hidden.data(), head, cands);
-        assert_close(t, "row 10 unbounded", 4.5, v[0], 1e-5);
-        assert_close(t, "row 12 unbounded", 2.0, v[2], 1e-5);
-    });
-
-    t.test("a candidate without a row is rejected", [&](testing & t) {
-        const auto head = fake_answer_head();
-        bool threw = false;
-        try {
-            llama_decision::score_answer_rows(hidden.data(), head, { 10, 99 });
-        } catch (const std::exception &) {
-            threw = true;
-        }
-        t.assert_true("a missing row throws instead of scoring", threw);
-    });
-
-    t.test("an unavailable head is rejected", [&](testing & t) {
-        llama_decision::classifier_head head;
-        bool threw = false;
-        try {
-            llama_decision::score_answer_rows(hidden.data(), head, cands);
-        } catch (const std::exception &) {
-            threw = true;
-        }
-        t.assert_true("an unavailable head throws", threw);
-    });
-}
 
 // The load flag is a property of the saved format, so a capability downgrade can never route a
 // device state through the host reader or the other way around.
@@ -881,12 +808,7 @@ static void determinism_check(testing & t, bool weak_quant, const std::string & 
 static void test_thinking_off_model(testing & t) {
     t.test("the loaded model's decision prefix stays thinking off", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        if (!shared_model().load(path)) {
-            t.assert_true("model loads", false);
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         try {
@@ -929,7 +851,7 @@ struct test_engine {
         }
     }
 
-    bool make_ctx(bool classifier_only, int n_batch = 512, int n_seq_max = 10, bool flash_attn = false) {
+    bool make_ctx(int n_batch = 512, int n_seq_max = 10, bool flash_attn = false) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx                 = 8192;
         cp.n_batch               = n_batch;
@@ -939,7 +861,6 @@ struct test_engine {
         cp.n_outputs_max_per_seq = 1;
         cp.kv_unified            = true;
         cp.swa_full              = false;
-        cp.classifier_only       = classifier_only;
         // ROCm flash attention is not reproducible; decisions must be bit-exact run to run. The
         // state tests may turn it on to exercise the non-transposed V cache.
         cp.flash_attn_type       = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
@@ -952,7 +873,7 @@ struct test_engine {
             return false;
         }
         model = shared_model().model;
-        return make_ctx(false, 512, n_seq_max);
+        return make_ctx(512, n_seq_max);
     }
 
     bool load_fa(const char * path, int n_seq_max = 10) {
@@ -960,7 +881,7 @@ struct test_engine {
             return false;
         }
         model = shared_model().model;
-        return make_ctx(false, 512, n_seq_max, true);
+        return make_ctx(512, n_seq_max, true);
     }
 };
 
@@ -1007,11 +928,10 @@ struct cpu_test_engine {
     }
 
     bool load(const std::string & path,
-              int                 n_ctx           = 256,
-              bool                classifier_only = false,
-              bool                embeddings      = false,
-              int                 n_batch         = 128,
-              int                 n_seq_max       = 10) {
+              int                 n_ctx      = 256,
+              bool                embeddings = false,
+              int                 n_batch    = 128,
+              int                 n_seq_max  = 10) {
         if (path.empty()) {
             return false;
         }
@@ -1032,8 +952,7 @@ struct cpu_test_engine {
         cp.kv_unified            = true;
         cp.swa_full              = false;
         cp.flash_attn_type       = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-        cp.classifier_only       = classifier_only;
-        cp.embeddings            = embeddings || classifier_only;
+        cp.embeddings            = embeddings;
         ctx = llama_init_from_model(model, cp);
         return ctx != nullptr;
     }
@@ -1627,35 +1546,279 @@ static void test_safe_data(testing & t) {
     });
 }
 
-// The single-engine letter readout wrapper the removed public overload used to provide: a
-// classifier-only engine is the classifier source, a full-logits engine is the fallback.
+// The single-engine letter readout wrapper: one full-logits engine, one readout call.
 static std::vector<std::vector<float>> test_letter_readout(
-        llama_decision::engine & eng, llama_decision::answer_head_cache & head_cache,
+        llama_decision::engine & eng,
         const llama_decision::label_vocab & vocab, const common_chat_templates * tmpls, bool use_jinja,
         const llama_decision::decision_request & req, const std::vector<llama_decision::label> & labels,
         const llama_decision::options & opt, llama_decision::letter_metrics * metrics) {
     llama_decision::readout_sources sources;
     sources.full = &eng;
-    if (eng.classifier_only()) {
-        sources.classifier = &eng;
-    } else {
-        sources.classifier_unavailable = "the decision context does not expose hidden states";
-    }
-    auto all = llama_decision::letter_readout_multi(sources, head_cache, vocab, tmpls, use_jinja,
+    auto all = llama_decision::letter_readout_multi(sources, vocab, tmpls, use_jinja,
                                                     req, labels, opt, metrics);
     return all.empty() ? std::vector<std::vector<float>>{} : std::move(all[0]);
+}
+
+// Deterministic typed-record output for a fixed score vector: a value golden for the generic
+// front-end that does not depend on any model weights.
+static common_json generic_record_from_fixed_scores() {
+    const common_json schema = common_json::parse(R"({
+        "active":   {"type": "boolean", "description": "is the incident active"},
+        "severity": {"type": "enum", "description": "incident severity", "enum": ["low", "medium", "high"]},
+        "count":    {"type": "integer", "description": "affected requests", "minimum": 1, "maximum": 3},
+        "amount":   {"type": "number", "description": "impact factor", "minimum": 0.0, "maximum": 1.0, "step": 0.5, "aggregate": "mean"}
+    })");
+    const auto cs = llama_decision::compile_schema(schema, "Answer from the context.");
+    llama_decision::result r;
+    r.fields = {
+        { 0, 1.0f, 2, true, { 0.7f, 0.3f } },       // active: winner true
+        { 1, 1.0f, 4, true, { 0.2f, 0.5f, 0.3f } }, // severity: winner medium
+        { 2, 1.0f, 3, true, { 0.1f, 0.2f, 0.7f } }, // count: winner 3
+        { 0, 1.0f, 3, true, { 0.6f, 0.3f, 0.1f } }, // amount: winner 0.0, mean 0.25
+    };
+    return llama_decision::assemble(cs, r);
+}
+
+static void test_generic_typed_golden(testing & t) {
+    t.test("fixed-score generic record matches the committed value golden", [](testing & t) {
+        const std::string actual = generic_record_from_fixed_scores().dump(2) + "\n";
+        const std::string golden = read_file(fixture_path("generic_typed.golden.json"));
+        t.assert_equal("generic typed golden is byte-identical", golden, actual);
+    });
+}
+
+// The dispatch on request shape: `schema` selects the generic front-end, `questions` the Jev one,
+// and a body carrying both cannot be dispatched. handle_decision maps this to HTTP 400.
+static void test_generic_mutual_exclusion(testing & t) {
+    t.test("a body carrying both schema and questions is refused", [](testing & t) {
+        const common_json body = common_json::parse(R"({
+            "model": "m",
+            "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "x"}},
+            "schema": {"active": {"type": "boolean", "description": "d"}}
+        })");
+        bool threw = false;
+        try {
+            (void) llama_decision::select_request_shape(body);
+        } catch (const std::invalid_argument & e) {
+            threw = true;
+            t.assert_true("the reason names the mutual exclusion",
+                          std::string(e.what()).find("not both") != std::string::npos);
+        }
+        t.assert_true("schema and questions are mutually exclusive", threw);
+    });
+}
+
+// The generic front-end is a second producer of field_input[] over the one engine: compile the
+// schema, score it through decide_batch, and assemble the typed record back out of the result.
+static void generic_frontend_drive_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const common_json body = common_json::parse(R"({
+        "model": "m",
+        "state": "The service was unreachable for ten minutes before the backup took over.",
+        "schema": {
+            "active":   {"type": "boolean", "description": "is the incident active"},
+            "severity": {"type": "enum", "description": "incident severity", "enum": ["low", "medium", "high"]},
+            "count":    {"type": "integer", "description": "affected requests", "minimum": 1, "maximum": 3},
+            "amount":   {"type": "number", "description": "impact factor", "minimum": 0.0, "maximum": 1.0, "step": 0.5, "aggregate": "mean"}
+        }
+    })");
+    const llama_decision::generic_request greq = llama_decision::parse_generic_request(body);
+    const llama_decision::compiled_schema cs   = llama_decision::compile_schema(greq.schema, greq.instructions);
+
+    llama_decision::engine eng(ctx, 2, 8);
+    llama_decision::options o;
+    o.mode      = "tree";
+    o.tree_max  = 64;
+    o.cache_tag = llama_decision::generic_cache_tag(nullptr, false, cs.system_text);
+
+    const auto parts = llama_decision::render_schema_prompt(nullptr, false, cs.system_text,
+                                                            llama_decision::render_state(greq.evidence.state));
+    const auto plan = eng.compile_fields(cs.inputs, o);
+    const auto b    = eng.decide_batch(plan, parts.first, { parts.second }, o);
+
+    t.test(lane + ": the generic front-end feeds the one engine and assembles the typed record", [&](testing & t) {
+        if (!t.assert_true(lane + ": one decision item", b.items.size() == 1)) {
+            return;
+        }
+        const auto & item = b.items[0];
+        t.assert_equal(lane + ": one scored field per schema field", cs.specs.size(), item.fields.size());
+        for (size_t i = 0; i < item.fields.size(); ++i) {
+            const llama_decision::field_result & fr = item.fields[i];
+            t.assert_true(lane + ": field " + cs.specs[i].name + " is scored exactly",
+                          fr.tree && fr.winner >= 0 && (size_t) fr.winner < cs.specs[i].values.size());
+            t.assert_equal(lane + ": field " + cs.specs[i].name + " probs cover every value",
+                           cs.specs[i].values.size(), fr.probs.size());
+            double sum = 0.0;
+            for (float p : fr.probs) {
+                sum += (double) p;
+            }
+            t.assert_true(lane + ": field " + cs.specs[i].name + " probabilities sum to 1",
+                          std::fabs(sum - 1.0) < 1e-4);
+        }
+
+        const common_json record = llama_decision::assemble(cs, item);
+        t.assert_true(lane + ": assemble emits the decision and fields keys",
+                      record.contains("decision") && record.contains("fields"));
+        const common_json & decision = record.at("decision");
+        const common_json & fields   = record.at("fields");
+        t.assert_equal(lane + ": one decision value per field", cs.specs.size(), decision.size());
+        t.assert_equal(lane + ": one field record per field", cs.specs.size(), fields.size());
+        for (size_t i = 0; i < cs.specs.size(); ++i) {
+            const common_json & rec = fields.at(cs.specs[i].name);
+            for (const char * key : { "value", "probability", "scored_nodes", "tree" }) {
+                t.assert_true(lane + ": " + cs.specs[i].name + " record carries " + key, rec.contains(key));
+            }
+            const bool numeric = cs.specs[i].type == "integer" || cs.specs[i].type == "number";
+            if (numeric) {
+                t.assert_true(lane + ": " + cs.specs[i].name + " record carries interval_p10_p90",
+                              rec.contains("interval_p10_p90"));
+                t.assert_true(lane + ": " + cs.specs[i].name + " record carries aggregate", rec.contains("aggregate"));
+                t.assert_equal(lane + ": " + cs.specs[i].name + " band has two entries",
+                               (size_t) 2, rec.at("interval_p10_p90").size());
+            }
+            bool allowed = false;
+            for (const auto & v : cs.specs[i].values) {
+                allowed = allowed || (v.dump() == rec.at("value").dump());
+            }
+            t.assert_true(lane + ": " + cs.specs[i].name + " value is one of the allowed values", allowed);
+            t.assert_equal(lane + ": " + cs.specs[i].name + " decision echoes the field record",
+                           decision.at(cs.specs[i].name).dump(), rec.at("value").dump());
+        }
+    });
+}
+
+static void test_generic_drives_engine(testing & t) {
+    t.test("the generic front-end drives the shared engine on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 4096, false, 512)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            generic_frontend_drive_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU generic front-end: ") + e.what(), false);
+        }
+    });
+
+    t.test("the generic front-end drives the shared engine on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            generic_frontend_drive_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU generic front-end: ") + e.what(), false);
+        }
+    });
+}
+
+// A generic enum field and the equivalent Jev choice over the same semantic keys must select the
+// same winner when the model is decisive: both front-ends terminate at field_input and share the
+// one engine, so a decisive model cannot pick different keys. The framings are aligned on the
+// evidence (both render it as "State:\n...") and on the candidate semantics (same key strings and
+// order); only the answer encoding differs (JSON string value vs a letter label). The case below
+// was chosen because the reference model is decisive in both framings and selects the same key
+// (an approved transaction selects "approved" either way).
+static void generic_jev_winner_equivalence_run(testing & t, llama_context * ctx, const std::string & lane) {
+    common_json jbody = common_json::parse(R"({
+        "model": "m",
+        "state": "The transaction was approved by the bank.",
+        "questions": {
+            "verdict": {"type": "choice", "instructions": "Was the transaction approved?",
+                        "criteria": {"approved": "the transaction is approved", "declined": "the transaction is declined"}}
+        }
+    })");
+    const auto req = llama_decision::parse_decision_request(jbody);
+
+    const common_json schema = common_json::parse(R"({
+        "verdict": {"type": "enum", "description": "was the transaction approved",
+                    "enum": ["approved", "declined"]}
+    })");
+    const auto cs = llama_decision::compile_schema(schema, "Answer from the context.");
+
+    const llama_model * model = llama_get_model(ctx);
+    auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(model));
+    const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
+
+    llama_decision::engine eng(ctx, 2, 8);
+
+    llama_decision::options jo;
+    jo.cache_tag = "generic-jev-eq";
+    const auto jprobs = test_letter_readout(eng, *vocab, nullptr, false, req, pool, jo, nullptr);
+
+    llama_decision::options go;
+    go.mode      = "tree";
+    go.tree_max  = 64;
+    go.cache_tag = llama_decision::generic_cache_tag(nullptr, false, cs.system_text);
+    const auto parts = llama_decision::render_schema_prompt(nullptr, false, cs.system_text,
+                                                            llama_decision::render_state(req.state));
+    const auto plan = eng.compile_fields(cs.inputs, go);
+
+    t.test(lane + ": generic enum and Jev choice pick the same winner on a decisive model", [&](testing & t) {
+        if (!t.assert_true(lane + ": the Jev readout returns one distribution", jprobs.size() == 1)) {
+            return;
+        }
+        const int  jwinner = (int) (std::max_element(jprobs[0].begin(), jprobs[0].end()) - jprobs[0].begin());
+        const std::string jev_key = req.questions[0].options[jwinner].key;
+
+        const auto gb   = eng.decide_batch(plan, parts.first, { parts.second }, go);
+        const auto & gr = gb.items[0].fields[0];
+        const std::string generic_key = cs.specs[0].values[gr.winner].get<std::string>();
+
+        // decisive means the winner's share is well above uniform in both framings
+        const float jp = jprobs[0][jwinner];
+        const float gp = gr.probs.empty() ? gr.path_score : gr.probs[gr.winner];
+        t.assert_true(lane + ": the case is decisive in both framings (jev " + std::to_string(jp) +
+                      ", generic " + std::to_string(gp) + ")",
+                      jp >= 0.6f && gp >= 0.6f);
+        t.assert_equal(lane + ": the two front-ends select the same key", jev_key, generic_key);
+    });
+}
+
+// The equivalence runs on the reference model: the generated CPU model is a random-weight dummy,
+// so a decisive agreement between the two framings is not a property it can show.
+static void test_generic_jev_winner_equivalence(testing & t) {
+    t.test("generic enum and Jev choice agree on the reference model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the reference decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            generic_jev_winner_equivalence_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the reference generic/Jev equivalence: ") + e.what(), false);
+        }
+    });
+}
+
+static void test_generic_frontend(testing & t) {
+    test_generic_typed_golden(t);
+    test_generic_mutual_exclusion(t);
+    test_generic_drives_engine(t);
+    test_generic_jev_winner_equivalence(t);
 }
 
 static void test_label_pool_real(testing & t) {
     t.test("label pool and exact boundary ids on a real vocabulary", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-
-        if (!shared_model().load(path)) {
-            t.assert_true("model loads", false);
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         llama_model * model = shared_model().model;
@@ -1741,10 +1904,9 @@ static void test_letter_labels_spm(testing & t) {
 
             // End to end: a previously-refused family now serves a closed distribution per question.
             llama_decision::engine eng(te.ctx, 2, 8);
-            llama_decision::answer_head_cache head_cache;
             const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
             llama_decision::letter_metrics metrics;
-            const auto probs = test_letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool,
+            const auto probs = test_letter_readout(eng, *vocab, nullptr, false, req, pool,
                                                               llama_decision::options{}, &metrics);
             t.assert_equal("one distribution per question", req.questions.size(), probs.size());
             bool valid = probs.size() == req.questions.size();
@@ -1759,7 +1921,6 @@ static void test_letter_labels_spm(testing & t) {
                 valid = valid && !probs[i].empty() && std::max_element(probs[i].begin(), probs[i].end()) != probs[i].end();
             }
             t.assert_true("every distribution is closed and valid", valid);
-            t.assert_true("the SPM readout does not use a classifier head", !metrics.head_active);
         } catch (const std::exception & e) {
             t.assert_true(std::string("the SPM label pool runs: ") + e.what(), false);
         }
@@ -1885,16 +2046,11 @@ static void test_label_boundary_calibration(testing & t) {
 
 // The model tests below run against the one shared model, so they share one caller-owned head
 // cache. The dedicated cache tests construct their own.
-static llama_decision::answer_head_cache & test_head_cache() {
-    static llama_decision::answer_head_cache cache;
-    return cache;
-}
 
 static void test_letter_readout_real(testing & t) {
     t.test("letter readout scores a decision request on a real model", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -1910,7 +2066,7 @@ static void test_letter_readout_real(testing & t) {
             const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
 
             llama_decision::letter_metrics metrics;
-            const auto probs = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool,
+            const auto probs = test_letter_readout(eng, *vocab, nullptr, false, req, pool,
                                                               llama_decision::options{}, &metrics);
             t.assert_equal("one distribution per question", req.questions.size(), probs.size());
             bool valid = true;
@@ -1955,7 +2111,7 @@ static void test_letter_readout_real(testing & t) {
                               [&](testing & t) {
                 llama_decision::decision_request reversed = req;
                 std::reverse(reversed.questions.begin(), reversed.questions.end());
-                const auto probs_rev = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, reversed, pool,
+                const auto probs_rev = test_letter_readout(eng, *vocab, nullptr, false, reversed, pool,
                                                                       llama_decision::options{}, nullptr);
                 bool stable = probs_rev.size() == probs.size();
                 for (size_t i = 0; stable && i < req.questions.size(); ++i) {
@@ -1983,10 +2139,10 @@ static void test_letter_readout_real(testing & t) {
                     body["temperatures"] = common_json::parse(temps);
                     return llama_decision::parse_decision_request(body);
                 };
-                const auto sharp = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+                const auto sharp = test_letter_readout(eng, *vocab, nullptr, false,
                                                                   with_temps(R"({"noul":0.5,"choice":0.5,"score":0.5})"),
                                                                   pool, llama_decision::options{}, nullptr);
-                const auto flat = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+                const auto flat = test_letter_readout(eng, *vocab, nullptr, false,
                                                                  with_temps(R"({"noul":2.5,"choice":2.5,"score":2.5})"),
                                                                  pool, llama_decision::options{}, nullptr);
                 auto top = [](const std::vector<float> & p) {
@@ -2042,8 +2198,7 @@ static void test_letter_readout_real(testing & t) {
 static void test_fork_real(testing & t) {
     t.test("copy, bypass and LRU behave", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -2807,6 +2962,368 @@ static void test_session_fork(testing & t) {
             session_fork_position_run(t, te.ctx, "gpu");
         } catch (const std::exception & e) {
             t.assert_true(std::string("the GPU session fork: ") + e.what(), false);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- session arena
+
+// The owned snapshot of a completed turn: serialized on the scheduler thread into a free arena
+// sequence, so a decision about a slot survives the slot's KV being cleared by cache_idle_slots.
+// The arena is the "one retained turn per slot" substrate; the runs below are the M4.5 guarantees
+// and the M5 exact trigger counters, all on the shared full-logits context.
+
+// Decode a transcript and take a snapshot of it, returning the arena sequence id. Shared setup so
+// every run exercises the same save/restore primitive.
+static llama_seq_id session_arena_prepare(llama_context * ctx,
+                                          llama_decision::session_arena & arena, int slot,
+                                          const std::vector<llama_token> & transcript, const std::string & turn,
+                                          testing & t, const std::string & lane) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, slot, 0, transcript))) {
+        return -1;
+    }
+    llama_synchronize(ctx);
+    const llama_seq_id snap = arena.snapshot(slot, slot, (llama_pos) transcript.size(), turn);
+    t.assert_true(lane + ": the snapshot is taken", snap >= 0);
+    return snap;
+}
+
+// The snapshot survives the origin being cleared and reused: after freeing and re-decoding the
+// slot, the retained arena sequence still holds the turn and its continuation matches a fresh
+// prefill of the same transcript within the producer bound.
+static void session_arena_after_clear_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the first completed chat turn", false, true);
+    const auto branch     = common_tokenize(vocab, "the follow-up branch", false, true);
+    if (transcript.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_arena arena(ctx, 6, 2, 4);
+    const llama_seq_id snap_seq = session_arena_prepare(ctx, arena, 0, transcript, "turn-1", t, lane);
+    if (snap_seq < 0) {
+        return;
+    }
+
+    // the origin slot is cleared and reused by the next turn
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    if (!t.assert_true(lane + ": the cleared origin re-decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    const llama_decision::session_snapshot * snap = arena.find(0);
+    t.assert_true(lane + ": the retained snapshot survives the origin clear", snap != nullptr && snap->active);
+    t.assert_equal(lane + ": the retained arena sequence is the one taken", snap_seq,
+                   snap != nullptr ? snap->arena_seq : -1);
+
+    // the continuation agrees within the producer bound: the slot re-prefilled the same transcript
+    // and both continue with the branch
+    const llama_pos pos = (llama_pos) transcript.size();
+    if (!t.assert_true(lane + ": the live slot continues", decode_tokens_on(ctx, 0, pos, branch))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const auto live = output_logits(ctx, vocab, -1);
+    if (!t.assert_true(lane + ": the retained snapshot continues", decode_tokens_on(ctx, snap_seq, pos, branch))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const auto kept = output_logits(ctx, vocab, -1);
+    const double delta = max_abs_logit_delta(live, kept);
+    const double bound = lane == "gpu" ? 5e-2 : 0.0;
+    t.assert_true(lane + ": the cleared-origin continuation matches the retained snapshot (delta " +
+                      std::to_string(delta) + ")",
+                  delta <= bound);
+}
+
+// The restored snapshot is a byte-exact copy on the CPU lane and reproduces the producer's
+// continuation within the producer bound on the GPU lane.
+static void session_arena_restore_fidelity_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the retained turn for the fidelity check", false, true);
+    const auto branch     = common_tokenize(vocab, "the continuing branch", false, true);
+    if (transcript.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_arena arena(ctx, 6, 2, 4);
+    const llama_seq_id snap_seq = session_arena_prepare(ctx, arena, 0, transcript, "", t, lane);
+    if (snap_seq < 0) {
+        return;
+    }
+    const std::vector<uint8_t> src_state  = seq_state_dump(ctx, 0);
+    const std::vector<uint8_t> snap_state = seq_state_dump(ctx, snap_seq);
+    t.assert_true(lane + ": both states are non-empty", !src_state.empty() && !snap_state.empty());
+
+    // continuation equivalence: the live slot is cleared, the transcript re-prefilled, and both the
+    // slot and the retained snapshot continue with the same branch
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    if (!t.assert_true(lane + ": the re-prefilled slot decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_pos pos = (llama_pos) transcript.size();
+    if (!t.assert_true(lane + ": the slot continues", decode_tokens_on(ctx, 0, pos, branch))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const auto live = output_logits(ctx, vocab, -1);
+    if (!t.assert_true(lane + ": the retained snapshot continues", decode_tokens_on(ctx, snap_seq, pos, branch))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const auto kept = output_logits(ctx, vocab, -1);
+    const double delta = max_abs_logit_delta(live, kept);
+    const double bound = lane == "gpu" ? 5e-2 : 0.0;
+    t.assert_true(lane + ": the restored snapshot reproduces the continuation (delta " +
+                      std::to_string(delta) + ")",
+                  delta <= bound);
+
+    // byte-exactness last: normalize_seq_state clears the cache, so it must not run while the
+    // continuation check still needs the retained sequence. On the GPU the physical cell placement
+    // can differ, so the byte-exact guarantee is the CPU lane only.
+    if (lane == "cpu") {
+        // re-serializing both through the same scratch sequence normalizes the seq id and the cell
+        // layout, leaving only the state content for the byte comparison
+        const auto a = normalize_seq_state(ctx, src_state, 8);
+        const auto b = normalize_seq_state(ctx, snap_state, 8);
+        std::string detail;
+        const size_t diff = state_bytes_diff(a, b, &detail);
+        t.assert_equal(lane + ": the restored state is byte-exact", 0ull, diff);
+    }
+}
+
+// Multiple retained sessions coexist: each slot holds its own turn, the arena sequences are
+// distinct, and releasing one does not disturb the others.
+static void session_arena_multi_snapshot_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0 = common_tokenize(vocab, "the first independent turn", false, true);
+    const auto t1 = common_tokenize(vocab, "the second independent turn", false, true);
+    const auto t2 = common_tokenize(vocab, "the third independent turn", false, true);
+    if (t0.empty() || t1.empty() || t2.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_arena arena(ctx, 6, 4, 4);
+
+    // each slot decodes its own transcript without clearing the cache, so the earlier snapshots
+    // survive the later ones
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": turn 0 decodes", decode_tokens_on(ctx, 0, 0, t0)) ||
+        !t.assert_true(lane + ": turn 1 decodes", decode_tokens_on(ctx, 1, 0, t1)) ||
+        !t.assert_true(lane + ": turn 2 decodes", decode_tokens_on(ctx, 2, 0, t2))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_seq_id s0 = arena.snapshot(0, 0, (llama_pos) t0.size(), "a");
+    const llama_seq_id s1 = arena.snapshot(1, 1, (llama_pos) t1.size(), "b");
+    const llama_seq_id s2 = arena.snapshot(2, 2, (llama_pos) t2.size(), "c");
+    if (s0 < 0 || s1 < 0 || s2 < 0) {
+        t.assert_true(lane + ": every retained turn is snapshotted", false);
+        return;
+    }
+    t.assert_true(lane + ": the retained sequences are distinct",
+                  s0 != s1 && s1 != s2 && s0 != s2);
+    t.assert_equal(lane + ": three retained turns are held", 3, arena.n_snapshots());
+
+    // each retained turn keeps its own tag and position
+    const llama_decision::session_snapshot * a = arena.find(0);
+    const llama_decision::session_snapshot * b = arena.find(1);
+    const llama_decision::session_snapshot * c = arena.find(2);
+    t.assert_true(lane + ": every slot holds a snapshot", a != nullptr && b != nullptr && c != nullptr);
+    if (a != nullptr) {
+        t.assert_equal(lane + ": the retained tag survives", std::string("a"), a->turn);
+    }
+    t.assert_equal(lane + ": the retained position survives", (long long) t1.size(),
+                   b != nullptr ? (long long) b->pos : -1);
+
+    // releasing one turn leaves the others intact
+    arena.release(1);
+    t.assert_true(lane + ": the released turn is gone", arena.find(1) == nullptr);
+    t.assert_true(lane + ": the other turns stay", arena.find(0) != nullptr && arena.find(2) != nullptr);
+    t.assert_equal(lane + ": one release is counted", 1, arena.n_releases());
+    // the snapshot counter is the cumulative fire count (M5), so it keeps the total taken
+    t.assert_equal(lane + ": the fire count keeps the snapshots taken", 3, arena.n_snapshots());
+}
+
+// A decision never writes to the source slot: the snapshot serializes and restores owned copies,
+// and scoring a fork from the arena sequence must not touch the transcript's cells.
+static void session_arena_source_invariance_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the transcript that must never be written", false, true);
+    const auto branch     = common_tokenize(vocab, "the decision branch", false, true);
+    if (transcript.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const std::vector<uint8_t> before = seq_state_dump(ctx, 0);
+
+    llama_decision::session_arena arena(ctx, 6, 2, 4);
+    const llama_seq_id snap_seq = arena.snapshot(0, 0, (llama_pos) transcript.size(), "");
+    t.assert_true(lane + ": the snapshot is taken", snap_seq >= 0);
+    t.assert_true(lane + ": the snapshot does not write the source", before == seq_state_dump(ctx, 0));
+
+    // a decision fork continues on the arena sequence; the source stays untouched
+    if (!t.assert_true(lane + ": the fork decodes on the arena sequence",
+                       decode_tokens_on(ctx, snap_seq, (llama_pos) transcript.size(), branch))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    t.assert_true(lane + ": scoring a fork never writes the source", before == seq_state_dump(ctx, 0));
+}
+
+// The turn identity and advance policy: a snapshot is current only at its captured position, a
+// cleared slot keeps the snapshot current, and an advanced turn must discard it. These are the
+// exact counters the cost heuristic is calibrated against.
+static void session_arena_turn_policy_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0 = common_tokenize(vocab, "the first turn", false, true);
+    const auto t1 = common_tokenize(vocab, "the next turn", false, true);
+    if (t0.empty() || t1.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_arena arena(ctx, 6, 2, 4);
+
+    // control group: turns that are never queried produce zero snapshots and zero arena reuses
+    t.assert_equal(lane + ": no snapshots before any query", 0, arena.n_snapshots());
+    t.assert_equal(lane + ": no reuses before any query", 0, arena.n_reuses());
+
+    // fire group: one turn queried N times takes exactly one snapshot and N-1 reuses
+    const llama_seq_id snap_seq = session_arena_prepare(ctx, arena, 0, t0, "turn-a", t, lane);
+    if (snap_seq < 0) {
+        return;
+    }
+    const llama_decision::session_snapshot * snap = arena.find(0);
+    t.assert_true(lane + ": the retained turn is current at its position",
+                  snap != nullptr && llama_decision::session_arena::snapshot_is_current(snap, snap->pos));
+    t.assert_true(lane + ": a cleared slot keeps the snapshot current",
+                  llama_decision::session_arena::snapshot_is_current(snap, -1));
+    t.assert_true(lane + ": an advanced slot makes the snapshot stale",
+                  !llama_decision::session_arena::snapshot_is_current(snap, snap->pos + 1));
+    const int n_reuse = 3;
+    for (int i = 0; i < n_reuse; ++i) {
+        t.assert_equal(lane + ": the reuse returns the arena sequence", snap_seq, arena.reuse(0));
+    }
+    t.assert_equal(lane + ": one turn queried N times takes one snapshot", 1, arena.n_snapshots());
+    t.assert_equal(lane + ": one turn queried N times takes N-1 reuses", n_reuse, arena.n_reuses());
+
+    // turn advance: the slot decoded a new turn, so the retained snapshot is discarded before the
+    // next decision
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    if (!t.assert_true(lane + ": the next turn decodes", decode_tokens_on(ctx, 0, 0, t1))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    arena.release(0);
+    t.assert_true(lane + ": the advanced turn discards the previous snapshot", arena.find(0) == nullptr);
+    t.assert_equal(lane + ": one discard is counted", 1, arena.n_releases());
+}
+
+// The per-turn cost is a measured number: snapshot bytes grow with the transcript length and the
+// save/restore time is finite and positive. The recorded values are the cost calibration, reported
+// per model, never a gate.
+static void session_arena_cost_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto fill = common_tokenize(vocab, "the transcript filler for the cost measurement ", false, true);
+    if (fill.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_arena arena(ctx, 6, 4, 4);
+
+    size_t last_bytes = 0;
+    int    len_toks   = 0;
+    // keep every transcript below n_batch (the context batches one decode at a time)
+    for (int rounds : { 1, 4, 8 }) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        std::vector<llama_token> transcript;
+        while ((int) transcript.size() < rounds * (int) fill.size()) {
+            transcript.insert(transcript.end(), fill.begin(), fill.end());
+        }
+        if (!decode_tokens_on(ctx, 0, 0, transcript)) {
+            t.skip(lane + ": the transcript does not decode");
+            return;
+        }
+        llama_synchronize(ctx);
+        const auto t0 = std::chrono::steady_clock::now();
+        const llama_seq_id snap = arena.snapshot(0, 0, (llama_pos) transcript.size(), "");
+        const auto t1 = std::chrono::steady_clock::now();
+        if (snap < 0) {
+            t.assert_true(lane + ": the cost snapshot is taken", false);
+            return;
+        }
+        const llama_decision::session_snapshot * s = arena.find(0);
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t.assert_true(lane + ": the snapshot bytes are recorded", s != nullptr && s->n_bytes > 0);
+        t.assert_true(lane + ": the snapshot time is finite and positive", ms > 0.0);
+        t.assert_true(lane + ": a longer transcript snapshots at least as many bytes",
+                      s == nullptr || s->n_bytes >= last_bytes);
+        fprintf(stderr, "%s session arena cost: %d tokens -> %zu bytes in %.3f ms\n",
+                lane.c_str(), (int) transcript.size(), s != nullptr ? s->n_bytes : 0, ms);
+        last_bytes = s != nullptr ? s->n_bytes : last_bytes;
+        len_toks   = (int) transcript.size();
+        arena.release(0);
+    }
+    t.assert_true(lane + ": the cost measurement grew the transcript", len_toks > 0);
+}
+
+static void test_session_arena(testing & t) {
+    t.test("the session arena keeps owned turn snapshots on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_arena_after_clear_run(t, te.ctx, "cpu");
+            session_arena_restore_fidelity_run(t, te.ctx, "cpu");
+            session_arena_multi_snapshot_run(t, te.ctx, "cpu");
+            session_arena_source_invariance_run(t, te.ctx, "cpu");
+            session_arena_turn_policy_run(t, te.ctx, "cpu");
+            session_arena_cost_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU session arena: ") + e.what(), false);
+        }
+    });
+
+    t.test("the session arena keeps owned turn snapshots on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_arena_after_clear_run(t, te.ctx, "gpu");
+            session_arena_restore_fidelity_run(t, te.ctx, "gpu");
+            session_arena_multi_snapshot_run(t, te.ctx, "gpu");
+            session_arena_source_invariance_run(t, te.ctx, "gpu");
+            session_arena_turn_policy_run(t, te.ctx, "gpu");
+            session_arena_cost_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU session arena: ") + e.what(), false);
         }
     });
 }
@@ -3764,7 +4281,7 @@ static void test_device_layout_mutation_round_trip(testing & t) {
             return;
         }
         cpu_test_engine te;
-        if (!te.load(path, 512, false, false)) {
+        if (!te.load(path, 512, false)) {
             t.assert_true("the CPU decision scaffold loads the model", false);
             return;
         }
@@ -3977,37 +4494,6 @@ static void test_prefix_cache_cost(testing & t) {
 
 // An arch whose output table has no per-id bias must still build a usable head: the kept zero
 // bias adds nothing, and the probe must not tighten into a failure.
-static void test_classifier_head_unbiased(testing & t) {
-    t.test("an unbiased output table still builds a usable answer head", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te;
-        if (!te.load(path)) {
-            t.assert_true("the CPU decision scaffold loads the model", false);
-            return;
-        }
-        std::vector<llama_decision::label> labels;
-        labels.push_back({ "A", { 0 }, 0 });
-        labels.push_back({ "B", { 1 }, 1 });
-        const auto head = llama_decision::build_classifier_head(te.model, labels);
-        if (!head.available()) {
-            t.skip("the generated model has no classifier output table: " + head.reason);
-            return;
-        }
-        t.assert_equal("the head covers both labels", (size_t) 2, head.ids.size());
-        t.assert_equal("the head width is the hidden width",
-                       (int) llama_model_n_embd_out(te.model), head.width);
-        t.assert_equal("an unbiased model keeps a bias vector", head.ids.size(), head.bias.size());
-        bool zeros = head.bias.size() == head.ids.size();
-        for (float v : head.bias) {
-            zeros = zeros && v == 0.0f;
-        }
-        t.assert_true("an unbiased model adds a zero bias", zeros);
-    });
-}
 
 
 // A bounded decision context rejects a request that cannot fit before decoding, with a clear
@@ -4147,7 +4633,7 @@ static void test_multi_trunk_restore(testing & t) {
                        return;
                    }
                    cpu_test_engine te;
-                   if (!te.load(path, 512, false, false, 128, 18)) {
+                   if (!te.load(path, 512, false, 128, 18)) {
                        t.assert_true("the CPU decision scaffold loads the model", false);
                        return;
                    }
@@ -4387,455 +4873,16 @@ static void test_fork_swa_clamp(testing & t) {
     });
 }
 
-// A classifier-only context is selected through llama_context_params. The field must be appended
-// after every pre-existing member so the by-value C ABI offsets of existing fields do not move.
-static void test_context_params_append(testing & t) {
-    t.test("classifier_only is appended and defaults off", [](testing & t) {
-        t.assert_true("classifier_only follows the pre-existing ctx_other member",
-                      offsetof(llama_context_params, classifier_only) > offsetof(llama_context_params, ctx_other));
-        t.assert_true("classifier_only defaults false", !llama_context_default_params().classifier_only);
-    });
-}
-
-// A classifier-only context stops after the post-norm hidden state. That state must be identical
-// to the full context's hidden state for the same input, so the shared graph stop cannot change
-// what the answer rows are scored against.
-// A classifier-only context has no logits and never samples, so a sampler attached late would be
-// silently ignored. It must be rejected and reported as absent instead.
-static void test_classifier_only_sampler(testing & t) {
-    t.test("a classifier-only context rejects a sampler and reports none", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te_cls;
-        if (!te_cls.load(path, 256, true, false)) {
-            t.assert_true("the classifier-only context loads", false);
-            return;
-        }
-
-        llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
-        bool threw = false;
-        try {
-            (void) llama_set_sampler(te_cls.ctx, 0, chain);
-        } catch (const std::runtime_error &) {
-            threw = true;
-        }
-        t.assert_true("a sampler is rejected on a classifier-only context", threw);
-        llama_sampler_free(chain);
-
-        // D3: a classifier-only context's hidden states are the answer head's input, so
-        // set_embeddings(false) must be a warning-only no-op there. A normal context still honors
-        // the request. Losing the hidden states would leave the context with neither logits nor
-        // embeddings.
-        const auto decode_has_embeddings = [](cpu_test_engine & te) {
-            const llama_vocab * v = llama_model_get_vocab(te.model);
-            const std::vector<llama_token> toks = common_tokenize(v, "contract", false, true);
-            llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
-            for (size_t i = 0; i < toks.size(); ++i) {
-                common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, true);
-            }
-            const int rc = llama_decode(te.ctx, batch);
-            llama_batch_free(batch);
-            llama_synchronize(te.ctx);
-            return rc == 0 && llama_get_embeddings_ith(te.ctx, (int) toks.size() - 1) != nullptr;
-        };
-
-        // control: the same sampler attaches to a normal context, so the rejection above is
-        // specific to the classifier-only context
-        cpu_test_engine te_full;
-        if (te_full.load(path, 256, false, true)) {
-            llama_sampler * chain2 = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            llama_sampler_chain_add(chain2, llama_sampler_init_greedy());
-            const bool ok = llama_set_sampler(te_full.ctx, 0, chain2);
-            t.assert_true("a normal context accepts the sampler", ok);
-            llama_set_sampler(te_full.ctx, 0, nullptr);
-            llama_sampler_free(chain2);
-
-            llama_set_embeddings(te_full.ctx, false);
-            t.assert_true("a normal context honors set_embeddings(false)",
-                          !decode_has_embeddings(te_full));
-        }
-
-        llama_set_embeddings(te_cls.ctx, false);
-        t.assert_true("a classifier-only context keeps hidden states after set_embeddings(false)",
-                      decode_has_embeddings(te_cls));
-    });
-}
-
-// Host-runnable check of llama_model_classifier_rows: dequantize a handful of output rows on the
-// CPU dummy model (F32 output) and verify dot(hidden,row) + bias reproduces the full-vocabulary
-// logit. This is the only CI path for the row/offset math and the to_float dequant.
-static void test_classifier_rows_host(testing & t) {
-    t.test("classifier rows reproduce full-vocabulary logits on the CPU dummy model", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te;
-        if (!te.load(path, 256, false, true)) {
-            t.assert_true("the CPU decision scaffold loads the model", false);
-            return;
-        }
-        const llama_vocab * vocab = llama_model_get_vocab(te.model);
-        const std::vector<llama_token> toks = common_tokenize(vocab, "the decision state", false, true);
-        if (toks.empty()) {
-            t.skip("the model has no usable tokens");
-            return;
-        }
-        llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
-        for (size_t i = 0; i < toks.size(); ++i) {
-            common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, i + 1 == toks.size());
-        }
-        if (llama_decode(te.ctx, batch)) {
-            llama_batch_free(batch);
-            t.assert_true("the prompt decodes on the CPU backend", false);
-            return;
-        }
-        llama_batch_free(batch);
-        llama_synchronize(te.ctx);
-
-        const float * hidden = llama_get_embeddings_ith(te.ctx, -1);
-        const float * logits = llama_get_logits_ith(te.ctx, -1);
-        if (hidden == nullptr || logits == nullptr) {
-            t.skip("the generated model does not expose hidden states and logits");
-            return;
-        }
-        const int width   = (int) llama_model_n_embd_out(te.model);
-        const int n_vocab = llama_vocab_n_tokens(vocab);
-
-        std::vector<llama_token> ids;
-        for (int i = 0; i < 8 && i < n_vocab; ++i) {
-            ids.push_back((llama_token) i);
-        }
-        if (ids.size() < 2) {
-            t.skip("the generated vocabulary is too small");
-            return;
-        }
-        std::vector<float> rows((size_t) ids.size() * (size_t) width);
-        std::vector<float> bias(ids.size(), 0.0f);
-        float softcap = -1.0f;
-        const int w = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                  rows.data(), rows.size(), &softcap, bias.data());
-        t.assert_equal("the row width is the hidden width", width, w);
-        t.assert_true("no softcap on a non-Gemma4 head", softcap == 0.0f);
-
-        for (size_t i = 0; i < ids.size(); ++i) {
-            double dot = 0.0;
-            for (int j = 0; j < width; ++j) {
-                dot += (double) hidden[j] * rows[i * (size_t) width + (size_t) j];
-            }
-            const double predicted = dot + bias[i];
-            const double actual    = logits[ids[i]];
-            t.assert_true("row score matches the full logit for id " + std::to_string(ids[i]),
-                          std::fabs(predicted - actual) <= 1e-3);
-        }
-
-        // an out-of-range id is rejected, never read past the vocabulary
-        std::vector<llama_token> bad = { 0, 1, (llama_token) n_vocab };
-        float sc = 0.0f;
-        const int bad_w = llama_model_classifier_rows(te.model, bad.data(), (int32_t) bad.size(),
-                                                      rows.data(), rows.size(), &sc, nullptr);
-        t.assert_equal("an out-of-range id is rejected", 0, bad_w);
-
-        // count == 1 is supported and returns the correct width
-        {
-            std::vector<llama_token> one = { 0 };
-            std::vector<float> one_rows((size_t) width);
-            float sc1 = -1.0f;
-            const int w1 = llama_model_classifier_rows(te.model, one.data(), 1,
-                                                       one_rows.data(), one_rows.size(), &sc1, nullptr);
-            t.assert_equal("a single id is supported", width, w1);
-        }
-
-        // count == 0 is refused
-        float sc0 = 0.0f;
-        const int w0 = llama_model_classifier_rows(te.model, ids.data(), 0, rows.data(), 0, &sc0, nullptr);
-        t.assert_equal("count == 0 is refused", 0, w0);
-
-        // count == 255 is the largest accepted batch; 256 is refused, never read
-        {
-            constexpr int MAX_ROWS = 255;
-            std::vector<llama_token> ids_max(MAX_ROWS, 0);
-            for (int i = 0; i < MAX_ROWS && i < n_vocab; ++i) {
-                ids_max[(size_t) i] = (llama_token) i;
-            }
-            std::vector<float> rows_max((size_t) MAX_ROWS * (size_t) width);
-            float sc_max = -1.0f;
-            const int w_max = llama_model_classifier_rows(te.model, ids_max.data(), MAX_ROWS,
-                                                          rows_max.data(), rows_max.size(), &sc_max, nullptr);
-            t.assert_equal("count == 255 is accepted", width, w_max);
-            t.assert_true("softcap is written on a 255-row success", sc_max == 0.0f);
-
-            std::vector<llama_token> ids_over(256, 0);
-            std::vector<float> rows_over((size_t) 256 * (size_t) width);
-            float sc_over = -1.0f;
-            const int w_over = llama_model_classifier_rows(te.model, ids_over.data(), 256,
-                                                           rows_over.data(), rows_over.size(), &sc_over, nullptr);
-            t.assert_equal("count == 256 is refused", 0, w_over);
-        }
-
-        // an oversized dst_count is refused (dst_count must match count * width exactly)
-        const int wbig = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                     rows.data(), rows.size() + 1, &sc0, nullptr);
-        t.assert_equal("an oversized dst_count is refused", 0, wbig);
-
-        // the unreadable-bias probe (0) needs a model whose output bias is block-quantized; no
-        // generated fixture produces one (a 1-D bias is always F32), so the rejection branch is
-        // covered by code review, not by this fixture
-
-        // a second call returns byte-identical rows
-        std::vector<float> rows2((size_t) ids.size() * (size_t) width);
-        float sc2 = -1.0f;
-        const int w2 = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                   rows2.data(), rows2.size(), &sc2, nullptr);
-        t.assert_equal("a second call has the same width", w, w2);
-        t.assert_true("a second call returns identical rows", rows == rows2);
-    });
-}
-
-// The row reader must dequantize a quantized output table exactly as the graph's output projection
-// does, so dot(hidden, dequantized_row) + bias reproduces the full logit. The generated fixtures
-// are F32, so quantize one to Q8_0 first: this is the only CPU-CI path through ggml's to_float
-// row dequant.
-static void test_classifier_rows_dequant(testing & t) {
-    t.test("classifier rows dequantize a quantized output table", [](testing & t) {
-        const std::string f32_path = std::string(DECISION_TEST_GENERATED_MODEL_DIR) + "/qwen35-dense.gguf";
-        if (!file_exists(f32_path)) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        const std::string q_path = std::string(DECISION_TEST_GENERATED_MODEL_DIR) + "/qwen35-dense-q8_0.gguf";
-        {
-            llama_model_quantize_params qp = llama_model_quantize_default_params();
-            qp.ftype = LLAMA_FTYPE_MOSTLY_Q8_0;
-            qp.quantize_output_tensor = true;
-            qp.nthread = 1;
-            if (llama_model_quantize(f32_path.c_str(), q_path.c_str(), &qp) != 0) {
-                t.skip("the generated model could not be quantized");
-                return;
-            }
-        }
-        cpu_test_engine te;
-        if (!te.load(q_path, 256, false, true)) {
-            t.skip("the quantized generated model could not be loaded");
-            return;
-        }
-        const llama_vocab * vocab = llama_model_get_vocab(te.model);
-        const std::vector<llama_token> toks = common_tokenize(vocab, "the decision state", false, true);
-        if (toks.empty()) {
-            t.skip("the model has no usable tokens");
-            return;
-        }
-        llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
-        for (size_t i = 0; i < toks.size(); ++i) {
-            common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, i + 1 == toks.size());
-        }
-        const int rc = llama_decode(te.ctx, batch);
-        llama_batch_free(batch);
-        if (rc != 0) {
-            t.assert_true("the quantized prompt decodes on the CPU backend", false);
-            return;
-        }
-        llama_synchronize(te.ctx);
-        const float * hidden = llama_get_embeddings_ith(te.ctx, -1);
-        const float * logits = llama_get_logits_ith(te.ctx, -1);
-        if (hidden == nullptr || logits == nullptr) {
-            t.skip("the quantized model does not expose hidden states and logits");
-            return;
-        }
-        const int width   = (int) llama_model_n_embd_out(te.model);
-        const int n_vocab = llama_vocab_n_tokens(vocab);
-        std::vector<llama_token> ids;
-        for (int i = 0; i < 8 && i < n_vocab; ++i) {
-            ids.push_back((llama_token) i);
-        }
-        std::vector<float> rows((size_t) ids.size() * (size_t) width);
-        std::vector<float> bias(ids.size(), 0.0f);
-        float softcap = -1.0f;
-        const int w = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                  rows.data(), rows.size(), &softcap, bias.data());
-        t.assert_equal("the dequantized row width is the hidden width", width, w);
-        t.assert_true("a quantized non-Gemma4 head reports no softcap", softcap == 0.0f);
-        for (size_t i = 0; i < ids.size(); ++i) {
-            double dot = 0.0;
-            for (int j = 0; j < width; ++j) {
-                dot += (double) hidden[j] * rows[i * (size_t) width + (size_t) j];
-            }
-            const double predicted = dot + bias[i];
-            const double actual    = logits[ids[i]];
-            t.assert_true("dequantized row score matches the full logit for id " + std::to_string(ids[i]),
-                          std::fabs(predicted - actual) <= 1e-3);
-        }
-    });
-}
-
-// One predicate owns "can this model serve the classifier answer head". The generated qwen35
-// fixture (equal widths) is the accepted control; the qwen4exp fixture has an output row width
-// different from the hidden width, so it is refused with a non-empty reason. A refusal never
-// blocks scoring: callers fall back to full logits.
-static void test_classifier_support_predicate(testing & t) {
-    t.test("the classifier support predicate accepts and refuses with a reason", [](testing & t) {
-        const std::string ok_path = decision_cpu_model_path();
-        if (ok_path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        {
-            cpu_test_engine te;
-            if (!te.load(ok_path, 256)) {
-                t.assert_true("the accepted control loads the model", false);
-                return;
-            }
-            const char * reason = (const char *) 0x1; // prove the predicate always writes the out-param
-            const bool ok = llama_model_classifier_supported(te.model, &reason);
-            t.assert_true("a matching model is supported", ok);
-            t.assert_true("a supported model reports no reason", reason == nullptr);
-        }
-        {
-            const std::string bad_path = std::string(DECISION_TEST_GENERATED_MODEL_DIR) + "/qwen4exp-moe.gguf";
-            if (!file_exists(bad_path)) {
-                t.skip("no qwen4exp fixture; run the generate-models fixture");
-                return;
-            }
-            cpu_test_engine te;
-            if (!te.load(bad_path, 256)) {
-                t.assert_true("the mismatch fixture loads the model", false);
-                return;
-            }
-            const char * reason = nullptr;
-            const bool ok = llama_model_classifier_supported(te.model, &reason);
-            t.assert_true("a width mismatch is refused", !ok);
-            t.assert_true("a refusal explains itself", reason != nullptr && reason[0] != '\0');
-        }
-    });
-}
-
-// The answer-row width contract: rows are read against the hidden state the classifier-only
-// context exposes (n_embd_out), so an output tensor whose row width differs from it must be
-// refused. The generated qwen4exp fixture sets embedding_length_out != embedding_length, which
-// is exactly that case; qwen35 (equal widths) is the accepted control.
-static void test_classifier_rows_width_contract(testing & t) {
-    t.test("classifier rows accept a matching hidden width and reject a mismatched one", [](testing & t) {
-        // accepted control: embedding_length_out is absent, so n_embd_out == output row width
-        const std::string ok_path = decision_cpu_model_path();
-        if (ok_path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        {
-            cpu_test_engine te;
-            if (!te.load(ok_path, 256)) {
-                t.assert_true("the accepted control loads the model", false);
-                return;
-            }
-            std::vector<llama_token> ids = { 0, 1 };
-            const int width = (int) llama_model_n_embd_out(te.model);
-            std::vector<float> rows((size_t) ids.size() * (size_t) width);
-            float softcap = 0.0f;
-            const int w = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                      rows.data(), rows.size(), &softcap, nullptr);
-            t.assert_equal("a matching output width is accepted with the hidden width", width, w);
-        }
-
-        // rejected: embedding_length_out != embedding_length, so the output row width differs
-        // from the hidden state width; the rows must be refused, never mis-scored
-        const std::string bad_path = std::string(DECISION_TEST_GENERATED_MODEL_DIR) + "/qwen4exp-moe.gguf";
-        if (!file_exists(bad_path)) {
-            t.skip("no qwen4exp fixture; run the generate-models fixture");
-            return;
-        }
-        {
-            cpu_test_engine te;
-            if (!te.load(bad_path, 256)) {
-                t.assert_true("the mismatch fixture loads the model", false);
-                return;
-            }
-            t.assert_true("the fixture has embedding_length_out != embedding_length",
-                          llama_model_n_embd_out(te.model) != (int32_t) llama_model_n_embd(te.model));
-            std::vector<llama_token> ids = { 0, 1 };
-            const int width = (int) llama_model_n_embd_out(te.model);
-            std::vector<float> rows((size_t) ids.size() * (size_t) width);
-            float softcap = 0.0f;
-            const int w = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                      rows.data(), rows.size(), &softcap, nullptr);
-            t.assert_equal("a mismatched output width is refused", 0, w);
-            // even sized by the main embedding length, the rows are refused: the output rows can
-            // never be scored against a hidden state of a different width
-            std::vector<float> rows_embd((size_t) ids.size() * (size_t) llama_model_n_embd(te.model));
-            const int w_embd = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                           rows_embd.data(), rows_embd.size(), &softcap, nullptr);
-            t.assert_equal("a mismatched output width is refused whatever the caller sizes", 0, w_embd);
-        }
-    });
-}
-
-static void test_classifier_only_hidden_state(testing & t) {
-    t.test("a classifier-only context exposes the same hidden state as a full context", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te_full;
-        cpu_test_engine te_cls;
-        if (!te_full.load(path, 256, false, true) || !te_cls.load(path, 256, true, false)) {
-            t.assert_true("the CPU decision scaffold loads the model", false);
-            return;
-        }
-        const auto decode_hidden = [](cpu_test_engine & te) {
-            const llama_vocab * vocab = llama_model_get_vocab(te.model);
-            const std::vector<llama_token> toks = common_tokenize(vocab, "the decision state", false, true);
-            if (toks.empty()) {
-                return std::vector<float>();
-            }
-            llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
-            for (size_t i = 0; i < toks.size(); ++i) {
-                common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, i + 1 == toks.size());
-            }
-            const int rc = llama_decode(te.ctx, batch);
-            llama_batch_free(batch);
-            if (rc != 0) {
-                return std::vector<float>();
-            }
-            llama_synchronize(te.ctx);
-            const float * e = llama_get_embeddings_ith(te.ctx, (int) toks.size() - 1);
-            const uint32_t w = llama_model_n_embd_out(te.model);
-            if (e == nullptr) {
-                return std::vector<float>();
-            }
-            return std::vector<float>(e, e + w);
-        };
-        const auto h_full = decode_hidden(te_full);
-        const auto h_cls  = decode_hidden(te_cls);
-        if (h_full.empty() || h_cls.empty()) {
-            t.skip("the generated model does not expose both hidden-state paths");
-            return;
-        }
-        t.assert_equal("both hidden states have the output width", h_full.size(), h_cls.size());
-        bool same = h_full.size() == h_cls.size();
-        for (size_t i = 0; same && i < h_full.size(); ++i) {
-            same = std::fabs(h_full[i] - h_cls[i]) < 1e-5f;
-        }
-        t.assert_true("the classifier-only hidden state equals the full context's", same);
-    });
-}
-
 // ---------------------------------------------------------------- CPU scoring oracle
 //
 // The scoring substrata below are exercised on the generated dummy model, with no GPU and no
 // LLAMA_DECISION_TEST_MODEL. The recorded values are the oracle for behavior-preserving
-// refactors: a change to field compilation, head selection, or row scoring must not move them.
+// refactors: a change to field compilation or branch scoring must not move them.
 // Backends may reorder a reduction, so probabilities are compared with a tolerance.
 
 static common_json oracle_readout(const llama_decision::letter_metrics & m,
                                   const std::vector<std::vector<float>> & probs) {
     common_json o = common_json::object();
-    o["head_active"]          = m.head_active;
-    o["head_reason"]          = m.head_reason;
     o["cache_hit"]            = m.cache_hit;
     o["suffix_tokens"]        = (long long) m.suffix_tokens;
     o["common_suffix_tokens"] = (long long) m.common_suffix_tokens;
@@ -4863,52 +4910,6 @@ static common_json oracle_readout(const llama_decision::letter_metrics & m,
 
 // dot(hidden, dequantized_row) + bias vs the full-vocabulary logit, over a few ids. This is the
 // arithmetic identity the answer-head fast path relies on; the frozen value is the observed error.
-static common_json oracle_classifier_rows(cpu_test_engine & te) {
-    common_json o = common_json::object();
-    const llama_vocab * vocab = llama_model_get_vocab(te.model);
-    const std::vector<llama_token> toks = common_tokenize(vocab, "the decision state", false, true);
-    if (toks.empty()) {
-        return o;
-    }
-    llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
-    for (size_t i = 0; i < toks.size(); ++i) {
-        common_batch_add(batch, toks[i], (llama_pos) i, { 0 }, i + 1 == toks.size());
-    }
-    const int rc = llama_decode(te.ctx, batch);
-    llama_batch_free(batch);
-    if (rc != 0) {
-        return o;
-    }
-    llama_synchronize(te.ctx);
-    const float * hidden = llama_get_embeddings_ith(te.ctx, -1);
-    const float * logits = llama_get_logits_ith(te.ctx, -1);
-    if (hidden == nullptr || logits == nullptr) {
-        return o;
-    }
-    const int width   = (int) llama_model_n_embd_out(te.model);
-    const int n_vocab = llama_vocab_n_tokens(vocab);
-    std::vector<llama_token> ids;
-    for (int i = 0; i < 8 && i < n_vocab; ++i) {
-        ids.push_back((llama_token) i);
-    }
-    std::vector<float> rows((size_t) ids.size() * (size_t) width);
-    std::vector<float> bias(ids.size(), 0.0f);
-    float softcap = -1.0f;
-    const int w = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                              rows.data(), rows.size(), &softcap, bias.data());
-    o["width"]   = w;
-    o["softcap"] = (double) softcap;
-    double worst = 0.0;
-    for (size_t i = 0; i < ids.size(); ++i) {
-        double dot = 0.0;
-        for (int j = 0; j < width; ++j) {
-            dot += (double) hidden[j] * (double) rows[i * (size_t) width + (size_t) j];
-        }
-        worst = std::max(worst, std::fabs(dot + (double) bias[i] - (double) logits[ids[i]]));
-    }
-    o["max_abs_dot_vs_logit"] = worst;
-    return o;
-}
 
 // Tokens field compilation will score for one candidate, exactly as decide_batch builds the path.
 static std::vector<llama_token> oracle_candidate_tokens(const llama_vocab * vocab, const std::string & suffix,
@@ -4919,28 +4920,6 @@ static std::vector<llama_token> oracle_candidate_tokens(const llama_vocab * voca
 // Builds an answer-row table for explicit token ids. The generated dummy model's TEST tokenizer
 // hashes fixed 5-character chunks, so a candidate's scored token depends on the suffix offset and
 // is not the isolated label token; the head must cover the tokens the compiled paths actually use.
-static llama_decision::classifier_head oracle_make_head(const llama_model * model, const std::vector<llama_token> & ids) {
-    llama_decision::classifier_head head;
-    const int width = (int) llama_model_n_embd_out(model);
-    if (width <= 0 || ids.empty()) {
-        head.reason = "no answer rows are available";
-        return head;
-    }
-    head.ids = ids;
-    head.rows.assign(ids.size() * (size_t) width, 0.0f);
-    head.bias.assign(ids.size(), 0.0f);
-    const int w = llama_model_classifier_rows(model, head.ids.data(), (int32_t) head.ids.size(),
-                                              head.rows.data(), head.rows.size(), &head.softcap, head.bias.data());
-    if (w <= 0) {
-        head.ids.clear();
-        head.rows.clear();
-        head.bias.clear();
-        head.reason = "the model output tensor is not a plain contiguous answer head";
-        return head;
-    }
-    head.width = w;
-    return head;
-}
 
 static std::vector<llama_token> oracle_field_tokens(const llama_vocab * vocab, const std::string & suffix,
                                                     const std::vector<std::string> & candidates) {
@@ -4959,86 +4938,6 @@ static std::vector<llama_token> oracle_field_tokens(const llama_vocab * vocab, c
 // exists: a covered head on the classifier context is active and scores the rows; a full context,
 // an unavailable head, and a null head all fall back with a reason. The covered and full field
 // vectors are recorded so a refactor cannot move the head numerics.
-static common_json oracle_head_selection(cpu_test_engine & te_full, cpu_test_engine & te_head, const llama_vocab * vocab) {
-    common_json o = common_json::object();
-    const std::string suffix = "\nAnswer:\n";
-    const std::vector<std::string> candidates = { "AAAAA", "BBBBB" };
-    const std::vector<llama_token> ids = oracle_field_tokens(vocab, suffix, candidates);
-    const llama_decision::classifier_head covered = oracle_make_head(te_head.model, ids);
-    o["covered_available"] = covered.available();
-    o["covered_width"]     = covered.width;
-
-    std::vector<llama_decision::field_input> fields = { { suffix, candidates, 1.0f } };
-
-    auto run = [&](llama_context * ctx, const llama_decision::classifier_head * head) {
-        llama_decision::engine eng(ctx, 2, 8);
-        llama_decision::options opt;
-        opt.head = head;
-        return eng.decide_batch("", { "state" }, fields, opt);
-    };
-    auto describe = [](const llama_decision::batch_result & b) {
-        common_json r = common_json::object();
-        r["active"] = b.head_active;
-        r["reason"] = b.head_reason;
-        common_json probs = common_json::array();
-        for (float v : b.items[0].fields[0].probs) {
-            probs.push_back((double) v);
-        }
-        r["probs"] = probs;
-        return r;
-    };
-
-    if (covered.available() && llama_context_classifier_only(te_head.ctx)) {
-        o["covered_classifier"] = describe(run(te_head.ctx, &covered));
-    }
-    o["full_logits"] = describe(run(te_full.ctx, nullptr));
-    o["full_context"] = [&]() {
-        common_json r = describe(run(te_full.ctx, &covered));
-        r.erase("probs");
-        return r;
-    }();
-
-    llama_decision::classifier_head unavailable;
-    unavailable.reason = "synthetic unavailable head";
-    o["unavailable"] = [&]() {
-        common_json r = describe(run(te_full.ctx, &unavailable));
-        r.erase("probs");
-        return r;
-    }();
-    o["null_head"] = [&]() {
-        common_json r = describe(run(te_full.ctx, nullptr));
-        r.erase("probs");
-        return r;
-    }();
-
-    common_json agreement = common_json::object();
-    agreement["winners_match"] = false;
-    agreement["total_variation"] = 1.0;
-    if (o.contains("covered_classifier")) {
-        const auto & head_probs = o.at("covered_classifier").at("probs");
-        const auto & full_probs = o.at("full_logits").at("probs");
-        const auto argmax = [](const common_json & v) {
-            size_t best = 0;
-            for (size_t i = 1; i < v.size(); ++i) {
-                if (v.at(i).get<double>() > v.at(best).get<double>()) {
-                    best = i;
-                }
-            }
-            return best;
-        };
-        const bool same_size = head_probs.size() == full_probs.size();
-        agreement["winners_match"] = same_size && argmax(head_probs) == argmax(full_probs);
-        double tv = 0.0;
-        if (same_size) {
-            for (size_t i = 0; i < head_probs.size(); ++i) {
-                tv += std::fabs(head_probs.at(i).get<double>() - full_probs.at(i).get<double>());
-            }
-        }
-        agreement["total_variation"] = tv;
-    }
-    o["covered_vs_full"] = agreement;
-    return o;
-}
 
 static common_json decision_cpu_oracle() {
     common_json out = common_json::object();
@@ -5047,10 +4946,7 @@ static common_json decision_cpu_oracle() {
         return out;
     }
     cpu_test_engine te_full;
-    cpu_test_engine te_head;
-    cpu_test_engine te_rows;
-    if (!te_full.load(path, 512, false, false) || !te_head.load(path, 512, true, false) ||
-        !te_rows.load(path, 256, false, true)) {
+    if (!te_full.load(path, 512, false)) {
         return out;
     }
     auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te_full.model));
@@ -5067,31 +4963,14 @@ static common_json decision_cpu_oracle() {
     pool_info["token_a"] = (long long) pool[0].token;
     out["pool"] = pool_info;
 
-    llama_decision::answer_head_cache head_cache;
     llama_decision::engine e_full(te_full.ctx, 2, 8);
 
-    llama_decision::decision_request rfull = req;
-    rfull.head = "full";
     llama_decision::options ofull;
     ofull.cache_tag = "cpu-oracle-full";
     llama_decision::letter_metrics mfull;
-    const auto pfull = test_letter_readout(e_full, head_cache, *vocab, nullptr, false,
-                                                      rfull, pool, ofull, &mfull);
+    const auto pfull = test_letter_readout(e_full, *vocab, nullptr, false,
+                                                      req, pool, ofull, &mfull);
     out["full"] = oracle_readout(mfull, pfull);
-
-    // head="auto" on the shared full context cannot use the answer rows (it exposes logits, not
-    // hidden states), so the readout must report the fallback reason and still return an answer.
-    llama_decision::decision_request rauto = req;
-    rauto.head = "auto";
-    llama_decision::options oauto;
-    oauto.cache_tag = "cpu-oracle-auto";
-    llama_decision::letter_metrics mauto;
-    const auto pauto = test_letter_readout(e_full, head_cache, *vocab, nullptr, false,
-                                                      rauto, pool, oauto, &mauto);
-    out["auto_fallback"] = oracle_readout(mauto, pauto);
-
-    out["head_selection"]  = oracle_head_selection(te_full, te_head, llama_model_get_vocab(te_full.model));
-    out["classifier_rows"] = oracle_classifier_rows(te_rows);
     return out;
 }
 
@@ -5114,8 +4993,6 @@ static void oracle_assert_probs(testing & t, const std::string & label,
 
 static void oracle_assert_readout(testing & t, const std::string & label,
                                   const common_json & exp, const common_json & act, double tol) {
-    t.assert_equal(label + " head_active", exp.at("head_active").get<bool>(), act.at("head_active").get<bool>());
-    t.assert_equal(label + " head_reason", exp.at("head_reason").get<std::string>(), act.at("head_reason").get<std::string>());
     t.assert_equal(label + " cache_hit", exp.at("cache_hit").get<bool>(), act.at("cache_hit").get<bool>());
     t.assert_equal(label + " suffix_tokens", exp.at("suffix_tokens").get<long long>(), act.at("suffix_tokens").get<long long>());
     t.assert_equal(label + " common_suffix_tokens", exp.at("common_suffix_tokens").get<long long>(), act.at("common_suffix_tokens").get<long long>());
@@ -5172,60 +5049,6 @@ static void test_decision_cpu_oracle(testing & t) {
 
         const double prob_tol = 1e-3;
         oracle_assert_readout(t, "full readout", exp.at("full"), act.at("full"), prob_tol);
-        oracle_assert_readout(t, "auto fallback readout", exp.at("auto_fallback"), act.at("auto_fallback"), prob_tol);
-
-        const common_json & er = exp.at("classifier_rows");
-        const common_json & ar = act.at("classifier_rows");
-        t.assert_equal("classifier row width", er.at("width").get<long long>(), ar.at("width").get<long long>());
-        assert_close(t, "classifier softcap", er.at("softcap").get<double>(), ar.at("softcap").get<double>(), 1e-9);
-        const double dot_err = ar.at("max_abs_dot_vs_logit").get<double>();
-        t.assert_true("the row dot reproduces the full logit within 1e-3 (err=" + std::to_string(dot_err) + ")",
-                      dot_err <= 1e-3);
-
-        const common_json & es = exp.at("head_selection");
-        const common_json & as = act.at("head_selection");
-        t.assert_equal("covered head availability", es.at("covered_available").get<bool>(),
-                       as.at("covered_available").get<bool>());
-        t.assert_equal("covered head width", es.at("covered_width").get<long long>(),
-                       as.at("covered_width").get<long long>());
-        t.assert_equal("full-logits head_active", es.at("full_logits").at("active").get<bool>(),
-                       as.at("full_logits").at("active").get<bool>());
-        t.assert_equal("full-logits reason", es.at("full_logits").at("reason").get<std::string>(),
-                       as.at("full_logits").at("reason").get<std::string>());
-
-        if (es.contains("covered_classifier") && as.contains("covered_classifier")) {
-            const common_json & ec = es.at("covered_classifier");
-            const common_json & ac = as.at("covered_classifier");
-            t.assert_equal("covered classifier is active", true, ac.at("active").get<bool>());
-            t.assert_equal("covered classifier reason", std::string(""), ac.at("reason").get<std::string>());
-            oracle_assert_probs(t, "covered classifier", ec, ac, prob_tol);
-            oracle_assert_probs(t, "full-logits field", es.at("full_logits"), as.at("full_logits"), prob_tol);
-
-            const common_json & ev = es.at("covered_vs_full");
-            const common_json & av = as.at("covered_vs_full");
-            t.assert_equal("head and full agree on every winner", ev.at("winners_match").get<bool>(),
-                           av.at("winners_match").get<bool>());
-            if (av.at("winners_match").get<bool>()) {
-                // the bound is the committed calibration value, so a re-measured gate cannot
-                // silently drift away from the number the oracle trusts
-                const common_json cal = common_json::parse(
-                    read_file(std::string(DECISION_TEST_BASELINE_DIR) + "/calibration.json"));
-                const double bound = cal.at("rows").at("head_context_selector").at("measurements").at("outcome_tv_bound").get<double>();
-                const double tv = av.at("total_variation").get<double>();
-                t.assert_true("head and full agree within the calibrated total-variation bound (TV=" + std::to_string(tv) + ")",
-                              tv <= bound);
-            }
-        } else {
-            t.assert_equal("covered classifier presence", es.contains("covered_classifier"),
-                           as.contains("covered_classifier"));
-        }
-
-        for (const char * key : { "full_context", "unavailable", "null_head" }) {
-            t.assert_equal(std::string("head selection ") + key + " active",
-                           es.at(key).at("active").get<bool>(), as.at(key).at("active").get<bool>());
-            t.assert_equal(std::string("head selection ") + key + " reason",
-                           es.at(key).at("reason").get<std::string>(), as.at(key).at("reason").get<std::string>());
-        }
     });
 }
 
@@ -5239,7 +5062,7 @@ static void test_compile_fields_plan(testing & t) {
             return;
         }
         cpu_test_engine te_full;
-        if (!te_full.load(path, 512, false, false)) {
+        if (!te_full.load(path, 512, false)) {
             t.assert_true("the CPU decision scaffold loads the model", false);
             return;
         }
@@ -5280,7 +5103,7 @@ static void test_decide_batch_plan_overload(testing & t) {
             return;
         }
         cpu_test_engine te;
-        if (!te.load(path, 512, false, false)) {
+        if (!te.load(path, 512, false)) {
             t.assert_true("the CPU decision scaffold loads the model", false);
             return;
         }
@@ -5302,7 +5125,6 @@ static void test_decide_batch_plan_overload(testing & t) {
         t.assert_equal("the overload keeps the item count", wrapped.items.size(), planned.items.size());
         t.assert_equal("the overload keeps the batch rows", wrapped.rows, planned.rows);
         t.assert_equal("the overload keeps the suffix accounting", wrapped.suffix_tokens, planned.suffix_tokens);
-        t.assert_equal("the overload keeps head_active", wrapped.head_active, planned.head_active);
 
         bool same = wrapped.items.size() == planned.items.size();
         for (size_t i = 0; same && i < wrapped.items.size(); ++i) {
@@ -5322,125 +5144,13 @@ static void test_decide_batch_plan_overload(testing & t) {
     });
 }
 
-// select_scoring_head is the one head-usability rule: classifier context plus full candidate
-// coverage, otherwise false with a reason. The server and the readout both go through it.
-static void test_select_scoring_head(testing & t) {
-    t.test("select_scoring_head is the single head-usability predicate", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te_full;
-        cpu_test_engine te_head;
-        if (!te_full.load(path, 512, false, false) || !te_head.load(path, 512, true, false)) {
-            t.assert_true("the CPU decision scaffold loads the model", false);
-            return;
-        }
-        const llama_vocab * vocab = llama_model_get_vocab(te_head.model);
-        const std::string suffix = "\nAnswer:\n";
-        const std::vector<std::string> candidates = { "AAAAA", "BBBBB" };
-        const std::vector<llama_token> ids = oracle_field_tokens(vocab, suffix, candidates);
-        const llama_decision::classifier_head covered = oracle_make_head(te_head.model, ids);
-        if (!covered.available() || ids.size() < 2) {
-            t.skip("the generated model has no usable answer rows");
-            return;
-        }
-        std::vector<llama_decision::field_input> fields = { { suffix, candidates, 1.0f } };
-
-        llama_decision::engine e_cls(te_head.ctx, 2, 8);
-        llama_decision::engine e_full(te_full.ctx, 2, 8);
-        llama_decision::options with_head;
-        with_head.head = &covered;
-        const llama_decision::compiled_fields plan_cls  = e_cls.compile_fields(fields, with_head);
-        const llama_decision::compiled_fields plan_full = e_full.compile_fields(fields, with_head);
-
-        std::string reason;
-        t.assert_true("classifier context + covered head -> true",
-                      e_cls.select_scoring_head(plan_cls, with_head, &reason));
-        t.assert_equal("covered head has no reason", std::string(""), reason);
-
-        const llama_decision::classifier_head partial = oracle_make_head(te_head.model, { ids[0] });
-        llama_decision::options with_partial;
-        with_partial.head = &partial;
-        const llama_decision::compiled_fields plan_partial = e_cls.compile_fields(fields, with_partial);
-        reason.clear();
-        t.assert_true("classifier context + uncovered head -> false",
-                      !e_cls.select_scoring_head(plan_partial, with_partial, &reason));
-        t.assert_equal("uncovered head names coverage",
-                       std::string("the answer head does not cover every candidate token"), reason);
-
-        reason.clear();
-        t.assert_true("full context + covered head -> false",
-                      !e_full.select_scoring_head(plan_full, with_head, &reason));
-        t.assert_equal("full context reason",
-                       std::string("the decision context does not expose hidden states"), reason);
-
-        llama_decision::classifier_head unavailable;
-        unavailable.reason = "synthetic unavailable head";
-        llama_decision::options with_unavailable;
-        with_unavailable.head = &unavailable;
-        reason.clear();
-        t.assert_true("unavailable head -> false",
-                      !e_cls.select_scoring_head(plan_cls, with_unavailable, &reason));
-        t.assert_equal("unavailable head reason", std::string("synthetic unavailable head"), reason);
-
-        reason = "stale";
-        t.assert_true("null head -> false",
-                      !e_cls.select_scoring_head(plan_cls, llama_decision::options{}, &reason));
-        t.assert_equal("null head clears the reason", std::string(""), reason);
-    });
-}
-
 // A classifier-only context has no logits, so the engine refuses a request without a covering
 // head before any decode instead of reaching gather_candidates and reading a null buffer.
-static void test_classifier_ctx_requires_head(testing & t) {
-    t.test("a classifier-only context without a covering head fails before any decode", [](testing & t) {
-        const std::string path = decision_cpu_model_path();
-        if (path.empty()) {
-            t.skip("no generated model; run the generate-models fixture");
-            return;
-        }
-        cpu_test_engine te_head;
-        if (!te_head.load(path, 512, true, false)) {
-            t.assert_true("the classifier-only CPU scaffold loads the model", false);
-            return;
-        }
-        const llama_vocab * vocab = llama_model_get_vocab(te_head.model);
-        const std::string suffix = "\nAnswer:\n";
-        const std::vector<std::string> candidates = { "AAAAA", "BBBBB" };
-        const std::vector<llama_token> ids = oracle_field_tokens(vocab, suffix, candidates);
-        std::vector<llama_decision::field_input> fields = { { suffix, candidates, 1.0f } };
-        llama_decision::engine e_cls(te_head.ctx, 2, 8);
-
-        bool threw = false;
-        try {
-            (void) e_cls.decide_batch("", { "state" }, fields, llama_decision::options{});
-        } catch (const llama_decision::unsupported_error &) {
-            threw = true;
-        }
-        t.assert_true("no head on a classifier context throws unsupported_error", threw);
-
-        if (ids.size() >= 2) {
-            const llama_decision::classifier_head partial = oracle_make_head(te_head.model, { ids[0] });
-            llama_decision::options opt;
-            opt.head = &partial;
-            threw = false;
-            try {
-                (void) e_cls.decide_batch("", { "state" }, fields, opt);
-            } catch (const llama_decision::unsupported_error &) {
-                threw = true;
-            }
-            t.assert_true("an uncovered head on a classifier context throws unsupported_error", threw);
-        }
-    });
-}
 
 static void test_prefix_cache_coherence(testing & t) {
     t.test("prefix cache never hits across a changed identity", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5472,8 +5182,7 @@ static void test_prefix_cache_coherence(testing & t) {
 static void test_token_cache(testing & t) {
     t.test("token cache encodes repeated prompts once", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5503,8 +5212,7 @@ static void test_token_cache(testing & t) {
 static void test_prefix_reuse(testing & t) {
     t.test("a repeated request reuses the cached prefix without re-prefilling", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5535,8 +5243,7 @@ static void test_prefix_reuse(testing & t) {
 static void test_request_prefix(testing & t) {
     t.test("a long common suffix head is hoisted and short or disabled ones are not", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5607,8 +5314,7 @@ static void test_request_prefix(testing & t) {
 static void test_batching_waves(testing & t) {
     t.test("a wide batch packs into waves and keeps the answer order", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5659,8 +5365,7 @@ static void test_batching_waves(testing & t) {
 static void test_dedup_fields(testing & t) {
     t.test("identical fields score once and still answer in place", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5697,8 +5402,7 @@ static void test_dedup_fields(testing & t) {
 static void test_cancel_reaches_compute(testing & t) {
     t.test("a stop request aborts before scoring and never returns an answer", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5734,8 +5438,7 @@ static void test_cancel_reaches_compute(testing & t) {
 static void test_yield_points(testing & t) {
     t.test("the engine offers a cooperative yield between waves", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5764,8 +5467,7 @@ static void test_yield_points(testing & t) {
 static void test_capacity_error(testing & t) {
     t.test("an oversize suffix is chunked within the batch and rejected beyond the context", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5821,11 +5523,11 @@ static void test_long_branch_chunking(testing & t) {
             return;
         }
         cpu_test_engine small, large;
-        if (!small.load(path, 1024, false, false, 128)) {
+        if (!small.load(path, 1024, false, 128)) {
             t.assert_true("the small n_batch scaffold loads the model", false);
             return;
         }
-        if (!large.load(path, 1024, false, false, 512)) {
+        if (!large.load(path, 1024, false, 512)) {
             t.assert_true("the large n_batch scaffold loads the model", false);
             return;
         }
@@ -5863,8 +5565,7 @@ static void test_long_branch_chunking(testing & t) {
 static void test_prefix_hoist_cache(testing & t) {
     t.test("a long shared head prefills once and the next state hits the cache", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -5885,8 +5586,8 @@ static void test_prefix_hoist_cache(testing & t) {
 
             llama_decision::letter_metrics m1;
             llama_decision::letter_metrics m2;
-            (void) test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req1, pool, llama_decision::options{}, &m1);
-            (void) test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req2, pool, llama_decision::options{}, &m2);
+            (void) test_letter_readout(eng, *vocab, nullptr, false, req1, pool, llama_decision::options{}, &m1);
+            (void) test_letter_readout(eng, *vocab, nullptr, false, req2, pool, llama_decision::options{}, &m2);
 
             t.assert_true("the shared head is at least 32 tokens", m1.shared_tokens >= 32);
             t.assert_true("the first request prefills", !m1.cache_hit);
@@ -6012,92 +5713,6 @@ static void test_reference_corpus(testing & t) {
 // provenance (contract hash, template hash, ftype) and proves the wiring: the predicate accepts,
 // the row reader writes the Gemma4 softcap, and score_answer_rows applies softcap * tanh(dot /
 // softcap), matching the graph's lm_head softcap.
-static void test_gemma4_softcap(testing & t) {
-    t.test("Gemma4 rows carry the final-logit softcap and scoring applies it", [](testing & t) {
-        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to the recorded Gemma4 model");
-            return;
-        }
-        const common_json baseline = common_json::parse(
-            read_file(std::string(DECISION_TEST_BASELINE_DIR) + "/baseline.json"));
-        if (!baseline.contains("gemma4_softcap")) {
-            t.skip("no recorded Gemma4 oracle in baseline.json");
-            return;
-        }
-        const auto & ref = baseline.at("gemma4_softcap");
-        const std::string ref_model = ref.at("model").get<std::string>();
-        if (model_identity(path) != ref_model) {
-            t.skip("the loaded model is not the recorded Gemma4 model");
-            return;
-        }
-
-        cpu_test_engine te;
-        if (!te.load(path, 256, false, true)) {
-            t.assert_true("the Gemma4 model loads on CPU", false);
-            return;
-        }
-        const char * reason = nullptr;
-        t.assert_true("the Gemma4 classifier head is supported",
-                      llama_model_classifier_supported(te.model, &reason));
-        t.assert_true("a supported Gemma4 head reports no reason", reason == nullptr);
-
-        const int width = (int) llama_model_n_embd_out(te.model);
-        std::vector<llama_token> ids = { 0, 1 };
-        std::vector<float> rows((size_t) ids.size() * (size_t) width);
-        std::vector<float> bias(ids.size(), 0.0f);
-        float softcap = 0.0f;
-        const int w = llama_model_classifier_rows(te.model, ids.data(), (int32_t) ids.size(),
-                                                  rows.data(), rows.size(), &softcap, bias.data());
-        t.assert_equal("the Gemma4 row width is the hidden width", width, w);
-        t.assert_equal("the Gemma4 row width matches the recorded value", ref.at("width").get<int>(), width);
-        const float ref_softcap = ref.at("softcap").get<float>();
-        t.assert_true("the Gemma4 softcap is nonzero", softcap > 0.0f);
-        t.assert_true("the Gemma4 softcap matches the recorded value", softcap == ref_softcap);
-
-        // provenance: a template/tokenizer/contract drift is a loud diff, never a silent recalibration
-        auto tmpls = common_chat_templates_init(te.model, "");
-        if (!tmpls) {
-            t.skip("the Gemma4 model has no chat template");
-            return;
-        }
-        const auto parts = llama_decision::render_letter_prompt(
-            tmpls.get(), true, llama_decision::letter_system_text());
-        const std::string template_hash = llama_decision::make_prefix_tag(
-            parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
-        t.assert_equal("the Gemma4 template hash matches the recorded value",
-                       ref.at("template_hash").get<std::string>(), template_hash);
-        const std::string contract_hash = llama_decision::decision_contract_hash(
-            ref_model, template_hash, llama_vocab_n_tokens(llama_model_get_vocab(te.model)));
-        t.assert_equal("the Gemma4 contract hash matches the recorded value",
-                       ref.at("contract_hash").get<std::string>(), contract_hash);
-        t.assert_equal("the Gemma4 ftype matches the recorded quantization",
-                       ref.at("quantization").get<int>(), (int) llama_model_ftype(te.model));
-
-        // the scorer must apply the softcap exactly as the graph's lm_head does. Build a head from
-        // the real rows and check every score against softcap * tanh(raw / softcap).
-        llama_decision::classifier_head head;
-        head.width   = width;
-        head.softcap = softcap;
-        head.ids     = ids;
-        head.rows    = rows;
-        head.bias    = bias;
-        std::vector<float> hidden((size_t) width, 0.0f);
-        for (int j = 0; j < width; ++j) {
-            hidden[(size_t) j] = 0.25f * std::sin((float) j); // a deterministic non-trivial vector
-        }
-        const std::vector<float> scores = llama_decision::score_answer_rows(hidden.data(), head, ids);
-        t.assert_equal("one score per candidate", (int) ids.size(), (int) scores.size());
-        for (size_t i = 0; i < ids.size(); ++i) {
-            double raw = bias[i];
-            for (int j = 0; j < width; ++j) {
-                raw += (double) hidden[(size_t) j] * rows[i * (size_t) width + (size_t) j];
-            }
-            const double expected = (double) softcap * std::tanh(raw / (double) softcap);
-            assert_close(t, "the Gemma4 score applies softcap * tanh(dot / softcap)", expected, scores[i], 1e-4);
-        }
-    });
-}
 
 static void test_docs_errors(testing & t) {
     t.test("the normative doc lists the full error set and the owned limits", [](testing & t) {
@@ -6160,171 +5775,8 @@ static void test_policy_confidence(testing & t) {
         } catch (const std::exception &) {
             default_ok = false;
         }
-        t.assert_true("a default temperature needs no provenance", default_ok);
+t.assert_true("a default temperature needs no provenance", default_ok);
     });
-
-    t.test("the classifier answer-head API lives in the staging header, not the installed header", [](testing & t) {
-        // DECISION_TEST_SOURCE_DIR points at tools/parallel-decision, two levels below the root.
-        const std::string root      = std::string(DECISION_TEST_SOURCE_DIR) + "/../..";
-        const std::string installed = read_file(root + "/include/llama.h");
-        const std::string staging   = read_file(root + "/src/llama-ext.h");
-
-        t.assert_true("the installed header drops the supported predicate",
-                      installed.find("llama_model_classifier_supported") == std::string::npos);
-        t.assert_true("the installed header drops the row reader",
-                      installed.find("llama_model_classifier_rows") == std::string::npos);
-        t.assert_true("the staging header owns the supported predicate",
-                      staging.find("llama_model_classifier_supported") != std::string::npos);
-        t.assert_true("the staging header owns the row reader",
-                      staging.find("llama_model_classifier_rows") != std::string::npos);
-        // the symbols were exported with C linkage from the installed header, so the move must keep
-        // that linkage or the dynamic symbol name changes
-        t.assert_true("the staging declarations keep C linkage", staging.find("extern \"C\"") != std::string::npos);
-    });
-}
-
-static void test_head_capability(testing & t) {
-    t.test("the head cache probes once per model and never throws", [](testing & t) {
-        llama_decision::answer_head_cache cache;
-        const auto & a = cache.probe(nullptr);
-        const auto & b = cache.probe(nullptr);
-        t.assert_true("the capability is a single cached object per model", &a == &b);
-        t.assert_true("no model means no head", !a.available);
-        t.assert_true("a fallback reason is given", !a.reason.empty());
-    });
-}
-
-static void test_classifier_predicate(testing & t) {
-    t.test("head classifier predicate over synthetic descriptors", [](testing & t) {
-        struct descriptor {
-            std::string arch;
-            bool tied;
-            bool has_output_s;
-            bool contiguous;
-            bool out_of_range;
-            bool expect_available;
-            std::string reason_substr;
-        };
-        std::vector<descriptor> cases = {
-            {"gemma4", false, false, true,  false, true,  ""},
-            {"lfm2",   true,  false, true,  false, true,  ""},
-            {"lfm2",   true,  false, false, false, false, "contiguous"},
-            {"gemma4", false, false, true,  true,  false, "range"},
-            {"lfm2",   true,  true,  true,  false, false, "output_s"},
-        };
-        auto current_predicate = [](const descriptor & d) -> bool {
-            if (d.arch != "gemma4" && d.arch != "lfm2") return false;
-            if (!d.contiguous) return false;
-            if (d.out_of_range) return false;
-            if (d.has_output_s) return false;
-            return true;
-        };
-        for (const auto & c : cases) {
-            bool avail = current_predicate(c);
-            std::string msg = c.arch + (c.tied ? " tied" : "") + (c.has_output_s ? " output_s" : "") +
-                              (c.contiguous ? " contiguous" : " non-contiguous") +
-                              (c.out_of_range ? " out_of_range" : "");
-            t.assert_equal("predicate " + msg, c.expect_available, avail);
-        }
-    });
-}
-
-static void test_classifier_rows_lfm(testing & t) {
-    t.test("head classifier rows for the loaded model", [](testing & t) {
-        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        llama_model * model = shared_model().model;
-        const int width = (int) llama_model_n_embd_out(model);
-        std::vector<llama_token> ids;
-        for (int i = 0; i < 64; ++i) {
-            // use token ids 0..63 assuming they exist and are in range (vocab ~128k)
-            ids.push_back(i);
-        }
-        std::vector<float> dst((size_t) 64 * width, 0.0f);
-        std::vector<float> dst2((size_t) 64 * width, 0.0f);
-        float softcap = -1.0f, softcap2 = -1.0f;
-        int32_t w = llama_model_classifier_rows(model, ids.data(), 64, dst.data(), dst.size(), &softcap, nullptr);
-        t.assert_equal("width is the hidden width", width, w);
-        char arch[64] = { 0 };
-        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
-        if (std::string(arch).rfind("lfm2", 0) == 0) {
-            t.assert_true("LFM applies no logit softcap", softcap == 0.0f);
-        } else {
-            t.assert_true("a softcapped head reports its scale", softcap >= 0.0f);
-        }
-        int32_t w2 = llama_model_classifier_rows(model, ids.data(), 64, dst2.data(), dst2.size(), &softcap2, nullptr);
-        t.assert_equal("second call width same", w, w2);
-        bool same = true;
-        for (size_t i = 0; i < dst.size(); ++i) if (dst[i] != dst2[i]) { same = false; break; }
-        t.assert_true("concurrent first uses share same table content", same);
-        // out_of_range (the id must be past this model's vocab, which varies by arch)
-        std::vector<llama_token> bad = ids;
-        bad[0] = (llama_token) llama_vocab_n_tokens(llama_model_get_vocab(model));
-        float sc = 0;
-        int32_t bad_w = llama_model_classifier_rows(model, bad.data(), 64, dst.data(), dst.size(), &sc, nullptr);
-        t.assert_equal("out_of_range returns 0", 0, bad_w);
-    });
-}
-
-static void test_head_fallback_equivalence(testing & t) {
-    t.test("head auto falls back to full logits and the readout exposes logits plus probs", [](testing & t) {
-        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
-            return;
-        }
-        test_engine te;
-        if (!te.load(path)) {
-            t.assert_true("model loads", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            llama_decision::engine eng(te.ctx, 2, 8);
-            const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-
-            llama_decision::options oa;
-            oa.cache_tag = "head-auto";
-            llama_decision::letter_metrics ma;
-            const auto pa = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oa, &ma);
-
-            llama_decision::options of;
-            of.cache_tag = "head-full";
-            llama_decision::letter_metrics mf;
-            const auto pf = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
-
-            // Both runs read full logits here (the context exposes no hidden states), but they use
-            // separate prefix caches, so a backend may reorder a reduction. The decisions, not the
-            // last digit, are what the fallback must preserve.
-            bool same = pa.size() == pf.size();
-            double worst = 0.0;
-            for (size_t qi = 0; same && qi < pa.size(); ++qi) {
-                same = pa[qi].size() == pf[qi].size();
-                if (!same) {
-                    break;
-                }
-                same = std::distance(pa[qi].begin(), std::max_element(pa[qi].begin(), pa[qi].end())) ==
-                       std::distance(pf[qi].begin(), std::max_element(pf[qi].begin(), pf[qi].end()));
-                for (size_t i = 0; i < pa[qi].size(); ++i) {
-                    worst = std::max(worst, (double) std::fabs(pa[qi][i] - pf[qi][i]));
-                }
-            }
-            fprintf(stderr, "head fallback agreement: max delta %.3e (informational)\n", worst);
-            t.assert_true("auto and full heads agree on every winner", same);
-
-            fprintf(stderr, "head fallback: auto %.3f ms, full %.3f ms (informational)\n",
-                    ma.prefill_ms + ma.scoring_ms, mf.prefill_ms + mf.scoring_ms);
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("head run: ") + e.what(), false);
-        }
-    });
-}
-
-static const char * selected_test_model_path() {
-    return std::getenv("LLAMA_DECISION_TEST_MODEL");
 }
 
 static double total_variation(const std::vector<std::vector<float>> & a, const std::vector<std::vector<float>> & b) {
@@ -6343,349 +5795,10 @@ static double total_variation(const std::vector<std::vector<float>> & a, const s
     return tv;
 }
 
-static void test_selected_equivalence_lfm(testing & t) {
-    t.test("selected answer head agrees with full logits on LFM2.5", [](testing & t) {
-        const char * path = selected_test_model_path();
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        test_engine te_full;
-        te_full.model = shared_model().model;
-        test_engine te_head;
-        te_head.model = shared_model().model;
-        if (!te_full.make_ctx(false) || !te_head.make_ctx(true)) {
-            t.assert_true("both contexts load", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te_full.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            llama_decision::decision_request req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-
-            llama_decision::engine e_full(te_full.ctx, 2, 8);
-            llama_decision::engine e_head(te_head.ctx, 2, 8);
-
-            req.head = "full";
-            llama_decision::options of;
-            of.cache_tag = "sel-full";
-            llama_decision::letter_metrics mf;
-            const auto pf = test_letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
-
-            req.head = "selected";
-            llama_decision::options oh;
-            oh.cache_tag = "sel-head";
-            llama_decision::letter_metrics mh;
-            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
-
-            t.assert_true("the selected head was used", mh.head_active);
-
-            // The full path runs a quantized weight matmul that also quantizes the activations,
-            // while the head path dequantizes the rows and dots in FP32, so the two agree up to
-            // the quantization noise rather than bit-exactly.
-            bool winners_match = pf.size() == ph.size();
-            for (size_t qi = 0; winners_match && qi < pf.size(); ++qi) {
-                winners_match = pf[qi].size() == ph[qi].size() &&
-                                std::distance(pf[qi].begin(), std::max_element(pf[qi].begin(), pf[qi].end())) ==
-                                std::distance(ph[qi].begin(), std::max_element(ph[qi].begin(), ph[qi].end()));
-            }
-            t.assert_true("selected and full pick the same winner", winners_match);
-
-            // The full path runs a quantized weight matmul that also quantizes the activations,
-            // while the head dequantizes the rows and dots in FP32. Winner agreement above is the
-            // task-value gate. Total variation is producer confidence: it is always reported, and
-            // asserted only where the producer is already calibrated. On the weak-quant oracle the
-            // noise exceeds the bound, so the number is recorded, never asserted, and never xfail.
-            const double tv = total_variation(pf, ph);
-            printf("head vs full total variation: %.6f (weak_quant=%d)\n", tv, weak_quant_gpu_oracle(path) ? 1 : 0);
-            if (!weak_quant_gpu_oracle(path)) {
-                t.assert_true("selected and full agree within 5e-2 total variation (TV=" + std::to_string(tv) + ")", tv <= 5e-2);
-            }
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("selected equivalence: ") + e.what(), false);
-        }
-    });
-}
-
-// Qwen2 is the supported arch that carries a real per-id output bias, so this is the model that
-// exercises the bias fidelity of the selected head against the full logits.
-static void test_selected_equivalence_qwen2(testing & t) {
-    t.test("selected head matches full logits with a Qwen2 output bias", [](testing & t) {
-        const char * path = selected_test_model_path();
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        char arch[64] = { 0 };
-        llama_model_meta_val_str(shared_model().model, "general.architecture", arch, sizeof(arch));
-        if (std::string(arch).rfind("qwen2", 0) != 0) {
-            t.skip("needs a Qwen2 model in LLAMA_DECISION_TEST_MODEL");
-            return;
-        }
-        test_engine te_full;
-        te_full.model = shared_model().model;
-        test_engine te_head;
-        te_head.model = shared_model().model;
-        if (!te_full.make_ctx(false) || !te_head.make_ctx(true)) {
-            t.assert_true("both contexts load", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te_full.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            const auto head = llama_decision::build_classifier_head(te_full.model, pool);
-            t.assert_true("the Qwen2 head builds", head.available());
-            bool nonzero = false;
-            for (float v : head.bias) {
-                nonzero = nonzero || v != 0.0f;
-            }
-            t.assert_true("the head carries the model's output bias", nonzero);
-
-            llama_decision::decision_request req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-            llama_decision::engine e_full(te_full.ctx, 2, 8);
-            llama_decision::engine e_head(te_head.ctx, 2, 8);
-
-            req.head = "full";
-            llama_decision::options of;
-            of.cache_tag = "q2-full";
-            llama_decision::letter_metrics mf;
-            const auto pf = test_letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
-
-            req.head = "selected";
-            llama_decision::options oh;
-            oh.cache_tag = "q2-head";
-            llama_decision::letter_metrics mh;
-            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
-
-            t.assert_true("the selected head was used", mh.head_active);
-            bool winners = pf.size() == ph.size();
-            for (size_t qi = 0; winners && qi < pf.size(); ++qi) {
-                winners = pf[qi].size() == ph[qi].size() &&
-                          std::distance(pf[qi].begin(), std::max_element(pf[qi].begin(), pf[qi].end())) ==
-                          std::distance(ph[qi].begin(), std::max_element(ph[qi].begin(), ph[qi].end()));
-            }
-            t.assert_true("bias-corrected selected and full pick the same winner", winners);
-            const double tv = total_variation(pf, ph);
-            t.assert_true("bias-corrected scores agree within 5e-2 total variation (TV=" + std::to_string(tv) + ")", tv <= 5e-2);
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("Qwen2 selected equivalence: ") + e.what(), false);
-        }
-    });
-}
-
-// The answer-head cache is owned by the caller: the same (model, labels) must reuse one table, and
-// a rebuilt cache must reproduce the same decisions.
-static void test_answer_head_cache(testing & t) {
-    t.test("the answer-head cache builds once and rebuilds deterministically", [](testing & t) {
-        const char * path = selected_test_model_path();
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        test_engine te;
-        te.model = shared_model().model;
-        if (!te.make_ctx(false)) {
-            t.assert_true("the context loads", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-
-            llama_decision::answer_head_cache cache;
-            const auto & a = cache.for_labels(te.model, pool);
-            const auto & b = cache.for_labels(te.model, pool);
-            t.assert_true("the same model and labels reuse one table", &a == &b && a.rows.data() == b.rows.data());
-            t.assert_true("the capability probe is cached too",
-                          &cache.probe(te.model) == &cache.probe(te.model));
-
-            llama_decision::engine eng(te.ctx, 2, 8);
-            llama_decision::options opt;
-            opt.cache_tag = "head-cache";
-            const auto first = test_letter_readout(eng, cache, *vocab, nullptr, false, req, pool, opt, nullptr);
-
-            // a rebuilt cache must not change the decisions. The winner is task-value and stays
-            // hard; the probabilities use the producer-numerics bound because the second pass runs
-            // on a warm prefix cache. On the known weak-quant GPU oracle the whole check is skipped
-            // with a reason, never xfail.
-            llama_decision::answer_head_cache rebuilt;
-            const auto second = test_letter_readout(eng, rebuilt, *vocab, nullptr, false, req, pool, opt, nullptr);
-            determinism_check(t, weak_quant_gpu_oracle(path),
-                              "a rebuilt cache gives identical decisions (weak-quant GPU numerics)",
-                              [&](testing & t) {
-                bool equal = first.size() == second.size();
-                for (size_t qi = 0; equal && qi < first.size(); ++qi) {
-                    equal = first[qi].size() == second[qi].size();
-                    if (equal) {
-                        // the decision (winner) is task-value and must not move
-                        equal = std::distance(first[qi].begin(), std::max_element(first[qi].begin(), first[qi].end())) ==
-                                std::distance(second[qi].begin(), std::max_element(second[qi].begin(), second[qi].end()));
-                    }
-                    for (size_t k = 0; equal && k < first[qi].size(); ++k) {
-                        equal = std::fabs(first[qi][k] - second[qi][k]) < 5e-2f;
-                    }
-                }
-                t.assert_true("a rebuilt cache gives identical decisions", equal);
-            });
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("the head cache run: ") + e.what(), false);
-        }
-    });
-}
-
-static void test_classifier_only_readout(testing & t) {
-    t.test("a classifier-only context uses the selected head and never silently reads logits", [](testing & t) {
-        const char * path = selected_test_model_path();
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        test_engine te;
-        te.model = shared_model().model;
-        if (!te.make_ctx(true)) {
-            t.assert_true("classifier context loads", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            llama_decision::engine eng(te.ctx, 2, 8);
-            const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-
-            llama_decision::options opt;
-            opt.cache_tag = "co-readout";
-            llama_decision::letter_metrics m;
-            const auto p = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, opt, &m);
-            t.assert_true("the classifier context activates the selected head", m.head_active);
-            t.assert_true("the readout reports its suffix accounting", m.suffix_tokens > 0);
-            t.assert_equal("one probability vector per question", (size_t) req.questions.size(), p.size());
-
-            // Without a head this context produces no logits, so the engine must refuse instead of
-            // reading a null logits pointer.
-            llama_decision::engine eng2(te.ctx, 2, 8);
-            bool threw = false;
-            try {
-                llama_decision::field_input f;
-                f.suffix      = "alpha: ";
-                f.candidates  = { "A", "B" };
-                llama_decision::options o2;
-                o2.cache_tag = "co-null";
-                (void) eng2.decide_batch("system", { "ctx" }, { f }, o2);
-            } catch (const std::exception &) {
-                threw = true;
-            }
-            t.assert_true("a headless classifier-only context refuses instead of reading null logits", threw);
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("classifier-only readout: ") + e.what(), false);
-        }
-    });
-}
-
-static void test_selected_fallback_lfm(testing & t) {
-    t.test("a requested head without hidden states falls back to full logits on LFM2.5", [](testing & t) {
-        const char * path = selected_test_model_path();
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        test_engine te;
-        if (!te.load(path)) {
-            t.assert_true("model loads", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            llama_decision::decision_request req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-            llama_decision::engine eng(te.ctx, 2, 8);
-
-            req.head = "full";
-            llama_decision::options of;
-            of.cache_tag = "fb-full";
-            llama_decision::letter_metrics mf;
-            const auto pf = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, of, &mf);
-
-            // the model can serve selected rows, but this context exposes no hidden states
-            req.head = "selected";
-            llama_decision::options oh;
-            oh.cache_tag = "fb-selected";
-            llama_decision::letter_metrics mh;
-            const auto ph = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, oh, &mh);
-
-            t.assert_true("the head did not activate", !mh.head_active);
-            t.assert_true("a fallback reason is reported", !mh.head_reason.empty());
-            // The two runs use separate prefix caches, so a backend may reorder a reduction even
-            // though both read the same full logits; the decisions must still match.
-            bool winners = pf.size() == ph.size();
-            for (size_t qi = 0; winners && qi < pf.size(); ++qi) {
-                winners = pf[qi].size() == ph[qi].size() &&
-                          std::distance(pf[qi].begin(), std::max_element(pf[qi].begin(), pf[qi].end())) ==
-                          std::distance(ph[qi].begin(), std::max_element(ph[qi].begin(), ph[qi].end()));
-            }
-            t.assert_true("fallback picks the full-logits winners", winners);
-            // The TV bound is a tolerance on the producer's numerics, so on the known weak-quant
-            // GPU oracle it is skipped with a reason; the winner agreement above stays hard.
-            determinism_check(t, weak_quant_gpu_oracle(path),
-                              "fallback stays within 5e-2 total variation (weak-quant GPU numerics)",
-                              [&](testing & t) {
-                const double tv = total_variation(pf, ph);
-                t.assert_true("fallback stays within 5e-2 total variation (TV=" + std::to_string(tv) + ")", tv <= 5e-2);
-            });
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("selected fallback: ") + e.what(), false);
-        }
-    });
-}
-
-static void test_selected_explicit_error(testing & t) {
-    t.test("explicit selected on an incompatible head is a client error and auto is unaffected", [](testing & t) {
-        llama_decision::head_capability cap;
-        cap.reason = "unsupported architecture";
-
-        bool threw = false;
-        try {
-            llama_decision::require_selected_head("selected", cap);
-        } catch (const std::invalid_argument &) {
-            threw = true;
-        }
-        t.assert_true("explicit selected on an incompatible head throws", threw);
-
-        bool auto_ok = true;
-        try {
-            llama_decision::require_selected_head("auto", cap);
-            llama_decision::require_selected_head("full", cap);
-            llama_decision::require_selected_head("", cap);
-        } catch (...) {
-            auto_ok = false;
-        }
-        t.assert_true("auto and full never error on the head", auto_ok);
-
-        // the next auto request on a real model is unaffected by the rejected one
-        const char * path = selected_test_model_path();
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        test_engine te;
-        if (!te.load(path)) {
-            t.assert_true("model loads", false);
-            return;
-        }
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
-            const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
-            llama_decision::decision_request req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-            llama_decision::engine eng(te.ctx, 2, 8);
-            llama_decision::options o;
-            o.cache_tag = "after-error";
-            const auto p = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, o, nullptr);
-            t.assert_equal("auto still answers every question", req.questions.size(), p.size());
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("auto after error: ") + e.what(), false);
-        }
-    });
-}
-
 static void test_permutations_real(testing & t) {
     t.test("permutation passes are stable and the noul answer survives the swap", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         test_engine te;
@@ -6704,11 +5817,11 @@ static void test_permutations_real(testing & t) {
 
             llama_decision::options o;
             o.cache_tag = "perm";
-            const auto p1  = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p1  = test_letter_readout(eng, *vocab, nullptr, false,
                                                             llama_decision::parse_decision_request(one), pool, o, nullptr);
-            const auto p2  = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p2  = test_letter_readout(eng, *vocab, nullptr, false,
                                                             llama_decision::parse_decision_request(two), pool, o, nullptr);
-            const auto p2b = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p2b = test_letter_readout(eng, *vocab, nullptr, false,
                                                             llama_decision::parse_decision_request(two), pool, o, nullptr);
 
             // Two identical passes must land on bit-identical probabilities. This is a producer
@@ -6751,9 +5864,9 @@ static void test_permutations_real(testing & t) {
                 body["permutations"] = 2;
                 return body;
             };
-            const auto p_ab = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p_ab = test_letter_readout(eng, *vocab, nullptr, false,
                                                              llama_decision::parse_decision_request(make_pair(false)), pool, o, nullptr);
-            const auto p_ba = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p_ba = test_letter_readout(eng, *vocab, nullptr, false,
                                                              llama_decision::parse_decision_request(make_pair(true)), pool, o, nullptr);
             const double bill_a = p_ab[0][0]; // billing first
             const double bill_b = p_ba[0][1]; // billing second
@@ -6810,7 +5923,6 @@ static std::pair<common_json, common_json> assemble_default_and_diagnostics() {
     usage["output_tokens"]   = 0;
     usage["cached_tokens"]   = 0;
     usage["state_cache_hit"] = false;
-    usage["head_mode"]       = "full";
 
     const std::vector<std::vector<float>> probs = { { 0.25f, 0.75f }, { 0.6f, 0.3f, 0.1f }, { 0.2f, 0.3f, 0.5f } };
     llama_decision::decision_request req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
@@ -6842,7 +5954,7 @@ static void test_decision_default_envelope(testing & t) {
 
         t.assert_equal("top-level keys", std::string("answers,model,usage"), key_set(out));
         t.assert_equal("usage keys",
-                       std::string("cached_tokens,head_mode,input_tokens,output_tokens,state_cache_hit"),
+                       std::string("cached_tokens,input_tokens,output_tokens,state_cache_hit"),
                        key_set(out.at("usage")));
 
         const auto & answers = out.at("answers");
@@ -6876,6 +5988,96 @@ static void test_decision_default_envelope(testing & t) {
     });
 }
 
+
+// M6 - the Jev compatibility guarantee. The default envelope is the frozen contract: replaying the
+// M0 golden request set must produce a byte-identical default (non-diagnostics) envelope, the
+// diagnostics variant must differ only additively, and the session fork fields must appear only
+// when a session fork (or diagnostics) is present, never in the strict stateless default envelope.
+static void test_jev_compat_guarantee(testing & t) {
+    const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+    const std::vector<std::vector<float>> probs = {
+        { 0.25f, 0.75f },
+        { 0.6f, 0.3f, 0.1f },
+        { 0.2f, 0.3f, 0.5f },
+    };
+    common_json usage = common_json::object();
+    usage["input_tokens"]    = 12;
+    usage["output_tokens"]   = 0;
+    usage["cached_tokens"]   = 4;
+    usage["state_cache_hit"] = false;
+
+    t.test("the M0 golden request set replays byte-identical in the default envelope", [&](testing & t) {
+        const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        const std::string actual = out.dump(2) + "\n";
+        const std::string golden = read_file(fixture_path("decision_basic.golden.json"));
+        t.assert_equal("the default envelope is byte-identical to the M0 golden", golden, actual);
+    });
+
+    t.test("the diagnostics variant differs only additively", [&](testing & t) {
+        auto diag_req = req;
+        diag_req.diagnostics = true;
+        const common_json plain = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        const common_json diag  = llama_decision::assemble_decision_response(diag_req, probs, "m", usage);
+
+        t.assert_equal("model is unchanged", plain.at("model").dump(), diag.at("model").dump());
+        t.assert_equal("usage input_tokens is unchanged",
+                       plain.at("usage").at("input_tokens").dump(), diag.at("usage").at("input_tokens").dump());
+        t.assert_equal("usage output_tokens is unchanged",
+                       plain.at("usage").at("output_tokens").dump(), diag.at("usage").at("output_tokens").dump());
+        t.assert_true("the diagnostics usage carries the extra counters",
+                      diag.at("usage").contains("cached_tokens") && diag.at("usage").contains("state_cache_hit"));
+        for (const auto & e : plain.at("answers").items()) {
+            const auto & a = e.value();
+            const auto & b = diag.at("answers").at(e.key());
+            t.assert_equal("answer " + e.key() + " type is unchanged",
+                           a.at("type").dump(), b.at("type").dump());
+            for (const char * key : { "noul", "choice", "score", "probabilities", "legend", "confidence" }) {
+                const bool in_plain = a.contains(key);
+                t.assert_equal("answer " + e.key() + " has " + key, in_plain, b.contains(key));
+                if (in_plain) {
+                    t.assert_equal("answer " + e.key() + " " + key + " is unchanged",
+                                   a.at(key).dump(), b.at(key).dump());
+                }
+            }
+        }
+    });
+
+    t.test("session fork fields appear only with a session fork or diagnostics", [&](testing & t) {
+        common_json session_payload = common_json::object();
+        session_payload["session_fork"] = true;
+        session_payload["source_slot"]  = 3;
+        session_payload["session_pos"]  = 41;
+        session_payload["turn"]         = "t-7";
+
+        // stateless default: no payload, no session fields
+        const common_json plain = llama_decision::assemble_decision_response(req, probs, "m", usage);
+        for (const char * key : { "session_fork", "source_slot", "session_pos", "turn" }) {
+            t.assert_true(std::string("the stateless default has no ") + key, !plain.contains(key));
+        }
+        t.assert_equal("stateless default top-level keys",
+                       std::string("answers,model,usage"), key_set(plain));
+
+        // a session fork passes the fork payload even without diagnostics: the fork fields appear
+        // additively and the default envelope is otherwise byte-identical
+        const common_json fork = llama_decision::assemble_decision_response(req, probs, "m", usage, &session_payload);
+        t.assert_equal("session_fork is reported", true, fork.at("session_fork").get<bool>());
+        t.assert_equal("source_slot is reported", 3, fork.at("source_slot").get<long long>());
+        t.assert_equal("session_pos is reported", 41, fork.at("session_pos").get<long long>());
+        t.assert_equal("turn is reported", std::string("t-7"), fork.at("turn").get<std::string>());
+        t.assert_equal("fork answers equal the stateless answers",
+                       plain.at("answers").dump(), fork.at("answers").dump());
+        t.assert_equal("fork usage equals the stateless usage",
+                       plain.at("usage").dump(), fork.at("usage").dump());
+
+        // with diagnostics the same payload still reports the fork fields
+        auto diag_req = req;
+        diag_req.diagnostics = true;
+        const common_json diag = llama_decision::assemble_decision_response(diag_req, probs, "m", usage, &session_payload);
+        t.assert_equal("session_fork is reported with diagnostics", true, diag.at("session_fork").get<bool>());
+        t.assert_equal("source_slot is reported with diagnostics", 3, diag.at("source_slot").get<long long>());
+        t.assert_equal("session_pos is reported with diagnostics", 41, diag.at("session_pos").get<long long>());
+    });
+}
 
 // Confidence and its telemetry are producer self-doubt: they may be reported, but no gating path
 // may read them. The scorer and the server must not name them at all, and the per-answer audit
@@ -7096,233 +6298,6 @@ static int count_tokens_in_decision_sources(const std::vector<std::string> & nee
     return hits;
 }
 
-// One synthetic answer-head descriptor for the policy ledger.
-struct head_descriptor {
-    std::string arch;      // lfm2 | lfm2moe | gemma4 | unsupported
-    bool        output_s;  // adapter-scaled head
-    bool        contiguous;
-    bool        out_of_range;
-    bool        expect;    // the documented policy should allow the fast path
-};
-
-// The documented selected-head policy: a plain, contiguous, in-range output tensor on a supported
-// architecture. Mirrors the real guards in llama_model_classifier_rows / the context capability.
-static bool head_descriptor_available(const head_descriptor & d) {
-    const bool arch_ok = d.arch == "lfm2" || d.arch == "lfm2moe" || d.arch == "gemma4";
-    return arch_ok && !d.output_s && d.contiguous && !d.out_of_range;
-}
-
-static common_json calibration_selected_head_measurement() {
-    // The fast path is opt-in: with no model loaded the capability probe reports it unavailable,
-    // and it is never a production gate until signed. This ledger checks the policy against a
-    // 250-case control group (out-of-range ids, non-contiguous heads, adapter-scaled heads and
-    // unsupported architectures must never fire). The row table is built per request, so no model
-    // is needed here.
-    std::vector<head_descriptor> cases;
-    for (int i = 0; i < 125; ++i) {
-        cases.push_back({ (i % 2 == 0) ? "lfm2" : "gemma4", false, true, false, true });
-    }
-    for (int i = 0; i < 50; ++i) {  // out-of-range ids
-        cases.push_back({ (i % 2 == 0) ? "lfm2" : "gemma4", false, true, true, false });
-    }
-    for (int i = 0; i < 40; ++i) {  // non-contiguous head
-        cases.push_back({ (i % 2 == 0) ? "lfm2" : "gemma4", false, false, false, false });
-    }
-    for (int i = 0; i < 25; ++i) {  // adapter-scaled head
-        cases.push_back({ (i % 2 == 0) ? "lfm2" : "gemma4", true, true, false, false });
-    }
-    for (int i = 0; i < 10; ++i) {  // unsupported architecture
-        cases.push_back({ "unsupported", false, true, false, false });
-    }
-
-    int tp = 0, fp = 0, tn = 0, fn = 0;
-    for (const auto & d : cases) {
-        const bool avail = head_descriptor_available(d);
-        if (d.expect && avail) {
-            ++tp;
-        } else if (!d.expect && avail) {
-            ++fp;
-        } else if (!d.expect && !avail) {
-            ++tn;
-        } else {
-            ++fn;
-        }
-    }
-    (void) tn;
-
-    common_json out = common_json::object();
-    out["source_hits"]     = count_tokens_in_decision_sources({ "classifier_rows", "llama_get_embeddings" });
-    llama_decision::answer_head_cache cache;
-    out["available"]       = cache.probe(nullptr).available; // no model loaded: the head path stays off
-    out["production_gate"] = false;
-    out["cases"]           = (int) cases.size();
-    out["precision"]       = (tp + fp) ? (double) tp / (tp + fp) : 1.0;
-    out["recall"]          = (tp + fn) ? (double) tp / (tp + fn) : 1.0;
-    out["false_positives"] = fp;
-    out["false_negatives"] = fn;
-    return out;
-}
-
-// The head/context selector is a producer-capability predicate: it may pick the classifier fast
-// path only when the context is classifier-only, the answer head is available at the hidden
-// width, and it covers every candidate token. This ledger mirrors engine::select_scoring_head
-// over a labelled case set (the real predicate is exercised against a live context elsewhere in
-// the suite); precision and recall must both be 1.0. The fallback tally is a capability metric,
-// never a quality metric.
-struct head_selector_case {
-    bool classifier_ctx;
-    bool head_available;
-    bool width_matches;
-    bool covers_all;
-    bool expect_classifier;
-    const char * fallback_reason; // reason family when the case must fall back
-};
-
-static bool head_selector_picks_classifier(const head_selector_case & c) {
-    return c.classifier_ctx && c.head_available && c.width_matches && c.covers_all;
-}
-
-static common_json calibration_head_selector_measurement() {
-    std::vector<head_selector_case> cases;
-    for (int i = 0; i < 80; ++i) {
-        cases.push_back({ true, true, true, true, true, "" });
-    }
-    for (int i = 0; i < 40; ++i) {
-        cases.push_back({ false, true, true, true, false, "non_classifier_context" });
-    }
-    for (int i = 0; i < 30; ++i) {
-        cases.push_back({ true, true, true, false, false, "uncovered_candidate" });
-    }
-    for (int i = 0; i < 25; ++i) {
-        cases.push_back({ true, true, false, true, false, "width_mismatch" });
-    }
-    for (int i = 0; i < 20; ++i) {
-        cases.push_back({ true, false, false, false, false, "unavailable_head" });
-    }
-    for (int i = 0; i < 15; ++i) {
-        cases.push_back({ true, false, false, false, false, "null_head" });
-    }
-
-    int tp = 0, fp = 0, tn = 0, fn = 0;
-    common_json reasons = common_json::object();
-    for (const auto & c : cases) {
-        const bool picked = head_selector_picks_classifier(c);
-        if (c.expect_classifier && picked) {
-            ++tp;
-        } else if (!c.expect_classifier && picked) {
-            ++fp;
-        } else if (!c.expect_classifier && !picked) {
-            ++tn;
-            if (c.fallback_reason[0] != '\0') {
-                reasons[c.fallback_reason] = reasons.value(c.fallback_reason, 0) + 1;
-            }
-        } else {
-            ++fn;
-        }
-    }
-    (void) tn;
-
-    common_json out = common_json::object();
-    out["cases"]            = (int) cases.size();
-    out["precision"]        = (tp + fp) ? (double) tp / (tp + fp) : 1.0;
-    out["recall"]           = (tp + fn) ? (double) tp / (tp + fn) : 1.0;
-    out["false_positives"]  = fp;
-    out["false_negatives"]  = fn;
-    out["fallback_cases"]   = fp + tn;
-    out["fallback_rate"]    = cases.empty() ? 0.0 : (double) (fp + tn) / (double) cases.size();
-    out["fallback_reasons"] = reasons;
-    return out;
-}
-
-// The adapter scope is an outcome-correctness gate, not a producer-capability one: with adapters
-// configured the decision must run on the base model, so the head is never used and an explicit
-// selected request is refused. This ledger mirrors the server contract (auto -> base full logits,
-// selected -> rejected, full -> base full logits) and measures detection precision/recall over a
-// labelled case set, including the no-adapter control group that must still select the head.
-struct adapter_scope_case {
-    bool         adapters;
-    const char * head;         // "auto" | "selected" | "full"
-    bool         head_covered;
-    const char * expect;       // "classifier" | "full" | "reject"
-};
-
-static const char * adapter_scope_outcome(const adapter_scope_case & c) {
-    if (c.adapters) {
-        return std::string(c.head) == "selected" ? "reject" : "full";
-    }
-    if (std::string(c.head) == "full") {
-        return "full";
-    }
-    return c.head_covered ? "classifier" : "full";
-}
-
-static common_json calibration_adapter_scope_measurement() {
-    std::vector<adapter_scope_case> cases;
-    for (int i = 0; i < 60; ++i) {
-        cases.push_back({ true, "auto", true, "full" });
-    }
-    for (int i = 0; i < 40; ++i) {
-        cases.push_back({ true, "selected", true, "reject" });
-    }
-    for (int i = 0; i < 30; ++i) {
-        cases.push_back({ true, "full", true, "full" });
-    }
-    for (int i = 0; i < 60; ++i) {
-        cases.push_back({ false, "auto", true, "classifier" });
-    }
-    for (int i = 0; i < 30; ++i) {
-        cases.push_back({ false, "selected", true, "classifier" });
-    }
-    for (int i = 0; i < 30; ++i) {
-        cases.push_back({ false, "auto", false, "full" });
-    }
-
-    // detection is "the decision was scoped to the base model because of adapters", truth is
-    // "adapters are configured". A no-adapter coverage fallback is not an adapter detection.
-    int tp = 0, fp = 0, fn = 0;
-    int control_head = 0;
-    int adapter_auto_full = 0, adapter_selected_reject = 0, adapter_full_full = 0;
-    bool policy_ok = true;
-    for (const auto & c : cases) {
-        const std::string got = adapter_scope_outcome(c);
-        policy_ok = policy_ok && got == c.expect;
-        const bool scoped = std::string(got) == "reject" || (std::string(got) == "full" && c.adapters);
-        if (c.adapters && scoped) {
-            ++tp;
-        } else if (!c.adapters && scoped) {
-            ++fp;
-        } else if (c.adapters && !scoped) {
-            ++fn;
-        }
-        if (!c.adapters && std::string(got) == "classifier") {
-            ++control_head;
-        }
-        if (c.adapters && std::string(c.head) == "auto" && got == "full") {
-            ++adapter_auto_full;
-        }
-        if (c.adapters && std::string(c.head) == "selected" && got == "reject") {
-            ++adapter_selected_reject;
-        }
-        if (c.adapters && std::string(c.head) == "full" && got == "full") {
-            ++adapter_full_full;
-        }
-    }
-
-    common_json out = common_json::object();
-    out["cases"]                    = (int) cases.size();
-    out["policy_matches_expect"]    = policy_ok;
-    out["precision"]                = (tp + fp) ? (double) tp / (tp + fp) : 1.0;
-    out["recall"]                   = (tp + fn) ? (double) tp / (tp + fn) : 1.0;
-    out["false_positives"]          = fp;
-    out["false_negatives"]          = fn;
-    out["control_no_adapter_head"]  = control_head;
-    out["with_adapter_auto_full"]   = adapter_auto_full;
-    out["with_adapter_selected_reject"] = adapter_selected_reject;
-    out["with_adapter_full_full"]   = adapter_full_full;
-    out["production_gate"]          = false;
-    return out;
-}
-
 // The temperature provenance gate is a confidence-in-the-producer control, never an outcome
 // guarantee: a matching profile can still produce a wrong answer. A profile with identical
 // provenance must be accepted, and any single mismatched provenance field must refuse a
@@ -7368,61 +6343,6 @@ static common_json calibration_temperature_control_measurement() {
     out["match_accepted"]   = match_accepted;
     out["mismatch_refused"] = mismatch_refused;
     out["mismatch_cases"]   = (int) (sizeof(fields) / sizeof(fields[0]));
-    return out;
-}
-
-// A capability precondition: the predicate decides whether the answer head may be built, never which
-// option wins. This control group runs the real predicate on the generated fixtures, so the verdict
-// is measured on a model rather than restated from prose. The accepted fixture has equal hidden and
-// output widths; the refused one sets the output width apart, where a built head would score against
-// the wrong width.
-static common_json calibration_classifier_predicate_measurement() {
-    const struct { const char * file; bool expect_supported; } fixtures[] = {
-        { "qwen35-dense.gguf", true  },
-        { "qwen4exp-moe.gguf", false },
-    };
-
-    int  cases          = 0;
-    int  accepted       = 0;
-    int  refused        = 0;
-    int  false_positives = 0;
-    int  false_negatives = 0;
-    bool fixtures_present = true;
-    for (const auto & f : fixtures) {
-        const std::string path = std::string(DECISION_TEST_GENERATED_MODEL_DIR) + "/" + f.file;
-        if (!file_exists(path)) {
-            fixtures_present = false;
-            continue;
-        }
-        cpu_test_engine te;
-        if (!te.load(path, 256)) {
-            fixtures_present = false;
-            continue;
-        }
-        ++cases;
-        const bool supported = llama_model_classifier_supported(te.model, nullptr);
-        if (supported) {
-            ++accepted;
-        } else {
-            ++refused;
-        }
-        if (supported && !f.expect_supported) {
-            ++false_positives;
-        }
-        if (!supported && f.expect_supported) {
-            ++false_negatives;
-        }
-    }
-
-    common_json out = common_json::object();
-    out["cases"]            = cases;
-    out["fixtures_present"] = fixtures_present;
-    out["accepted"]         = accepted;
-    out["refused"]          = refused;
-    out["precision"]        = (accepted + false_positives) ? (double) accepted / (accepted + false_positives) : 1.0;
-    out["recall"]           = (accepted + false_negatives) ? (double) accepted / (accepted + false_negatives) : 1.0;
-    out["false_positives"]  = false_positives;
-    out["false_negatives"]  = false_negatives;
     return out;
 }
 
@@ -7613,47 +6533,13 @@ static common_json calibration_model_measurement(const char * path) {
     const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
     out["label_pool_size"] = (long long) pool.size();
 
-    // head-vs-full: the selected head and the full logits are two producers of the same decision.
-    // Winner agreement is task value; total variation is producer confidence and is only recorded.
-    out["head_vs_full_available"]    = false;
-    out["head_vs_full_winner_agree"] = false;
-    out["head_vs_full_tv"]           = 0.0;
-    {
-        test_engine te_head;
-        te_head.model = te.model;
-        if (te_head.make_ctx(true)) {
-            auto hreq = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-            llama_decision::engine e_head(te_head.ctx, 2, 8);
-            hreq.head = "selected";
-            llama_decision::options hopt;
-            hopt.cache_tag = "cal-head";
-            llama_decision::letter_metrics hm;
-            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, hreq,
-                                                           pool, hopt, &hm);
-            hreq.head     = "full";
-            llama_decision::options fopt;
-            fopt.cache_tag = "cal-full";
-            llama_decision::letter_metrics fm;
-            const auto pf = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, hreq, pool,
-                                                           fopt, &fm);
-            out["head_vs_full_available"] = hm.head_active;
-            if (hm.head_active && pf.size() == ph.size()) {
-                bool agree = true;
-                for (size_t qi = 0; qi < pf.size(); ++qi) {
-                    agree = agree && pf[qi].size() == ph[qi].size() && argmax(pf[qi]) == argmax(ph[qi]);
-                }
-                out["head_vs_full_winner_agree"] = agree;
-                out["head_vs_full_tv"]           = total_variation(pf, ph);
-            }
-        }
-    }
     auto readout = [&](double temp) {
         common_json body = common_json::parse(decision_valid_body());
         body["temperature"] = temp;
         body.erase("temperatures");
         llama_decision::options ro;
         ro.cache_tag = "cal-temp";
-        return test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, llama_decision::parse_decision_request(body), pool, ro, nullptr);
+        return test_letter_readout(eng, *vocab, nullptr, false, llama_decision::parse_decision_request(body), pool, ro, nullptr);
     };
     const auto p10 = readout(1.0);
     const auto p13 = readout(1.3);
@@ -7737,190 +6623,7 @@ static void test_calibration_confidence(testing & t) {
     });
 }
 
-static void test_calibration_selected_head(testing & t) {
-    t.test("calibration: selected head exists but stays opt-in and disabled", [](testing & t) {
-        const common_json m = calibration_selected_head_measurement();
-        t.assert_true("the selected-head code is present", m.at("source_hits").get<int>() > 0);
-        t.assert_true("selected head is not available without a model", !m.at("available").get<bool>());
-        t.assert_true("the fast path is not a production gate", !m.at("production_gate").get<bool>());
-        t.assert_equal("the control group has 250 cases", 250, m.at("cases").get<int>());
-        assert_close(t, "selected-head policy precision is 1.0", 1.0, m.at("precision").get<double>(), 1e-12);
-        assert_close(t, "selected-head policy recall is 1.0", 1.0, m.at("recall").get<double>(), 1e-12);
-        t.assert_equal("no false positives on the control group", 0, m.at("false_positives").get<int>());
-        t.assert_equal("no false negatives on the control group", 0, m.at("false_negatives").get<int>());
-    });
-}
 
-static void test_calibration_selected_head_lfm(testing & t) {
-    t.test("calibration: selected head fires on LFM2 and agrees with full logits", [](testing & t) {
-        const char * path = selected_test_model_path();
-        if (!gpu_model_ready(t, path)) {
-            return;
-        }
-        test_engine te_full;
-        te_full.model = shared_model().model;
-        test_engine te_head;
-        te_head.model = shared_model().model;
-        // the 64-option suffix now carries keys and descriptions, so it needs a production-sized
-        // batch (512 was enough before the option lines gained the key)
-        if (!te_full.make_ctx(false, 2048) || !te_head.make_ctx(true, 2048)) {
-            t.assert_true("both contexts load", false);
-            return;
-        }
-
-        try {
-            auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te_full.model));
-            const std::string tail = "\nAnswer:\n";
-            const auto pool = llama_decision::build_label_pool(*vocab, tail, 64);
-            t.assert_equal("the label pool holds 64 labels", 64, (int) pool.size());
-
-            bool clean = true;
-            for (const auto & l : pool) {
-                clean = clean && llama_decision::answer_label_token(*vocab, tail, l.text) == l.token;
-            }
-            t.assert_true("every label resolves at the boundary", clean);
-
-            const auto head = llama_decision::build_classifier_head(shared_model().model, pool);
-            t.assert_true("the head table builds on LFM2", head.available());
-            t.assert_equal("the head width matches the hidden width",
-                           (int) llama_model_n_embd_out(shared_model().model), head.width);
-            char arch[64] = { 0 };
-            llama_model_meta_val_str(shared_model().model, "general.architecture", arch, sizeof(arch));
-            if (std::string(arch).rfind("lfm2", 0) == 0) {
-                t.assert_true("LFM applies no logit softcap", head.softcap == 0.0f);
-            } else {
-                t.assert_true("a softcapped head reports its scale", head.softcap >= 0.0f);
-            }
-
-            // control: an out-of-range id is rejected, and no model is never available
-            const llama_token out_of_range =
-                (llama_token) llama_vocab_n_tokens(llama_model_get_vocab(shared_model().model)); // ids are [0, n_tokens)
-            const std::vector<llama_token> bad = { 0, out_of_range };
-            std::vector<float> bad_rows((size_t) 2 * (size_t) llama_model_n_embd_out(shared_model().model), 0.0f);
-            float bad_softcap = 0.0f;
-            t.assert_equal("an out-of-range id is rejected",
-                           0, llama_model_classifier_rows(shared_model().model, bad.data(), 2, bad_rows.data(),
-                                                         bad_rows.size(), &bad_softcap, nullptr));
-            llama_decision::answer_head_cache probe_cache;
-            t.assert_true("no model means no head", !probe_cache.probe(nullptr).available);
-
-            // The head can only score length-1 label paths, and a label is coverable only when the
-            // token the plan scores at the answer boundary is the same single token the head
-            // carries. A symbol label whose tokenizer merges it with the trailing newline (e.g. a
-            // "!\n" token) drops out of head coverage, so the head's fan-out can be smaller than
-            // the pool. Size the wide question to the largest coverable prefix, probed with the
-            // engine's own predicate, so the head-vs-full agreement is still exercised on the
-            // widest question this model's head can actually serve.
-            llama_decision::engine e_full(te_full.ctx, 2, 8);
-            llama_decision::engine e_head(te_head.ctx, 2, 8);
-            size_t wide = pool.size();
-            for (; wide >= llama_decision::DECISION_MIN_OPTIONS; --wide) {
-                llama_decision::field_input probe;
-                probe.suffix = "\nQuestion: probe\nOptions:\n";
-                for (size_t i = 0; i < wide; ++i) {
-                    llama_decision::decision_option o;
-                    o.key = "opt" + std::to_string(i);
-                    probe.suffix += llama_decision::format_option_line(pool[i], o) + "\n";
-                }
-                probe.suffix += "Return the correct letter label.\nAnswer:\n";
-                probe.candidates.reserve(wide);
-                for (size_t i = 0; i < wide; ++i) {
-                    probe.candidates.push_back(pool[i].text);
-                }
-                llama_decision::options probe_opt;
-                probe_opt.mode           = "tree";
-                probe_opt.tree_max       = (int) pool.size();
-                probe_opt.split_boundary = false;
-                probe_opt.cache_tag      = "cal-head-probe";
-                llama_decision::options head_opt = probe_opt;
-                head_opt.head = &head;
-                std::string probe_reason;
-                const auto probe_plan = e_head.compile_fields({ probe }, probe_opt);
-                if (e_head.select_scoring_head(probe_plan, head_opt, &probe_reason)) {
-                    break;
-                }
-            }
-            t.assert_true("the head covers a usable wide prefix", wide >= llama_decision::DECISION_MIN_OPTIONS);
-
-            // scored pairs: one wide-option question plus 31 six-option questions
-            common_json body = common_json::object();
-            body["model"] = "m";
-            body["state"] = "Customer was charged twice on May 3 and asked for a refund.";
-            common_json questions = common_json::object();
-            auto add_question = [&questions](const std::string & id, int k) {
-                common_json crit = common_json::object();
-                for (int i = 0; i < k; ++i) {
-                    crit["opt" + std::to_string(i)] = "candidate " + std::to_string(i);
-                }
-                common_json q = common_json::object();
-                q["type"]         = "choice";
-                q["instructions"] = "Which category fits best?";
-                q["criteria"]     = crit;
-                questions[id]     = q;
-            };
-            add_question("wide", (int) wide);
-            for (int i = 0; i < 31; ++i) {
-                add_question("q" + std::to_string(i), 6);
-            }
-            body["questions"] = questions;
-
-            const auto req = llama_decision::parse_decision_request(body);
-            int pairs = 0;
-            for (const auto & q : req.questions) {
-                pairs += (int) q.options.size();
-            }
-            t.assert_true("the request scores the wide question plus 31 six-option questions",
-                          pairs == (int) wide + 31 * 6);
-
-            llama_decision::decision_request rfull = req;
-            rfull.head = "full";
-            llama_decision::options of;
-            of.cache_tag = "cal-full";
-            of.optimize  = false; // isolate the projection: the suffix hoist changes batch numerics
-            llama_decision::letter_metrics mf;
-            const auto pf = test_letter_readout(e_full, test_head_cache(), *vocab, nullptr, false, rfull, pool, of, &mf);
-
-            llama_decision::decision_request rhead = req;
-            rhead.head = "selected";
-            llama_decision::options oh;
-            oh.cache_tag = "cal-head";
-            oh.optimize  = false;
-            llama_decision::letter_metrics mh;
-            const auto ph = test_letter_readout(e_head, test_head_cache(), *vocab, nullptr, false, rhead, pool, oh, &mh);
-
-            t.assert_true("the head fires on LFM2", mh.head_active);
-
-            int wrong = 0;
-            bool shaped = pf.size() == ph.size();
-            for (size_t qi = 0; shaped && qi < pf.size(); ++qi) {
-                shaped = pf[qi].size() == ph[qi].size();
-                if (!shaped) {
-                    break;
-                }
-                const size_t a = std::distance(pf[qi].begin(), std::max_element(pf[qi].begin(), pf[qi].end()));
-                const size_t b = std::distance(ph[qi].begin(), std::max_element(ph[qi].begin(), ph[qi].end()));
-                if (a != b) {
-                    ++wrong;
-                }
-            }
-            t.assert_true("the selected and full shapes match", shaped);
-            t.assert_equal("no false positives: every question keeps its winner", 0, wrong);
-            assert_close(t, "precision is 1.0", 1.0, shaped ? (double) (pf.size() - wrong) / pf.size() : 0.0, 1e-12);
-            assert_close(t, "recall is 1.0", 1.0, mh.head_active ? 1.0 : 0.0, 1e-12);
-
-            const double tv = total_variation(pf, ph);
-            fprintf(stderr, "calibration selected head: %d pairs, TV %.6f, rows head %d full %d (informational)\n",
-                    pairs, tv, mh.rows, mf.rows);
-            // The full path runs a quantized weight matmul that also quantizes the activations, while
-            // the head dequantizes the rows and dots in FP32. The gap is quantization noise: it grows
-            // with the output table's quant coarseness (7.5e-2 was a Q4_0 2.6B, a Q4_K 9B is larger),
-            // so this is a sanity bound and the per-question winner check above is the real gate.
-            t.assert_true("selected and full agree within 2.5e-1 total variation (TV=" + std::to_string(tv) + ")", tv <= 2.5e-1);
-        } catch (const std::exception & e) {
-            t.assert_true(std::string("selected head calibration: ") + e.what(), false);
-        }
-    });
-}
 
 static common_json calibration_row(const std::string & trigger, const std::string & axis,
                                    const std::vector<std::string> & may_gate,
@@ -7999,50 +6702,6 @@ static common_json calibration_rows() {
                                  "advisory-only; dashboard threshold, never a production gate");
         r["measurements"] = calibration_confidence_measurement();
         rows["confidence_diagnostics"] = r;
-    }
-    {
-        auto r = calibration_row("selected vs full head choice", "task-value",
-                                 { "fast path vs full-logits path" },
-                                 { "admission", "caching", "routing", "persistence", "answer validity" },
-                                 "fast path exists but is opt-in and off by default: it runs only when the context exposes hidden states, an explicit selected request on an incompatible model errors, and every other path falls back to full logits");
-        r["measurements"] = calibration_selected_head_measurement();
-        rows["selected_head"] = r;
-    }
-    {
-        auto r = calibration_row("head/context selector (classifier vs full logits)", "task-value",
-                                 { "which context scores the request" },
-                                 { "admission", "caching", "routing", "persistence", "answer key" },
-                                 "the classifier fast path is chosen only when the context is classifier-only, the head is available at the hidden width and covers every candidate; otherwise full logits, and the fallback is a capability metric only");
-        r["measurements"] = calibration_head_selector_measurement();
-        r["measurements"]["outcome_tv_bound"]     = 0.05;
-        r["measurements"]["outcome_argmax_agree"] = true;
-        rows["head_context_selector"] = r;
-    }
-    {
-        auto r = calibration_row(
-            "head vs full producer equivalence", "task-value", { "whether the selected-head fast path may run" },
-            { "admission", "caching", "routing", "persistence" },
-            "winner equality between the selected head and full logits is the task-value gate; total variation is "
-            "producer confidence, recorded per model in model_measurements, never a gate; a family that flips a winner "
-            "is refused statically in the classifier predicate, never by a runtime confidence threshold");
-        common_json g        = control_group({
-            control_case("selected head available on the model", "used"),
-            control_case("selected head unavailable", "falls back to full logits"),
-            control_case("winner disagrees on a family", "that family is refused statically"),
-        });
-        g["winner_axis"]     = "task-value";
-        g["tv_axis"]         = "producer confidence (recorded, never asserted as a gate)";
-        g["tv_bound"]        = 0.05;
-        r["control_group"]   = g;
-        rows["head_vs_full"] = r;
-    }
-    {
-        auto r = calibration_row("adapter scope (base model only)", "task-value",
-                                 { "which model identity answers" },
-                                 { "no-adapter head selection", "admission", "caching", "routing", "persistence" },
-                                 "with adapters configured the decision is scoped to the base model: auto and full use base full logits, an explicit selected request is refused, and a no-adapter control still selects the head");
-        r["measurements"] = calibration_adapter_scope_measurement();
-        rows["adapter_scope"] = r;
     }
 
     rows["tree_vs_greedy"] = calibration_row("tree vs greedy exactness and cost", "task-value",
@@ -8197,21 +6856,6 @@ static common_json calibration_rows() {
         rows["body_cap"] = r;
     }
     {
-        auto r = calibration_row("classifier capability predicate (arch + output width + output_s + contiguity)", "task-value",
-                                 { "whether the answer-head fast path may be built" },
-                                 { "which option wins", "answer validity", "admission", "caching" },
-                                 "100 percent correct accept/refuse on the fixture control group; a false accept would build a head at the wrong width, a false refuse would only fall back to full logits");
-        r["measurements"] = calibration_classifier_predicate_measurement();
-        common_json g = control_group({
-            control_case("equal hidden and output widths", "accepted"),
-            control_case("output width differs from the hidden width", "refused"),
-            control_case("adapter-scaled output tensor", "refused"),
-            control_case("non-contiguous output tensor", "refused"),
-        });
-        r["control_group"] = g;
-        rows["classifier_predicate"] = r;
-    }
-    {
         auto r = calibration_row("output-row budget (max of chat and decision, not the sum)", "task-value",
                                  { "logits buffer size for the shared context" },
                                  { "answers", "admission", "caching" },
@@ -8263,14 +6907,14 @@ static void test_calibration_table(testing & t) {
         const common_json cal = common_json::parse(
             read_file(std::string(DECISION_TEST_BASELINE_DIR) + "/calibration.json"));
 
-        const char * ids[] = { "tree_vs_greedy", "prefix_hoist", "single_question_bypass", "question_dedup", "confidence_diagnostics", "auto_mode_boundary", "temperature_profile", "selected_head", "head_context_selector", "adapter_scope", "readout_compatibility", "admission_control" };
+        const char * ids[] = { "tree_vs_greedy", "prefix_hoist", "single_question_bypass", "question_dedup", "confidence_diagnostics", "auto_mode_boundary", "temperature_profile", "readout_compatibility", "admission_control" };
         for (const char * id : ids) {
             const auto & row = cal.at("rows").at(id);
             t.assert_true(std::string(id) + " has an axis", row.contains("axis"));
             t.assert_true(std::string(id) + " has a verdict", !row.at("verdict").get<std::string>().empty());
             t.assert_true(std::string(id) + " is not a production gate", !row.at("production_gate").get<bool>());
         }
-        for (const char * id : { "confidence_diagnostics", "temperature_profile", "selected_head", "head_context_selector", "adapter_scope", "readout_compatibility" }) {
+        for (const char * id : { "confidence_diagnostics", "temperature_profile", "readout_compatibility" }) {
             const auto & ng = cal.at("rows").at(id).at("may_not_gate");
             for (const char * rule : { "admission", "caching", "routing", "persistence" }) {
                 bool found = false;
@@ -8296,80 +6940,8 @@ static void test_calibration_table(testing & t) {
         assert_close(t, "confidence_diagnostics AUC matches the committed value",
                      cal.at("rows").at("confidence_diagnostics").at("measurements").at("auc").get<double>(),
                      calibration_confidence_measurement().at("auc").get<double>(), 1e-9);
-        t.assert_equal("selected_head source scan matches the committed value",
-                       cal.at("rows").at("selected_head").at("measurements").at("source_hits").get<int>(),
-                       calibration_selected_head_measurement().at("source_hits").get<int>());
-        t.assert_equal("selected_head cases match the committed value",
-                       cal.at("rows").at("selected_head").at("measurements").at("cases").get<int>(),
-                       calibration_selected_head_measurement().at("cases").get<int>());
-        assert_close(t, "selected_head precision matches the committed value",
-                     cal.at("rows").at("selected_head").at("measurements").at("precision").get<double>(),
-                     calibration_selected_head_measurement().at("precision").get<double>(), 1e-9);
-        assert_close(t, "selected_head recall matches the committed value",
-                     cal.at("rows").at("selected_head").at("measurements").at("recall").get<double>(),
-                     calibration_selected_head_measurement().at("recall").get<double>(), 1e-9);
-        t.assert_equal("selected_head false positives match the committed value",
-                       cal.at("rows").at("selected_head").at("measurements").at("false_positives").get<int>(),
-                       calibration_selected_head_measurement().at("false_positives").get<int>());
-        t.assert_equal("selected_head false negatives match the committed value",
-                       cal.at("rows").at("selected_head").at("measurements").at("false_negatives").get<int>(),
-                       calibration_selected_head_measurement().at("false_negatives").get<int>());
         assert_close(t, "prefix_hoist outcome TV bound matches the committed value",
                      cal.at("rows").at("prefix_hoist").at("measurements").at("outcome_tv_bound").get<double>(), 0.15, 1e-9);
-
-        // head/context selector: the capability ledger must reproduce the committed control group,
-        // with precision and recall of 1.0 (no true classifier case missed, no fallback chosen).
-        const common_json hs = calibration_head_selector_measurement();
-        t.assert_equal("head_context_selector cases match the committed value",
-                       cal.at("rows").at("head_context_selector").at("measurements").at("cases").get<int>(),
-                       hs.at("cases").get<int>());
-        assert_close(t, "head_context_selector precision is 1.0",
-                     cal.at("rows").at("head_context_selector").at("measurements").at("precision").get<double>(), 1.0, 1e-12);
-        assert_close(t, "head_context_selector recall is 1.0",
-                     cal.at("rows").at("head_context_selector").at("measurements").at("recall").get<double>(), 1.0, 1e-12);
-        assert_close(t, "head_context_selector precision matches the committed value",
-                     cal.at("rows").at("head_context_selector").at("measurements").at("precision").get<double>(),
-                     hs.at("precision").get<double>(), 1e-9);
-        assert_close(t, "head_context_selector recall matches the committed value",
-                     cal.at("rows").at("head_context_selector").at("measurements").at("recall").get<double>(),
-                     hs.at("recall").get<double>(), 1e-9);
-        t.assert_equal("head_context_selector no false positives",
-                       cal.at("rows").at("head_context_selector").at("measurements").at("false_positives").get<int>(), 0);
-        t.assert_equal("head_context_selector no false negatives",
-                       cal.at("rows").at("head_context_selector").at("measurements").at("false_negatives").get<int>(), 0);
-        t.assert_equal("head_context_selector fallback cases match the committed value",
-                       cal.at("rows").at("head_context_selector").at("measurements").at("fallback_cases").get<int>(),
-                       hs.at("fallback_cases").get<int>());
-        assert_close(t, "head_context_selector fallback rate matches the committed value",
-                     cal.at("rows").at("head_context_selector").at("measurements").at("fallback_rate").get<double>(),
-                     hs.at("fallback_rate").get<double>(), 1e-9);
-        assert_close(t, "head_context_selector outcome TV bound matches the committed value",
-                     cal.at("rows").at("head_context_selector").at("measurements").at("outcome_tv_bound").get<double>(), 0.05, 1e-9);
-        t.assert_true("head_context_selector records the outcome argmax agreement",
-                      cal.at("rows").at("head_context_selector").at("measurements").at("outcome_argmax_agree").get<bool>());
-
-        // adapter scope: outcome-correctness ledger, precision and recall of 1.0, with the
-        // no-adapter control group still selecting the head.
-        const common_json as = calibration_adapter_scope_measurement();
-        t.assert_true("adapter_scope policy matches every labelled case", as.at("policy_matches_expect").get<bool>());
-        t.assert_equal("adapter_scope cases match the committed value",
-                       cal.at("rows").at("adapter_scope").at("measurements").at("cases").get<int>(),
-                       as.at("cases").get<int>());
-        assert_close(t, "adapter_scope detection precision is 1.0",
-                     cal.at("rows").at("adapter_scope").at("measurements").at("precision").get<double>(), 1.0, 1e-12);
-        assert_close(t, "adapter_scope detection recall is 1.0",
-                     cal.at("rows").at("adapter_scope").at("measurements").at("recall").get<double>(), 1.0, 1e-12);
-        t.assert_true("adapter_scope no-adapter control still selects the head",
-                      as.at("control_no_adapter_head").get<int>() > 0 &&
-                      cal.at("rows").at("adapter_scope").at("measurements").at("control_no_adapter_head").get<int>() > 0);
-        t.assert_true("adapter_scope with-adapter auto is full",
-                      as.at("with_adapter_auto_full").get<int>() > 0 &&
-                      cal.at("rows").at("adapter_scope").at("measurements").at("with_adapter_auto_full").get<int>() > 0);
-        t.assert_true("adapter_scope with-adapter selected is refused",
-                      as.at("with_adapter_selected_reject").get<int>() > 0 &&
-                      cal.at("rows").at("adapter_scope").at("measurements").at("with_adapter_selected_reject").get<int>() > 0);
-        t.assert_true("adapter_scope is not a production gate",
-                      !cal.at("rows").at("adapter_scope").at("measurements").at("production_gate").get<bool>());
 
         assert_close(t, "temperature_profile match-accept matches the committed value",
                      cal.at("rows").at("temperature_profile").at("measurements").at("match_accepted").get<double>(),
@@ -8399,7 +6971,6 @@ static void test_calibration_ledger(testing & t) {
             { "question count limit","question_count_limit" },
             { "queue cap",           "admission_control" },
             { "body cap",            "body_cap" },
-            { "classifier predicate","classifier_predicate" },
             { "output-row budget",   "output_row_capacity" },
             { "determinism allowlist","determinism_allowlist" },
         };
@@ -8426,26 +6997,6 @@ static void test_calibration_gates(testing & t) {
     t.test("calibration: relocated gates carry measured verdicts", [](testing & t) {
         const common_json cal = common_json::parse(
             read_file(std::string(DECISION_TEST_BASELINE_DIR) + "/calibration.json"));
-
-        // classifier capability predicate (task-value): measured on the generated fixtures
-        const common_json cp = calibration_classifier_predicate_measurement();
-        const auto & cp_row = cal.at("rows").at("classifier_predicate");
-        t.assert_equal("classifier_predicate axis is task-value",
-                       std::string("task-value"), cp_row.at("axis").get<std::string>());
-        t.assert_true("classifier_predicate is not a production gate",
-                      !cp_row.at("production_gate").get<bool>());
-        t.assert_true("classifier_predicate control group runs on the fixtures",
-                      cp.at("fixtures_present").get<bool>());
-        t.assert_equal("classifier_predicate cases match the committed value",
-                       cp_row.at("measurements").at("cases").get<int>(), cp.at("cases").get<int>());
-        assert_close(t, "classifier_predicate precision is 1.0",
-                     cp_row.at("measurements").at("precision").get<double>(), 1.0, 1e-12);
-        assert_close(t, "classifier_predicate recall is 1.0",
-                     cp_row.at("measurements").at("recall").get<double>(), 1.0, 1e-12);
-        t.assert_equal("classifier_predicate has no false accept",
-                       cp_row.at("measurements").at("false_positives").get<int>(), 0);
-        t.assert_equal("classifier_predicate has no false refuse",
-                       cp_row.at("measurements").at("false_negatives").get<int>(), 0);
 
         // output-row capacity (task-value): the serialized budget covers every sequence and is no
         // larger than the sum of the two workloads
@@ -8507,9 +7058,9 @@ static void test_calibration_determinism_variance(testing & t) {
             two["permutations"] = 2;
             llama_decision::options o;
             o.cache_tag = "producer-variance";
-            const auto p1 = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p1 = test_letter_readout(eng, *vocab, nullptr, false,
                                                            llama_decision::parse_decision_request(two), pool, o, nullptr);
-            const auto p2 = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false,
+            const auto p2 = test_letter_readout(eng, *vocab, nullptr, false,
                                                            llama_decision::parse_decision_request(two), pool, o, nullptr);
 
             bool stable = p1.size() == p2.size();
@@ -8566,8 +7117,7 @@ static void test_decision_provenance(testing & t) {
 static void test_calibration_model(testing & t) {
     t.test("calibration: model-dependent thresholds measured on a real model", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
-        if (path == nullptr || path[0] == '\0') {
-            t.skip("set LLAMA_DECISION_TEST_MODEL to run");
+        if (!gpu_model_ready(t, path)) {
             return;
         }
         common_json m;
@@ -8659,6 +7209,7 @@ static int write_calibration_rows() {
 
 static int write_goldens() {
     write_file(fixture_path("decision_basic.golden.json"), decision_basic_from_fixed_scores().dump(2) + "\n");
+    write_file(fixture_path("generic_typed.golden.json"), generic_record_from_fixed_scores().dump(2) + "\n");
     return 0;
 }
 
@@ -8690,7 +7241,7 @@ static int write_decision_golden(const char * model_path) {
     const auto pool = llama_decision::build_label_pool(*vocab, test_letter_tail(), 64);
             llama_decision::engine eng(te.ctx, 2, 8);
             const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-    const auto probs = test_letter_readout(eng, test_head_cache(), *vocab, nullptr, false, req, pool, llama_decision::options{}, nullptr);
+    const auto probs = test_letter_readout(eng, *vocab, nullptr, false, req, pool, llama_decision::options{}, nullptr);
     common_json usage = common_json::object();
     usage["input_tokens"]    = 0;
     usage["output_tokens"]   = 0;
@@ -8728,12 +7279,10 @@ static common_json readout_capture(const std::string & path, bool gpu) {
         llama_decision::options opt;
         opt.cache_tag = "readout-baseline";
         llama_decision::letter_metrics    metrics;
-        llama_decision::answer_head_cache head_cache;
         const auto                        probs =
-            test_letter_readout(eng, head_cache, *vocab, nullptr, false, req, pool, opt, &metrics);
+            test_letter_readout(eng, *vocab, nullptr, false, req, pool, opt, &metrics);
 
         common_json core        = oracle_readout(metrics, probs);
-        core["head_mode"]       = metrics.head_active ? "selected" : "full";
         core["label_pool_size"] = (long long) pool.size();
         out["readout"]          = core;
 
@@ -8751,7 +7300,7 @@ static common_json readout_capture(const std::string & path, bool gpu) {
         run(te.model, te.ctx);
     } else {
         cpu_test_engine te;
-        if (!te.load(path, 4096, false, false, 512)) {
+        if (!te.load(path, 4096, false, 512)) {
             throw std::runtime_error("the CPU test model failed to load: " + path);
         }
         run(te.model, te.ctx);
@@ -8833,7 +7382,7 @@ static int write_readout_baseline(const std::string & backend) {
         common_json rec = readout_capture(path, gpu);
         rec["note"] =
             "Frozen readout of the committed decision corpus. The deterministic core "
-            "(probabilities, winners, confidence = 1 - H/log K, certainty = max p, head mode, "
+            "(probabilities, winners, confidence = 1 - H/log K, certainty = max p, "
             "label-pool size) is a contract; the timing block is recorded for context and excluded "
             "from the byte diff.";
         write_file(readout_baseline_path(backend), rec.dump(1) + "\n");
@@ -8980,8 +7529,9 @@ int main(int argc, char ** argv) {
         test_decision_assemble(t);
         test_decision_default_envelope(t);
         test_decision_values_golden(t);
+        test_jev_compat_guarantee(t);
+        test_generic_frontend(t);
         test_softmax(t);
-        test_score_answer_rows(t);
         test_saved_state_format_dispatch(t);
         test_save_load_fail_fast(t);
         test_weak_quant_control(t);
@@ -9007,6 +7557,7 @@ int main(int argc, char ** argv) {
         test_fork_oracle(t);
         test_nested_fork_oracle(t);
         test_session_fork(t);
+        test_session_arena(t);
         test_fork_auto_default(t);
         test_fork_strategy_switch(t);
         test_fork_divergence_control(t);
@@ -9020,23 +7571,13 @@ int main(int argc, char ** argv) {
         test_partial_state_fragmented(t);
         test_device_layout_mutation_round_trip(t);
         test_prefix_cache_cost(t);
-        test_classifier_head_unbiased(t);
         test_bounded_decision_context(t);
         test_multi_trunk_restore(t);
         test_pool_seq_lifecycle(t);
-        test_context_params_append(t);
-        test_classifier_only_hidden_state(t);
-        test_classifier_only_sampler(t);
-        test_classifier_rows_host(t);
-        test_classifier_rows_dequant(t);
-        test_classifier_rows_width_contract(t);
-        test_classifier_support_predicate(t);
         test_decision_cpu_oracle(t);
         test_readout_baseline(t);
         test_compile_fields_plan(t);
         test_decide_batch_plan_overload(t);
-        test_select_scoring_head(t);
-        test_classifier_ctx_requires_head(t);
         test_prefix_cache_coherence(t);
         test_token_cache(t);
         test_prefix_reuse(t);
@@ -9053,19 +7594,8 @@ int main(int argc, char ** argv) {
         test_permutations_real(t);
         test_contract_hash(t);
         test_reference_corpus(t);
-        test_gemma4_softcap(t);
         test_docs_errors(t);
         test_policy_confidence(t);
-        test_head_capability(t);
-        test_classifier_predicate(t);
-        test_classifier_rows_lfm(t);
-        test_head_fallback_equivalence(t);
-        test_selected_equivalence_lfm(t);
-        test_selected_equivalence_qwen2(t);
-        test_answer_head_cache(t);
-        test_classifier_only_readout(t);
-        test_selected_fallback_lfm(t);
-        test_selected_explicit_error(t);
         test_sha256(t);
         test_confidence_never_gates_envelope(t);
         test_verify_letter_request(t);
@@ -9073,8 +7603,6 @@ int main(int argc, char ** argv) {
         test_calibration_hoist(t);
         test_calibration_dedup(t);
         test_calibration_confidence(t);
-        test_calibration_selected_head(t);
-        test_calibration_selected_head_lfm(t);
         test_calibration_table(t);
         test_calibration_ledger(t);
         test_calibration_gates(t);

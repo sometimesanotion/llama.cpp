@@ -3,26 +3,26 @@
   "answers": {
     "refund": {
       "type": "noul",
-      "noul": 0.9986239075660706
+      "noul": 0.9987278580665588
     },
     "dept": {
       "type": "choice",
-      "confidence": 0.9991600215435028,
-      "choice": "billing",
+      "confidence": 0.9284395575523376,
+      "choice": "cancellation",
       "probabilities": {
-        "billing": 0.9994400143623352,
-        "technical": 0.0004623840795829892,
-        "cancellation": 9.757182851899415e-05
+        "billing": 0.0011636739363893867,
+        "technical": 0.04654329642653465,
+        "cancellation": 0.9522930383682251
       }
     },
     "urgency": {
       "type": "score",
-      "confidence": 0.7345951497554779,
-      "score": 0.9234400913119316,
+      "confidence": 0.7413468062877655,
+      "score": 1.8213233649730682,
       "probabilities": {
-        "0": 0.1267482340335846,
-        "1": 0.8230634331703186,
-        "2": 0.0501883290708065
+        "0": 0.006241192575544119,
+        "1": 0.16619428992271423,
+        "2": 0.827564537525177
       },
       "legend": {
         "0": {
@@ -38,5 +38,5 @@
     "input_tokens": 0,
     "output_tokens": 0
   },
-  "golden_model": "qwen3.8-27b-tturbo-fcf-709/latest.gguf"
+  "golden_model": "lfm2.5-350m-gguf/latest.gguf"
 }

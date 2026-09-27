@@ -301,7 +301,6 @@ static void test(void) {
 
         // every decision flag without --decision-seqs is a usage error
         const char * decision_flags[][2] = {
-            {"--decision-ctx-size", "1024"},
             {"--decision-temperature", "temps.json"},
             {"--decision-contract", "abc123"},
         };
@@ -311,10 +310,9 @@ static void test(void) {
         }
 
         // with --decision-seqs they parse and land in params
-        argv = {"binary_name", "--decision-seqs", "8", "--decision-ctx-size", "1024"};
+        argv = {"binary_name", "--decision-seqs", "8"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dec_params, LLAMA_EXAMPLE_SERVER));
         assert(dec_params.n_seq_decision == 8);
-        assert(dec_params.n_ctx_decision == 1024);
 
         argv = {"binary_name", "--decision-seqs", "8", "--decision-temperature", "temps.json", "--decision-contract", "abc123"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dec_params, LLAMA_EXAMPLE_SERVER));

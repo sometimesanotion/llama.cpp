@@ -1,11 +1,11 @@
 #include "server-context.h"
 
-#include "../../src/llama-ext.h"  // staging API: classifier answer-head predicate and row reader
 #include "build-info.h"
 #include "common.h"
 #include "decision-engine.h"
 #include "decision-protocol.h"
 #include "fit.h"
+#include "generic_frontend.h"
 #include "labels.h"
 #include "letter_readout.h"
 #include "llama.h"
@@ -59,7 +59,7 @@ static common_speculative_output_limits server_output_limits(const common_params
     // the larger of the chat need and the decision need - not their sum. The context also holds
     // every decision sequence alongside the chat slots, so the budget must always cover the full
     // sequence count (n_parallel + n_seq_decision), which the context's output reserve requires.
-    result.total = std::max(result.total, params.n_parallel + params.n_seq_decision);
+    result.total = std::max(result.total, params.n_parallel + params.n_seq_decision + params.n_seq_arena);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -1318,6 +1318,11 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                // a completed turn advances the slot: the retained snapshot for that turn is stale,
+                // so the next decision must take a fresh one instead of answering a previous turn
+                if (decision.decision_arena) {
+                    decision.decision_arena->release(id_slot);
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -2388,34 +2393,6 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
-    // The letter readout scores a handful of answer rows against the post-norm hidden state
-    // instead of projecting the whole vocabulary. That needs a classifier-only context, which
-    // shares the model weights and is created on first use. On failure the letter path keeps the
-    // shared context and reports why the fast path is off.
-    llama_context * decision_hidden_ctx() {
-        if (decision.ctx_decision == nullptr && decision.ctx_decision_error.empty()) {
-            llama_context_params cp = common_context_params_to_llama(params_base);
-            cp.classifier_only = true;
-            // this context serves only the decision engine, so it needs no chat slots and can be
-            // bounded independently of the chat context
-            cp.n_seq_max = params_base.n_seq_decision;
-            if (params_base.n_ctx_decision > 0) {
-                cp.n_ctx = params_base.n_ctx_decision;
-            }
-            decision.ctx_decision = llama_init_from_model(model_tgt, cp);
-            if (decision.ctx_decision == nullptr) {
-                decision.ctx_decision_error = "the classifier-only decision context could not be created";
-                SRV_WRN("%s; the letter readout falls back to full logits\n", decision.ctx_decision_error.c_str());
-            } else {
-                decision.decision_letter_engine_classifier = std::make_unique<llama_decision::engine>(
-                    decision.ctx_decision, 0, params_base.n_seq_decision);
-                SRV_INF("decision classifier-only context created: %u cells, %d sequences\n",
-                        llama_n_ctx(decision.ctx_decision), params_base.n_seq_decision);
-            }
-        }
-        return decision.ctx_decision;
-    }
-
     // The decision decode answers for the base model: adapters applied for chat must not leak
     // into a decision answer. Chat re-applies its own set before every batch, so this only
     // detaches them for the duration of the decision decode.
@@ -2423,9 +2400,6 @@ private:
         std::vector<common_adapter_lora_info> none;
         if (ctx_tgt) {
             common_set_adapter_lora(ctx_tgt, none);
-        }
-        if (decision.ctx_decision) {
-            common_set_adapter_lora(decision.ctx_decision, none);
         }
     }
 
@@ -2436,19 +2410,19 @@ private:
         if (params_base.n_seq_decision < 3) {
             throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
         }
-        const bool has_decision = body.contains("questions") || body.contains("state");
-        const bool has_generic = body.contains("schema");
-        if (has_decision && has_generic) {
-            throw llama_decision::semantic_error("request must be either questions or schema, not both");
+        const llama_decision::request_shape shape = llama_decision::select_request_shape(body);
+        if (shape == llama_decision::request_shape::none) {
+            throw std::invalid_argument("request must be a decision request: schema, or questions with state/contexts");
         }
         // An optional live sessions reference: the slot holds the decoded evidence, so the request
-        // is answered by forking it instead of re-prefilling. The checks below are capability
-        // checks only (slot exists, holds state, position continues it); they never inspect a
-        // producer concentration score.
+        // is answered by forking an owned snapshot instead of re-prefilling. The checks below are
+        // capability checks only (slot exists, turn complete, position continues it, turn identity
+        // matches); they never inspect a producer concentration score.
         struct decision_session {
             server_slot * slot = nullptr;
             llama_seq_id  seq  = -1;
             llama_pos     pos  = -1;
+            std::string   turn; // retained-turn tag, echoed additively
         };
         auto resolve_session = [&](const llama_decision::session_ref & ref) -> decision_session {
             decision_session out;
@@ -2463,25 +2437,184 @@ private:
             if (slot == nullptr) {
                 throw std::invalid_argument("id_slot " + std::to_string(ref.id_slot) + " does not exist");
             }
-            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
-            if (pos_max < 0) {
+            // M4.4: an in-flight slot has no completed turn to answer about. This is a task-validity
+            // check (is the turn complete), never a read of a producer concentration score.
+            if (slot->is_processing()) {
                 throw llama_decision::semantic_error(
-                    "id_slot " + std::to_string(ref.id_slot) + " has no decoded state to fork");
+                    "id_slot " + std::to_string(ref.id_slot) + " is still processing; a decision needs a completed turn");
             }
-            const llama_pos pos = pos_max + 1;
-            if (ref.session_pos >= 0 && (llama_pos) ref.session_pos != pos) {
+            // M4.1: the decision-owned arena, created on first use. One retained turn per slot,
+            // restored into a free arena sequence so the snapshot survives cache_idle_slots clears.
+            if (!decision.decision_arena) {
+                decision.decision_arena = std::make_unique<llama_decision::session_arena>(
+                    ctx_tgt, (llama_seq_id) (params_base.n_parallel + params_base.n_seq_decision),
+                    params_base.n_seq_arena, params_base.n_parallel);
+            }
+            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+            const llama_decision::session_snapshot * snap = decision.decision_arena->find(slot->id);
+            if (snap != nullptr) {
+                // M4.3: an opaque turn tag pins the snapshot. A mismatched turn is a client error,
+                // never a silent answer about a different turn.
+                if (!ref.turn.empty() && !snap->turn.empty() && ref.turn != snap->turn) {
+                    throw llama_decision::semantic_error(
+                        "turn " + ref.turn + " does not match the retained turn of id_slot " +
+                        std::to_string(ref.id_slot) + " (" + snap->turn + ")");
+                }
+                // M4.2: advance/discard - when the slot decoded past the snapshot, the turn advanced
+                // and the retained copy is stale. A cleared slot (pos_max < 0) cannot have advanced,
+                // so the snapshot survives the origin being cleared and reused.
+                if (pos_max >= 0 && pos_max + 1 != snap->pos) {
+                    decision.decision_arena->release(slot->id);
+                    snap = decision.decision_arena->find(slot->id);
+                }
+            }
+            if (snap == nullptr) {
+                // First decision for the current turn: take the owned snapshot now.
+                if (pos_max < 0) {
+                    throw llama_decision::semantic_error(
+                        "id_slot " + std::to_string(ref.id_slot) + " has no decoded state to fork");
+                }
+                const llama_pos pos = pos_max + 1;
+                if (ref.session_pos >= 0 && (llama_pos) ref.session_pos != pos) {
+                    throw llama_decision::semantic_error(
+                        "session_pos " + std::to_string(ref.session_pos) + " does not continue id_slot " +
+                        std::to_string(ref.id_slot) + " (expected " + std::to_string(pos) + ")");
+                }
+                const llama_seq_id arena_seq = decision.decision_arena->snapshot(slot->id, slot->id, pos, ref.turn);
+                if (arena_seq < 0) {
+                    throw llama_decision::capacity_error(
+                        "the decision session arena is full; start the server with --decision-arena-seqs N");
+                }
+                out.slot = slot;
+                out.seq  = arena_seq;
+                out.pos  = pos;
+                out.turn = ref.turn;
+                return out;
+            }
+            // Same turn as the retained snapshot: fork the arena sequence, not the live slot. The
+            // continuation is the snapshot's captured position, so a pinned session_pos must match
+            // it exactly (a shifted position is never scored silently).
+            if (ref.session_pos >= 0 && (llama_pos) ref.session_pos != snap->pos) {
                 throw llama_decision::semantic_error(
                     "session_pos " + std::to_string(ref.session_pos) + " does not continue id_slot " +
-                    std::to_string(ref.id_slot) + " (expected " + std::to_string(pos) + ")");
+                    std::to_string(ref.id_slot) + " (expected " + std::to_string(snap->pos) + ")");
             }
+            const llama_seq_id arena_seq = decision.decision_arena->reuse(slot->id);
             out.slot = slot;
-            out.seq  = slot->id;
-            out.pos  = pos;
+            out.seq  = arena_seq;
+            out.pos  = snap->pos;
+            out.turn = snap->turn;
             return out;
         };
+        // Generic front-end: a JSON schema or compact typed fields compiled into engine-facing
+        // field inputs and scored by the same engine the Jev readout uses. The evidence source
+        // (state, contexts, session) is orthogonal to the front-end.
+        if (shape == llama_decision::request_shape::generic) {
+            llama_decision::generic_request greq = llama_decision::parse_generic_request(body);
+            const decision_session          sess = resolve_session(greq.session);
+            if (sess.slot != nullptr && !greq.evidence.contexts.empty()) {
+                throw std::invalid_argument("a session decision scores exactly one context");
+            }
+            // One full-logits engine on the shared context, shared with the Jev path.
+            if (!decision.decision_letter_engine) {
+                decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
+                    ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
+            }
+            llama_decision::options gopt;
+            gopt.mode        = greq.mode;
+            gopt.tree_max    = greq.tree_max;
+            gopt.allow_cache = greq.allow_cache;
+            if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
+                gopt.fork = fork;
+            }
+            if (cancel_flag) {
+                gopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
+            }
+            gopt.yield = []() { std::this_thread::yield(); };
+            if (sess.slot != nullptr && !decision.decision_letter_engine->session_fork_supported(gopt.fork)) {
+                throw std::invalid_argument(
+                    "a session decision needs an exact fork on this model; fork \"" + gopt.fork +
+                    "\" would not reproduce the slot state");
+            }
+
+            llama_decision::compiled_schema cs = llama_decision::compile_schema(greq.schema, greq.instructions);
+            llama_decision::batch_result    b;
+            queue_tasks.yield_to_queue([&]() {
+                decision_scope_base_adapters();
+                if (sess.slot != nullptr) {
+                    // a live-session generic answer appends the schema as a fresh user turn
+                    const auto turn = llama_decision::split_user_turn(chat_params.tmpls.get(), chat_params.use_jinja);
+                    const auto sinputs = llama_decision::session_field_inputs(cs, turn.first, turn.second);
+                    llama_decision::options so = gopt;
+                    so.cache_tag = llama_decision::make_prefix_tag(cs.system_text, turn.second,
+                                                                   llama_decision::GENERIC_PROMPT_VERSION);
+                    const auto plan = decision.decision_letter_engine->compile_fields(sinputs, so);
+                    b = decision.decision_letter_engine->decide_batch_from_seq(sess.seq, sess.pos, plan, so);
+                } else {
+                    // stateless: one rendered evidence per context, or the single state
+                    std::vector<std::string> evidence;
+                    if (!greq.evidence.contexts.empty()) {
+                        for (const auto & c : greq.evidence.contexts) {
+                            evidence.push_back(llama_decision::render_state(c));
+                        }
+                    } else {
+                        evidence.push_back(llama_decision::render_state(greq.evidence.state));
+                    }
+                    std::string shared;
+                    std::vector<std::string> dynamic;
+                    for (const auto & ev : evidence) {
+                        const auto parts = llama_decision::render_schema_prompt(
+                            chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text, ev);
+                        if (dynamic.empty()) {
+                            shared = parts.first;
+                        } else if (parts.first != shared) {
+                            throw std::runtime_error("the chat template renders a different prefix per context");
+                        }
+                        dynamic.push_back(parts.second);
+                    }
+                    gopt.cache_tag = llama_decision::generic_cache_tag(
+                        chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text);
+                    const auto plan = decision.decision_letter_engine->compile_fields(cs.inputs, gopt);
+                    b = decision.decision_letter_engine->decide_batch(plan, shared, dynamic, gopt);
+                }
+            });
+
+            const std::string echo = (greq.model.empty() || greq.model == "jev-latest" || greq.model == "jev-preview")
+                ? model_name : greq.model;
+            size_t context_tokens = 0;
+            json results = json::array();
+            for (const auto & item : b.items) {
+                context_tokens += item.context_tokens;
+                json record = llama_decision::assemble(cs, item);
+                record["usage"] = {
+                    { "context_tokens", (long long) item.context_tokens },
+                    { "scored_rows",    (long long) item.rows },
+                };
+                results.push_back(std::move(record));
+            }
+            json usage = json::object();
+            usage["input_tokens"]    = (long long) (b.shared_tokens + context_tokens);
+            usage["output_tokens"]   = 0;
+            usage["cached_tokens"]   = (long long) (b.cache_hit ? b.shared_tokens : 0);
+            usage["state_cache_hit"] = b.cache_hit;
+            json timings = json::object();
+            timings["prefill_ms"] = b.prefill_ms;
+            timings["scoring_ms"] = b.scoring_ms;
+            timings["total_ms"]   = b.prefill_ms + b.scoring_ms;
+            timings["rounds"]     = b.rounds;
+            timings["rows"]       = b.rows;
+            timings["per_decision_ms"] = b.items.empty()
+                ? 0.0 : (b.prefill_ms + b.scoring_ms) / (double) b.items.size();
+            json out = json::object();
+            out["model"]   = echo;
+            out["results"] = results;
+            out["usage"]   = usage;
+            out["timings"] = timings;
+            return out;
+        }
         // Decision shape: state + typed questions, scored as one next-token choice over the
         // verified letter labels, sharing one framed state prefix across all questions.
-        if (llama_decision::is_decision_request(body)) {
+        if (shape == llama_decision::request_shape::jev) {
             llama_decision::decision_request req = llama_decision::parse_decision_request(body);
             // A deployment may opt in to more order-de-bias passes by default; the request field
             // always wins, so an explicit value is never overridden. This is a cost/quality knob,
@@ -2489,34 +2622,15 @@ private:
             if (!body.contains("permutations") || body.at("permutations").is_null()) {
                 req.permutations = params_base.n_decision_permutations;
             }
-            // the additive diagnostics object (head mode, contract identity, provenance) is opt-in;
+            // the additive diagnostics object (contract identity, provenance) is opt-in;
             // the default envelope must stay the strict Jev shape
             const bool                              want_diagnostics = req.diagnostics;
             const decision_session                  sess = resolve_session(req.session);
-            if (sess.slot != nullptr && req.head == "selected") {
-                throw std::invalid_argument(
-                    "head \"selected\" is incompatible with a session request: the classifier-only context cannot fork a chat slot");
-            }
             if (sess.slot != nullptr && !req.contexts.empty()) {
                 throw std::invalid_argument("a session decision scores exactly one context");
             }
-            // An explicit request for an unavailable fast path is the only head case that errors;
-            // the default path always falls back to full logits.
-            const llama_decision::head_capability & head_cap =
-                decision.decision_head_cache.probe(llama_get_model(ctx_tgt));
-            // The decision decode is scoped to the base model: the answer head reads base
-            // weights only, so with adapters configured the fast path cannot serve the
-            // adapted model. An explicit request for it is refused, the default path reads
-            // full logits on the base scope, and head=full is unchanged.
             const bool adapters_on = decision.adapters_configured(params_base.lora_adapters);
-            if (adapters_on && req.head == "selected") {
-                throw std::invalid_argument(
-                    "head \"selected\" is incompatible with configured adapters: decision answers are scoped to the base model");
-            }
-            llama_decision::require_selected_head(req.head, head_cap);
-            // One full-logits engine on the shared context, plus a classifier-only engine when the
-            // model can serve the fast path. The readout picks the source from the request's
-            // compiled plan, so this code never picks the classifier context on its own.
+            // One full-logits engine on the shared context.
             if (!decision.decision_letter_engine) {
                 decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
                     ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
@@ -2525,28 +2639,9 @@ private:
             sources.full = decision.decision_letter_engine.get();
             llama_decision::session_source session_source;
             if (sess.slot != nullptr) {
-                // A live session forks the slot's decoded transcript; the classifier context is not
-                // an option, so the readout runs full logits on the shared context.
                 session_source.seq      = sess.seq;
                 session_source.base_pos = sess.pos;
                 sources.session         = &session_source;
-            } else if (req.head != "full") {
-                if (adapters_on) {
-                    // the classifier context is not built: the answer is read from the base model
-                    sources.classifier_unavailable =
-                        "the decision decode is scoped to the base model while adapters are configured";
-                } else if (head_cap.available) {
-                    // only build the classifier context when the model probe says it can be used; a
-                    // request that forces "full" or a model without a usable head never allocates it
-                    if (decision_hidden_ctx() != nullptr) {
-                        sources.classifier = decision.decision_letter_engine_classifier.get();
-                    } else {
-                        sources.classifier_unavailable = decision.ctx_decision_error.empty()
-                            ? "the classifier-only decision context is not available" : decision.ctx_decision_error;
-                    }
-                } else {
-                    sources.classifier_unavailable = head_cap.reason;
-                }
             }
             if (!decision.decision_label_vocab) {
                 decision.decision_label_vocab = llama_decision::make_llama_label_vocab(
@@ -2631,10 +2726,10 @@ private:
             std::vector<std::vector<std::vector<float>>> all_probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
             queue_tasks.yield_to_queue([&]() {
-                // the readout decodes on whichever context the plan picks; both are scoped to the base model
+                // the readout decodes on the shared context, scoped to the base model
                 decision_scope_base_adapters();
-                all_probs = llama_decision::letter_readout_multi(sources, decision.decision_head_cache,
-                                                                 *decision.decision_label_vocab, chat_params.tmpls.get(),
+                all_probs = llama_decision::letter_readout_multi(sources, *decision.decision_label_vocab,
+                                                                 chat_params.tmpls.get(),
                                                                  chat_params.use_jinja, req, decision.decision_labels, jopt,
                                                                  &metrics);
             });
@@ -2645,7 +2740,6 @@ private:
             usage["output_tokens"]   = 0;
             usage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
             usage["state_cache_hit"] = metrics.cache_hit;
-            usage["head_mode"]       = metrics.head_active ? "selected" : "full";
 
             json timings = json::object();
             timings["prefill_ms"] = metrics.prefill_ms;
@@ -2662,17 +2756,6 @@ private:
                 ? model_name : req.model;
             json decision_diagnostics = json::object();
             if (want_diagnostics) {
-                // the fast path is optional; report how the answer was actually read out
-                const bool head_fallback = req.head != "full" && !metrics.head_active;
-                decision_diagnostics["head"] = json::object();
-                decision_diagnostics["head"]["mode"]     = metrics.head_active ? "selected" : "full";
-                decision_diagnostics["head"]["fallback"] = head_fallback;
-                if (head_fallback) {
-                    const std::string & reason = !metrics.head_reason.empty() ? metrics.head_reason
-                                              : !decision.ctx_decision_error.empty()   ? decision.ctx_decision_error
-                                                                              : head_cap.reason;
-                    decision_diagnostics["head"]["reason"] = reason;
-                }
                 // additive diagnostics: the readout contract identity this server is running
                 decision_diagnostics["diagnostics"] = json::object();
                 decision_diagnostics["diagnostics"]["contract_hash"]  = decision.decision_contract;
@@ -2699,6 +2782,9 @@ private:
                 decision_diagnostics["session_fork"] = true;
                 decision_diagnostics["source_slot"]  = sess.slot->id;
                 decision_diagnostics["session_pos"]  = (long long) sess.pos;
+                if (!sess.turn.empty()) {
+                    decision_diagnostics["turn"] = sess.turn;
+                }
             }
             const bool emit_diagnostics = want_diagnostics || sess.slot != nullptr;
             if (!multi) {
@@ -2720,7 +2806,6 @@ private:
                 cusage["output_tokens"]   = 0;
                 cusage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
                 cusage["state_cache_hit"] = metrics.cache_hit;
-                cusage["head_mode"]       = metrics.head_active ? "selected" : "full";
                 json ans = llama_decision::assemble_decision_response(
                     req, all_probs[ci], echo, cusage, nullptr);
                 contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
@@ -2736,7 +2821,8 @@ private:
             }
             return out;
         }
-        throw std::invalid_argument("request must be a decision request: questions with state or contexts");
+        // unreachable: select_request_shape rejects every other body at the top
+        throw std::invalid_argument("request must be a decision request: schema, or questions with state/contexts");
     }
 
     bool process_single_task(server_task && task, bool is_yielding) {
@@ -3066,6 +3152,12 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+
+                    // an erased slot is released: discard its retained snapshot so a later session
+                    // decision is refused instead of answering a turn the client dropped
+                    if (decision.decision_arena) {
+                        decision.decision_arena->release(id_slot);
+                    }
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;

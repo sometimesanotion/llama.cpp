@@ -450,8 +450,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    if (finish_classifier_only(cur)) return;
-
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;

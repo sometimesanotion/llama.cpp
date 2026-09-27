@@ -1097,30 +1097,6 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     }
 }
 
-// True for the architectures whose graph can stop at the post-norm hidden state and whose
-// tied/plain output table is unscaled, so llama_model_classifier_rows can read answer rows from it.
-// The stop is shared as llm_graph_context::finish_classifier_only; LFM2 stops through its own
-// embeddings gate instead.
-bool llm_arch_supports_classifier(const llm_arch & arch) {
-    switch (arch) {
-        case LLM_ARCH_GEMMA4:
-        case LLM_ARCH_LFM2:
-        case LLM_ARCH_LFM2MOE:
-        case LLM_ARCH_QWEN:
-        case LLM_ARCH_QWEN2:
-        case LLM_ARCH_QWEN2MOE:
-        case LLM_ARCH_QWEN3:
-        case LLM_ARCH_QWEN3MOE:
-        case LLM_ARCH_QWEN3NEXT:
-        case LLM_ARCH_QWEN35:
-        case LLM_ARCH_QWEN35MOE:
-        case LLM_ARCH_QWEN4EXP:
-            return true;
-        default:
-            return false;
-    }
-}
-
 bool llm_arch_is_diffusion(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_DREAM:

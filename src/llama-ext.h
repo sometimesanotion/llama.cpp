@@ -139,37 +139,3 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
-
-// The classifier answer-head API was exported with C linkage before it moved here, so keep the
-// linkage explicit: a C++ declaration would change the dynamic symbol and break the ABI.
-extern "C" {
-
-// Cheap, row-free check that the model can serve the classifier answer head: a supported
-// architecture, a plain contiguous output table whose row width equals the hidden state width,
-// no split output, and a per-id output bias that is readable element-wise when one exists.
-// Returns true when supported and false otherwise. On false, when `reason` is not NULL it
-// receives a static, human-readable explanation; on true it receives NULL. This is the single
-// predicate behind the classifier-only context guard, llama_model_classifier_rows and the
-// decision answer-head probe, so the three cannot disagree on whether the head is usable.
-LLAMA_API bool llama_model_classifier_supported(const struct llama_model * model, const char ** reason);
-
-// Dequantize the output (classifier) rows for the given token ids into dst. Returns the row
-// width, or zero when the model's output table is unsupported or a required id is out of range.
-// count must be in (0, 255]: a zero count or a count above 255 returns zero, so a caller can never
-// request an unbounded number of rows. dst must hold exactly count * width floats and dst_count
-// is checked against that exact size (an undersized or oversized dst_count returns zero). On
-// success the row width is returned and softcap is always written: it is the model's final logit
-// softcap, or 0 when the model has none. When the model has a per-id output bias it must be
-// readable as a contiguous 1-D vector over the vocabulary in a float (or element-wise
-// dequantizable) type, else the call returns zero; when bias_dst is not NULL it receives count
-// bias values. Pass NULL when only the rows are needed. See llama_model_classifier_supported for
-// the model-level rules this call enforces.
-LLAMA_API int32_t llama_model_classifier_rows(const struct llama_model * model,
-                                              const llama_token *        ids,
-                                              int32_t                    count,
-                                              float *                    dst,
-                                              size_t                     dst_count,
-                                              float *                    softcap,
-                                              float *                    bias_dst);
-
-}  // extern "C"

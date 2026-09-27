@@ -170,9 +170,9 @@ def run_checks(server, captured):
 
     # exact diagnostics key sets: the additive objects and fields are pinned so an accidental
     # unconditional field cannot slip into the default envelope, and so a missing one is caught
-    check(set(diag_body) == {"model", "answers", "usage", "timings", "head", "diagnostics"},
+    check(set(diag_body) == {"model", "answers", "usage", "timings", "diagnostics"},
           f"diagnostics top-level key set: {set(diag_body)}")
-    check(set(diag_body["usage"]) == {"input_tokens", "output_tokens", "cached_tokens", "state_cache_hit", "head_mode"},
+    check(set(diag_body["usage"]) == {"input_tokens", "output_tokens", "cached_tokens", "state_cache_hit"},
           f"diagnostics usage key set: {set(diag_body['usage'])}")
     check(set(diag_body["answers"]["refund"]) == {"type", "noul"},
           f"diagnostics noul key set: {set(diag_body['answers']['refund'])}")
@@ -273,36 +273,19 @@ def run_checks(server, captured):
         check(status == 422, f"{qtype} with null instructions status {status}: {text}")
         check("instructions" in text, f"{qtype} null rejection names instructions: {text}")
 
-    # 3b. head: an explicit selected request is a client error (400) when the model cannot expose a
-    #     plain answer head, and otherwise is served (selected) or falls back to full logits when
-    #     the serving context cannot expose hidden states, reporting why. The model family decides
-    #     which branch applies, so both are accepted; the refusal branch is still asserted.
+    # 3b. head is inert: the request field is tolerated for backward compatibility and ignored.
+    #     The default envelope never carries a head object and usage never carries head_mode.
     selected = dict(DECISION_VALID, head="selected", diagnostics=True)
     status, text = server.post("/v1/decision", json.dumps(selected))
-    selected_mode = ""
-    if status == 400:
-        check("not available" in text, f"selected head refusal names the reason: {text}")
-    else:
-        check(status == 200, f"explicit selected head status {status}: {text}")
-        selected_body = json.loads(text)
-        selected_mode = selected_body["head"]["mode"]
-        check(selected_mode in ("selected", "full"), "selected head mode reported")
-        if selected_mode == "full":
-            check(selected_body["head"]["fallback"] is True, "selected fallback is reported")
-            check(bool(selected_body["head"].get("reason")), "selected fallback reason is reported")
-
-    # 3c. no silent fallback: when the model serves the selected head explicitly, the default
-    #     request must use it too; a fallback here would hide a broken fast path in CI
-    if selected_mode == "selected":
-        check(diag_body["head"]["mode"] == "selected",
-              f"default request uses the fast head on a covered model: {diag_body.get('head')}")
+    check(status == 200, f"an inert head request is served: {status} {text}")
+    check("head" not in json.loads(text), "an inert head request carries no head object")
+    check("head_mode" not in json.loads(text).get("usage", {}), "an inert head request carries no head_mode")
 
     full = dict(DECISION_VALID, head="full", diagnostics=True)
     status, text = server.post("/v1/decision", json.dumps(full))
-    check(status == 200, f"explicit full head status {status}: {text}")
+    check(status == 200, f"an inert head request is served: {status} {text}")
+    check("head" not in json.loads(text), "an inert full request carries no head object")
     full_body = json.loads(text)
-    check(full_body["usage"].get("head_mode") == "full", "head_mode in usage")
-    check(full_body.get("head", {}).get("mode") == "full", "head diagnostic object")
     captured["p_full"] = full_body["answers"]["dept"]["probabilities"]
 
     # adapter scope diagnostics: the decision decode is scoped to the base model, and the
@@ -404,8 +387,6 @@ def run_session_checks(model):
               f"session position is reported: {session.get('session_pos')}")
         check(session["usage"]["output_tokens"] == 0, "a decision still generates nothing")
         check(session["usage"]["input_tokens"] > 0, "the session readout counts the source context")
-        check(session["head"]["mode"] == "full",
-              f"a session readout uses full logits (classifier cannot fork): {session.get('head')}")
 
         # the same evidence gives the same answer; only the prompt placement of the question differs
         for qid, want in control.items():
@@ -431,11 +412,11 @@ def run_session_checks(model):
         check(status == 422, f"a wrong session_pos is refused: {status} {text}")
         check("session_pos" in text, f"the position refusal names session_pos: {text}")
 
-        # session_pos without a slot, and a selected head on a session, are client errors
+        # session_pos without a slot is a client error; a head field on a session is inert
         status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_pos=1)))
         check(status == 422, f"session_pos without id_slot is refused: {status} {text}")
         status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, id_slot=0, head="selected")))
-        check(status == 400, f"a selected head on a session is refused: {status} {text}")
+        check(status == 200, f"an inert head field on a session is ignored: {status} {text}")
 
         # a negative slot is a parse error, an out-of-range slot is a request error
         status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, id_slot=-1)))
@@ -510,9 +491,9 @@ def build_test_lora(model):
     """A minimal rank-4 LoRA on a block FFN tensor, written with a fixed seed.
 
     The adapter perturbs one attention block's feed-forward projection, so chat
-    completions change measurably, while the answer head (base weights only) stays
-    usable for the decision contract. Returns the file path, or None when the
-    adapter cannot be built for this model.
+    completions change measurably, while the decision decode stays scoped to the
+    base model. Returns the file path, or None when the adapter cannot be built for
+    this model.
     """
     try:
         sys.path.insert(0, os.path.join(REPO, "gguf-py"))
@@ -565,10 +546,10 @@ def max_prob_delta(p1, p2):
 def run_adapter_checks(model, p_base_full):
     """Adapter-aware decision contract: the decision decode is scoped to the base model.
 
-    With an adapter configured, the letter path must not read the fast head, an explicit
-    selected request is refused, and auto reports why it used full logits. Chat keeps its
-    own adapter: a decision must not detach it from chat, and chat must re-apply it after
-    the decision cleared the shared context.
+    With an adapter configured, the decision reads base full logits and reports the base
+    scope. The `head` request field is inert and ignored. Chat keeps its own adapter: a
+    decision must not detach it from chat, and chat must re-apply it after the decision
+    cleared the shared context.
     """
     lora_path = build_test_lora(model)
     if lora_path is None:
@@ -618,10 +599,8 @@ def run_adapter_checks(model, p_base_full):
         status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, diagnostics=True)))
         check(status == 200, f"adapter auto status {status}: {text}")
         auto = json.loads(text)
-        check(auto["head"]["mode"] == "full", f"auto uses full logits with adapters: {auto.get('head')}")
-        check(auto["head"]["fallback"] is True, "auto fallback is reported")
-        check("adapter" in auto["head"].get("reason", ""), f"fallback reason names the adapter scope: {auto['head'].get('reason')}")
-        check(auto["usage"]["head_mode"] == "full", "usage head_mode matches")
+        check("head" not in auto, f"no head object with adapters: {set(auto)}")
+        check("head_mode" not in auto.get("usage", {}), "no head_mode with adapters")
         check(auto["diagnostics"]["adapters_configured"] is True, "adapters_configured reported")
         check(auto["diagnostics"]["adapter_scope"] == "base", "adapter scope is the base model")
         p_auto = auto["answers"]["dept"]["probabilities"]
@@ -645,12 +624,11 @@ def run_adapter_checks(model, p_base_full):
         check(max_prob_delta(p_full, p_base_full) < 1.5e-1,
               f"decision with adapters reads the base model: {p_full} vs {p_base_full}")
 
-        # selected: the fast head cannot serve adapters, so the explicit request is refused
+        # selected: the head request field is inert with adapters, ignored like everywhere else
         selected = dict(DECISION_VALID)
         selected["head"] = "selected"
         status, text = server.post("/v1/decision", json.dumps(selected))
-        check(status == 400, f"selected with adapters status {status}: {text}")
-        check("adapter" in text, f"selected refusal names the adapter conflict: {text}")
+        check(status == 200, f"an inert head request with adapters is served: {status} {text}")
 
         # chat still reflects the adapter after the decision cleared the shared context. A
         # byte-equal reply is not required: the pool sequences share the cache window on some

@@ -1,6 +1,5 @@
 #include "letter_readout.h"
 
-#include "../../src/llama-ext.h"  // staging API: classifier answer-head predicate and row reader
 #include "chat.h"
 #include "common.h"
 
@@ -28,11 +27,6 @@ std::string format_option_line(const label & l, const decision_option & opt) {
 }
 
 namespace {
-
-std::string render_state(const common_json & state) {
-    const std::string text = state.is_string() ? state.get<std::string>() : state.dump();
-    return "State:\n" + safe_data(text) + "\n";
-}
 
 std::string format_letter_suffix_ordered(const decision_question & q, const std::vector<label> & labels,
                                          const std::string & before, const std::string & after,
@@ -127,125 +121,6 @@ std::pair<std::string, std::string> split_user_turn(const common_chat_templates 
     return { prompt.substr(0, at), prompt.substr(at + sentinel.size()) };
 }
 
-// The one hidden-width source: answer rows and the head buffer are sized from the same model
-// query, so a head can never be built at a width other than the hidden state's.
-static int hidden_width(const llama_model * model) {
-    return model == nullptr ? 0 : (int) llama_model_n_embd_out(model);
-}
-
-const head_capability & answer_head_cache::probe(const llama_model * model) {
-    if (cap_set_ && model == cap_model_) {
-        return capability_;
-    }
-    head_capability cap;
-    const char * reason = nullptr;
-    // one predicate owns the model-level rules; the server guard, the row reader and this probe
-    // all read the same verdict, so they cannot disagree on whether the fast path can run
-    if (!llama_model_classifier_supported(model, &reason)) {
-        cap.reason = (reason != nullptr && reason[0] != '\0') ? reason : "the selected answer head is unavailable";
-    } else {
-        const int width = hidden_width(model);
-        const std::vector<llama_token> ids = { 0, 1 };
-        std::vector<float> rows((size_t) ids.size() * (size_t) width, 0.0f);
-        float softcap = 0.0f;
-        // the predicate is row-free; sampling two rows backs the width and softcap the head
-        // buffer is sized from. bias_dst is null, but the read still validates the output bias.
-        const int w = llama_model_classifier_rows(model, ids.data(), (int32_t) ids.size(), rows.data(),
-                                                  rows.size(), &softcap, nullptr);
-        if (w <= 0) {
-            cap.reason = "the answer rows could not be read";
-        } else {
-            cap.available = true;
-            cap.width     = w;
-            cap.softcap   = softcap;
-        }
-    }
-    capability_ = std::move(cap);
-    cap_model_  = model;
-    cap_set_    = true;
-    return capability_;
-}
-
-classifier_head build_classifier_head(const llama_model * model, const std::vector<label> & labels) {
-    classifier_head head;
-    if (labels.empty()) {
-        head.reason = "no answer labels are available";
-        return head;
-    }
-    const int width = hidden_width(model);
-    if (width <= 0) {
-        head.reason = model == nullptr ? "no model is loaded" : "no hidden state is available";
-        return head;
-    }
-    head.ids.reserve(labels.size());
-    for (const auto & l : labels) {
-        // a multi-token label has no single answer row: the head can only score length-1 paths,
-        // and select_scoring_head falls back to full logits whenever a length-2 label is used
-        if (l.token >= 0) {
-            head.ids.push_back(l.token);
-        }
-    }
-    head.rows.assign(head.ids.size() * (size_t) width, 0.0f);
-    head.bias.assign(head.ids.size(), 0.0f);
-    const int w = llama_model_classifier_rows(model, head.ids.data(), (int32_t) head.ids.size(),
-                                              head.rows.data(), head.rows.size(), &head.softcap, head.bias.data());
-    if (w <= 0) {
-        head.ids.clear();
-        head.rows.clear();
-        head.bias.clear();
-        const char * reason = nullptr;
-        if (!llama_model_classifier_supported(model, &reason)) {
-            head.reason = (reason != nullptr && reason[0] != '\0')
-                ? reason : "the model output tensor is not a plain contiguous answer head";
-        } else {
-            head.reason = "the answer rows could not be read";
-        }
-        return head;
-    }
-    head.width = w;
-    return head;
-}
-
-const classifier_head & answer_head_cache::for_labels(const llama_model * model, const std::vector<label> & labels) {
-    bool same = head_set_ && model == head_model_ && head_ids_.size() == labels.size();
-    if (same) {
-        for (size_t i = 0; i < labels.size(); ++i) {
-            if (head_ids_[i] != labels[i].token) {
-                same = false;
-                break;
-            }
-        }
-    }
-    if (same) {
-        return head_;
-    }
-    head_ = build_classifier_head(model, labels);
-    head_model_ = model;
-    head_set_   = true;
-    head_ids_.clear();
-    head_ids_.reserve(labels.size());
-    for (const auto & l : labels) {
-        head_ids_.push_back(l.token);
-    }
-    return head_;
-}
-
-void answer_head_cache::clear() {
-    cap_set_   = false;
-    cap_model_ = nullptr;
-    capability_ = {};
-    head_set_   = false;
-    head_model_ = nullptr;
-    head_ids_.clear();
-    head_ = {};
-}
-
-void require_selected_head(const std::string & requested, const head_capability & cap) {
-    if (requested == "selected" && !cap.available) {
-        throw std::invalid_argument("head \"selected\" is not available: " + cap.reason);
-    }
-}
-
 void verify_label_pool(const label_vocab & vocab, const std::vector<label> & labels, const std::string & tail) {
     for (const auto & l : labels) {
         if (answer_label_path(vocab, tail, l.text, (int) l.tokens.size()) != l.tokens) {
@@ -282,7 +157,6 @@ void verify_letter_request(const label_vocab & vocab, const std::string & after,
 }
 
 std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_sources & sources,
-                                                                  answer_head_cache & head_cache,
                                                                   const label_vocab & vocab,
 const common_chat_templates * tmpls, bool use_jinja,
                                                                    const decision_request & req,
@@ -294,9 +168,9 @@ const common_chat_templates * tmpls, bool use_jinja,
     }
 
     // The letter readout scores the composed label pool (1-2 token paths over A-Z, a-z, 0-9, and
-    // the extended single-character set) through the answer head when it covers them, and the
-    // shared full-logits context otherwise. The realized pool is the hard capacity for a model:
-    // a question that needs more labels than the pool is a semantic error, never a fallback.
+    // the extended single-character set) against the shared full-logits context. The realized pool
+    // is the hard capacity for a model: a question that needs more labels than the pool is a
+    // semantic error, never a fallback.
     const char * system_text    = letter_system_text();
     const char * prompt_version = LETTER_PROMPT_VERSION;
     const auto   split          = render_letter_prompt(tmpls, use_jinja, system_text);
@@ -349,42 +223,9 @@ const common_chat_templates * tmpls, bool use_jinja,
     readout_opt.split_boundary = false;
     readout_opt.cache_tag      = make_prefix_tag(system_text, split.second, prompt_version);
 
-    // The selected head is a fallback-safe fast path: it is used when the model exposes usable
-    // answer rows and the classifier context covers every candidate, and the shared full-logits
-    // context is used otherwise. Only the model-level head availability is a client error; a
-    // context that cannot carry the head falls back with a reason, like the default path.
-    const llama_model * model = sources.full->get_model();
-    if (req.head == "selected" && !session) {
-        require_selected_head(req.head, head_cache.probe(model));
-    }
-    // the row table is a pure function of (model, labels), so the cache builds it once
-    const classifier_head & head = head_cache.for_labels(model, labels);
-
     // compile the plan once on the full engine (the readout_sources contract guarantees it is
-    // non-null); the head choice below and the scoring share this one plan.
+    // non-null); the scoring shares this one plan.
     const compiled_fields plan = sources.full->compile_fields(fields, readout_opt);
-
-    engine * chosen = sources.full;
-    std::string fallback_reason;
-    // A live session has no classifier option: the classifier-only context has its own cache and
-    // cannot fork a chat slot, so a session readout always uses full logits on the shared context.
-    if (req.head != "full" && !session) {
-        if (!head.available()) {
-            fallback_reason = head.reason.empty() ? "the selected answer head is unavailable" : head.reason;
-        } else if (sources.classifier == nullptr) {
-            fallback_reason = sources.classifier_unavailable.empty()
-                ? "the classifier-only decision context is not available" : sources.classifier_unavailable;
-        } else {
-            // one plan, one predicate: the engine owns both, so the server and the readout cannot
-            // disagree on whether the fast path can run for these candidates.
-            readout_opt.head = &head;
-            if (sources.classifier->select_scoring_head(plan, readout_opt, &fallback_reason)) {
-                chosen = sources.classifier;
-            } else {
-                readout_opt.head = nullptr;
-            }
-        }
-    }
 
     // The evidence set: a single `state` (Jev) or the request's `contexts`. A session fork ignores
     // the text and continues the transcript, so the list is empty there.
@@ -402,7 +243,7 @@ const common_chat_templates * tmpls, bool use_jinja,
 
     const batch_result b = session
         ? sources.full->decide_batch_from_seq(sources.session->seq, sources.session->base_pos, plan, readout_opt)
-        : chosen->decide_batch(plan, split.first, states, readout_opt);
+        : sources.full->decide_batch(plan, split.first, states, readout_opt);
 
     if (metrics) {
         metrics->cache_hit      = b.cache_hit;
@@ -417,11 +258,6 @@ const common_chat_templates * tmpls, bool use_jinja,
         for (const auto & item : b.items) {
             metrics->context_tokens += item.context_tokens;
             metrics->per_context_tokens.push_back(item.context_tokens);
-        }
-        metrics->head_active    = b.head_active;
-        metrics->head_reason    = b.head_reason;
-        if (!b.head_active && req.head != "full" && metrics->head_reason.empty()) {
-            metrics->head_reason = fallback_reason;
         }
         metrics->suffix_tokens        = b.suffix_tokens;
         metrics->common_suffix_tokens = b.common_suffix_tokens;

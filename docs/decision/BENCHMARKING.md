@@ -166,17 +166,23 @@ same parent. The control test prints the plain `seq_cp` characterization as
 does not assert on it. Dense attention is the byte-identical control; LFM2 is the
 layout that breaks a plain `seq_cp`.
 
+The layout matrix (fresh cache, prior sequences, 1-2 branches) is only
+load-bearing where a partial fork can drift, so it runs in full only on
+recurrent/hybrid models. A dense model runs a single fresh-layout smoke check
+instead: `seq_cp` shares only attention cells, so the full matrix is a
+tautology there and costs CI time without adding signal.
+
 The ctest labels wrap the same filters:
 
 ```sh
-ctest --test-dir build --output-on-failure -R "decision|fork|permut|calibration|head"
+ctest --test-dir build --output-on-failure -R "decision|fork|permut|calibration"
 ```
 
 ## 7. Readout reproducibility baselines
 
 The frozen readout baseline is the deterministic core of the committed corpus:
 per-question probabilities, winners, `confidence = 1 - H/log K`, `certainty =
-max p`, head mode, and label-pool size. The timing block is recorded for context
+max p`, and label-pool size. The timing block is recorded for context
 and is excluded from the byte diff, because it moves every run.
 
 ```sh
@@ -275,7 +281,7 @@ place.
 
 ```sh
 # decision suites
-ctest --test-dir build --output-on-failure -R "decision|fork|permut|calibration|head"
+ctest --test-dir build --output-on-failure -R "decision|fork|permut|calibration"
 
 # server accuracy
 LLAMA_SERVER_BIN=build/bin/llama-server LLAMA_SERVER_TEST_MODEL=<model.gguf> \

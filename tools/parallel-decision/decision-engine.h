@@ -45,26 +45,6 @@ struct field_input {
     float                    temperature = 1.0f;  // softmax temperature for this field's score
 };
 
-// Dequantized output (classifier) rows for a small set of candidate tokens. When supplied, a
-// candidate is scored as dot(hidden, row) against the post-norm hidden state instead of a full
-// vocabulary projection. `width == 0` means the table is not usable and scoring must fall back.
-struct classifier_head {
-    std::vector<llama_token> ids;   // ids[r] owns rows[r]
-    std::vector<float>       rows;  // ids.size() * width floats
-    std::vector<float>       bias;  // per-id output bias, empty when the model's output has none
-    int                      width   = 0;
-    float                    softcap = 0.0f; // final logit softcap, 0 when the model has none
-    std::string              reason;         // why the head is unavailable, empty when usable
-
-    bool available() const { return width > 0; }
-    int  index_of(llama_token id) const; // row index for a token, or -1
-};
-
-// Scores candidate tokens against a post-norm hidden state and an answer-row table:
-// dot(hidden, row) plus the row's output bias, then the model's logit softcap when it has one.
-// Pure: it takes no context, so it is unit-testable with synthetic hidden states and rows.
-std::vector<float> score_answer_rows(const float * hidden, const classifier_head & head, const tokens_t & cands);
-
 struct options {
     std::string mode           = "auto"; // auto: tree up to tree_max values, else greedy; tree; greedy
     size_t      tree_max       = 128;
@@ -74,7 +54,6 @@ struct options {
     std::string fork           = "auto"; // auto | copy | restore | hybrid: how branches fork the prefix
     bool        bypass         = true;   // skip the fork when a round has exactly one branch
     bool        optimize       = true;   // dedup identical fields and hoist a long common suffix head
-    const classifier_head * head = nullptr; // optional: score candidates against these rows
     std::function<bool()> should_stop;   // optional: checked before every decode and between waves
     std::function<void()> yield;         // optional: cooperative yield point between waves
 };
@@ -85,8 +64,8 @@ std::vector<float> softmax(const std::vector<float> & logits, float temperature 
 
 // The compiled scoring plan for one request: every field's token trie, deduplicated, with a shared
 // suffix head hoisted onto the trunk. Opaque: the trie layout is private. It is a pure function of
-// (inputs, options) and the vocabulary, so the head fast path can be decided from the plan before
-// a context is chosen, and scoring then reuses the same plan instead of re-deriving the fields.
+// (inputs, options) and the vocabulary, so scoring reuses the same plan instead of re-deriving the
+// fields.
 struct compiled_fields {
     compiled_fields();
     ~compiled_fields();
@@ -128,8 +107,6 @@ struct result {
     int    rounds         = 0;
     double prefill_ms     = 0;
     double scoring_ms     = 0;
-    bool        head_active = false; // candidates were scored against the head rows
-    std::string head_reason;         // why a requested head was not used, empty otherwise
     // suffix token accounting: unique field suffixes after dedup, the head hoisted onto the trunk,
     // and what each branch actually decodes
     size_t suffix_tokens        = 0;
@@ -147,8 +124,6 @@ struct batch_result {
     int    rounds        = 0;
     double prefill_ms    = 0;
     double scoring_ms    = 0;
-    bool        head_active = false;
-    std::string head_reason;
     size_t suffix_tokens        = 0;
     size_t common_suffix_tokens = 0;
     size_t leaf_suffix_tokens   = 0;
@@ -184,16 +159,9 @@ class engine {
 
     const llama_model * get_model() const { return model; }
 
-    // True when this engine's context stops the graph at the post-norm hidden state.
-    bool classifier_only() const;
-
     // Compiles field inputs into the scoring plan. Pure: it tokenizes (through the per-engine
     // cache) and lays out the trie, but never touches the context or the KV cache.
     compiled_fields compile_fields(const std::vector<field_input> & inputs, const options & opt) const;
-
-    // The one head-usability predicate: true when `opt.head` can score every candidate in the plan
-    // on this engine's context. `reason` is set with why when it returns false.
-    bool select_scoring_head(const compiled_fields & plan, const options & opt, std::string * reason) const;
 
     result decide(const std::string & shared_text, const std::string & context_text,
                   const std::vector<field_input> & fields, const options & opt);
@@ -203,9 +171,8 @@ class engine {
     batch_result decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
                               const std::vector<field_input> & fields, const options & opt);
 
-    // Same as above, but scores a plan the caller already compiled. This is the entry point for a
-    // caller that needs the plan before choosing the context (for example to decide the answer
-    // head), so the fields are compiled once instead of twice. A null plan is a caller error.
+    // Same as above, but scores a plan the caller already compiled. The fields are compiled once
+    // instead of twice. A null plan is a caller error.
     batch_result decide_batch(const compiled_fields &          plan,
                               const std::string &              shared_text,
                               const std::vector<std::string> & contexts,
@@ -281,9 +248,6 @@ class engine {
 
     std::function<bool()> stop_;
     std::function<void()> yield_;
-    const classifier_head * head_        = nullptr;
-    bool                    head_active_ = false;
-    std::string             head_reason_;
     fork_kind           probe_fork_;
     fork_kind           active_fork_ = fork_kind::copy;
     llama_pos           swa_         = 0; // sliding-window size, 0 = none
@@ -334,7 +298,6 @@ class engine {
                         bool allow_bypass);
 
     void gather_candidates(int out_idx, const tokens_t & cands, branch_score & out);
-    bool head_covers(const classifier_head & head, const tokens_t & cands) const;
 };
 
 } // namespace llama_decision

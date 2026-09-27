@@ -77,129 +77,6 @@
         "verdict": "advisory-only"
       }
     },
-    "selected_head": {
-      "trigger": "selected vs full head choice",
-      "axis": "task-value",
-      "may_gate": [
-        "fast path vs full-logits path"
-      ],
-      "may_not_gate": [
-        "admission",
-        "caching",
-        "routing",
-        "persistence",
-        "answer validity"
-      ],
-      "production_gate": false,
-      "verdict": "fast path exists but is opt-in and off by default: it runs only when the context exposes hidden states, an explicit selected request on an incompatible model errors, and every other path falls back to full logits",
-      "measurements": {
-        "source_hits": 3,
-        "available": false,
-        "production_gate": false,
-        "cases": 250,
-        "precision": 1.0,
-        "recall": 1.0,
-        "false_positives": 0,
-        "false_negatives": 0
-      }
-    },
-    "head_context_selector": {
-      "trigger": "head/context selector (classifier vs full logits)",
-      "axis": "task-value",
-      "may_gate": [
-        "which context scores the request"
-      ],
-      "may_not_gate": [
-        "admission",
-        "caching",
-        "routing",
-        "persistence",
-        "answer key"
-      ],
-      "production_gate": false,
-      "verdict": "the classifier fast path is chosen only when the context is classifier-only, the head is available at the hidden width and covers every candidate; otherwise full logits, and the fallback is a capability metric only",
-      "measurements": {
-        "cases": 210,
-        "precision": 1.0,
-        "recall": 1.0,
-        "false_positives": 0,
-        "false_negatives": 0,
-        "fallback_cases": 130,
-        "fallback_rate": 0.6190476190476191,
-        "fallback_reasons": {
-          "non_classifier_context": 40,
-          "uncovered_candidate": 30,
-          "width_mismatch": 25,
-          "unavailable_head": 20,
-          "null_head": 15
-        },
-        "outcome_tv_bound": 0.05,
-        "outcome_argmax_agree": true
-      }
-    },
-    "head_vs_full": {
-      "trigger": "head vs full producer equivalence",
-      "axis": "task-value",
-      "may_gate": [
-        "whether the selected-head fast path may run"
-      ],
-      "may_not_gate": [
-        "admission",
-        "caching",
-        "routing",
-        "persistence"
-      ],
-      "production_gate": false,
-      "verdict": "winner equality between the selected head and full logits is the task-value gate; total variation is producer confidence, recorded per model in model_measurements, never a gate; a family that flips a winner is refused statically in the classifier predicate, never by a runtime confidence threshold",
-      "control_group": {
-        "cases": [
-          {
-            "input": "selected head available on the model",
-            "expect": "used"
-          },
-          {
-            "input": "selected head unavailable",
-            "expect": "falls back to full logits"
-          },
-          {
-            "input": "winner disagrees on a family",
-            "expect": "that family is refused statically"
-          }
-        ],
-        "winner_axis": "task-value",
-        "tv_axis": "producer confidence (recorded, never asserted as a gate)",
-        "tv_bound": 0.05
-      }
-    },
-    "adapter_scope": {
-      "trigger": "adapter scope (base model only)",
-      "axis": "task-value",
-      "may_gate": [
-        "which model identity answers"
-      ],
-      "may_not_gate": [
-        "no-adapter head selection",
-        "admission",
-        "caching",
-        "routing",
-        "persistence"
-      ],
-      "production_gate": false,
-      "verdict": "with adapters configured the decision is scoped to the base model: auto and full use base full logits, an explicit selected request is refused, and a no-adapter control still selects the head",
-      "measurements": {
-        "cases": 250,
-        "policy_matches_expect": true,
-        "precision": 1.0,
-        "recall": 1.0,
-        "false_positives": 0,
-        "false_negatives": 0,
-        "control_no_adapter_head": 90,
-        "with_adapter_auto_full": 60,
-        "with_adapter_selected_reject": 40,
-        "with_adapter_full_full": 30,
-        "production_gate": false
-      }
-    },
     "tree_vs_greedy": {
       "trigger": "tree vs greedy exactness and cost",
       "axis": "task-value",
@@ -384,7 +261,7 @@
         "admission"
       ],
       "production_gate": false,
-      "verdict": "a choice keeps 2 to 255 options; over-limit is rejected before decode, never truncated",
+      "verdict": "a choice keeps 2 to 64 options; over-limit is rejected before decode, never truncated",
       "control_group": {
         "cases": [
           {
@@ -396,16 +273,16 @@
             "expect": "accepted"
           },
           {
-            "input": "255 options",
+            "input": "64 options",
             "expect": "accepted"
           },
           {
-            "input": "256 options",
+            "input": "65 options",
             "expect": "rejected"
           }
         ],
         "min_options": 2,
-        "max_options": 255
+        "max_options": 64
       }
     },
     "label_pool_capacity": {
@@ -420,7 +297,7 @@
         "caching"
       ],
       "production_gate": false,
-      "verdict": "the protocol cap is 255 (LABEL_POOL_CAP, equal to DECISION_MAX_CHOICE_OPTIONS); the realized pool is model-dependent and may be smaller; a request whose widest question needs more labels than the realized pool is a 422, never a text-mode workaround",
+      "verdict": "the protocol cap is 64 (LABEL_POOL_CAP, equal to DECISION_MAX_CHOICE_OPTIONS); the realized pool is model-dependent and may be smaller; a request whose widest question needs more labels than the realized pool is a 422",
       "control_group": {
         "cases": [
           {
@@ -433,10 +310,10 @@
           },
           {
             "input": "a double-letter vocabulary at the cap",
-            "expect": "realized pool reaches 255"
+            "expect": "realized pool reaches 64"
           }
         ],
-        "protocol_cap": 255,
+        "protocol_cap": 64,
         "realized_source": "diagnostics.label_pool_size; recorded per model in model_measurements"
       }
     },
@@ -535,51 +412,6 @@
         ],
         "body_cap_bytes": 2097152,
         "body_cap_env": "LLAMA_DECISION_MAX_BODY"
-      }
-    },
-    "classifier_predicate": {
-      "trigger": "classifier capability predicate (arch + output width + output_s + contiguity)",
-      "axis": "task-value",
-      "may_gate": [
-        "whether the answer-head fast path may be built"
-      ],
-      "may_not_gate": [
-        "which option wins",
-        "answer validity",
-        "admission",
-        "caching"
-      ],
-      "production_gate": false,
-      "verdict": "100 percent correct accept/refuse on the fixture control group; a false accept would build a head at the wrong width, a false refuse would only fall back to full logits",
-      "measurements": {
-        "cases": 2,
-        "fixtures_present": true,
-        "accepted": 1,
-        "refused": 1,
-        "precision": 1.0,
-        "recall": 1.0,
-        "false_positives": 0,
-        "false_negatives": 0
-      },
-      "control_group": {
-        "cases": [
-          {
-            "input": "equal hidden and output widths",
-            "expect": "accepted"
-          },
-          {
-            "input": "output width differs from the hidden width",
-            "expect": "refused"
-          },
-          {
-            "input": "adapter-scaled output tensor",
-            "expect": "refused"
-          },
-          {
-            "input": "non-contiguous output tensor",
-            "expect": "refused"
-          }
-        ]
       }
     },
     "output_row_capacity": {
@@ -728,9 +560,6 @@
       "auto_at_tree_max_is_tree": true,
       "auto_above_tree_max_is_tree": false,
       "label_pool_size": 64,
-      "head_vs_full_available": true,
-      "head_vs_full_winner_agree": true,
-      "head_vs_full_tv": 0.021079439946333878,
       "temperature_nll_t1": 0.06163100717673836,
       "temperature_nll_t1_3": 0.10004203398274118,
       "temperature_nll_delta": 0.038411026806002814,

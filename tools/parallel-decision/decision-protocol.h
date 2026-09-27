@@ -95,12 +95,15 @@ struct decision_question {
 
 // A request may name a live chat slot to answer about, so the transcript is not re-prefilled.
 // `present` is true only when id_slot is supplied; `session_pos` is the source's next position
-// when pinned by the caller and -1 when the server derives it from the slot. Both are capability
-// inputs: the slot must exist, hold decoded state, and the position must continue it exactly.
+// when pinned by the caller and -1 when the server derives it from the slot. `turn` is an opaque
+// client tag that must match the slot's retained snapshot; a mismatch is a 409/422, never a
+// silent answer about a different turn. All are capability inputs: the slot must exist, hold
+// decoded state, and the position must continue it exactly.
 struct session_ref {
-    bool present     = false;
-    int  id_slot     = -1;
-    int  session_pos = -1;
+    bool        present     = false;
+    int         id_slot     = -1;
+    int         session_pos = -1;
+    std::string turn;       // opaque turn tag, matched against the retained snapshot
 };
 
 struct decision_request {
@@ -111,11 +114,46 @@ struct decision_request {
     double                    temperature = 1.0;
     common_json               temperatures; // object or null
     int                       permutations = 1;
-    std::string               head;         // "" (auto) | "selected" | "full"
     std::string               confidence_profile = "jev"; // "jev" (certainty-based, Jev default) | "local" (1 - H/logK)
     bool                      diagnostics = false; // emit additive and diagnostics fields
     session_ref               session;
 };
+
+// The evidence source shared by the Jev and generic front-ends: exactly one of a single `state`
+// (string/object/array) or a list of `contexts` (1-DECISION_MAX_CONTEXTS non-empty strings). The
+// session reference is orthogonal to the evidence text.
+struct decision_evidence {
+    bool                   state_present = false;
+    common_json            state;         // single evidence document; unused when contexts is set
+    std::vector<std::string> contexts;    // multi-context extension, answered in order
+};
+
+// Parses the evidence fields of a decision body. Throws semantic_error on invalid content; the
+// caller checks `state_present` for the "state or contexts required" rule because a session request
+// may carry neither.
+decision_evidence parse_evidence(const common_json & body);
+
+// Renders a state (string/object/array) as prompt evidence: the text is framed as data and every
+// "<" is escaped so chat-template special tokens cannot be injected from the evidence.
+std::string render_state(const common_json & state);
+
+// One grid value of a numeric question: the round-tripped double and its fixed-width JSON text.
+// Every grid value has the same shape, so the encoded set renders without float noise.
+struct numeric_grid_value {
+    double      value;
+    std::string text;
+};
+
+// The ascending numeric grid [lo, hi] at `step` (or multipleOf), including both ends. The shared
+// encoder behind the Jev `integer`/`number` extensions and the generic `number` field, so the two
+// front-ends cannot drift (D5). Throws semantic_error when the step does not divide the range or
+// the grid is outside 2-DECISION_MAX_NUMERIC_VALUES values.
+std::vector<numeric_grid_value> numeric_grid(double lo, double hi, double step);
+
+// Value-space weighted quantile of a numeric distribution over the grid values: the same
+// interpolation the score quantile uses, over actual values instead of level indices. Shared by
+// the Jev numeric answers and the generic record's interval/aggregate.
+double value_quantile(const std::vector<float> & p, const std::vector<double> & values, double q);
 
 // Renders a string/object/array instruction or criterion value to prompt text.
 std::string render_text(const common_json & value);
@@ -165,8 +203,11 @@ void validate_temperature_profile(const temperature_profile & profile, const tem
 // Lowercase hex SHA-256 of the given bytes. Used for the decision contract hash.
 std::string sha256_hex(const std::string & text);
 
-// Canonical decision response. Additive fields (certainty, the extra usage counters, and the
-// optional `head`/`diagnostics` payload) are emitted only when `req.diagnostics` is set; `probs` is
+// Canonical decision response. The per-answer additive fields (certainty, the extra usage
+// counters) are emitted only when `req.diagnostics` is set. The optional `diagnostics` payload is
+// additive and merged whenever the caller provides it: the server passes it for a diagnostics
+// request and for a session fork (which reports its fork fields additively, even without
+// `diagnostics: true`); a null payload keeps the strict Jev default envelope. `probs` is
 // index-aligned with req.questions and their options; a missing or empty entry falls back to a
 // uniform distribution. This assembler is the single owner of the default-vs-diagnostics envelope.
 common_json assemble_decision_response(const decision_request & req,

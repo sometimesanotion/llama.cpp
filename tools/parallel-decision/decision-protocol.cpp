@@ -1,6 +1,7 @@
 #include "decision-protocol.h"
 
 #include "chat.h"
+#include "labels.h"
 
 #include <algorithm>
 #include <cmath>
@@ -328,22 +329,12 @@ decision_question parse_question(const std::string & id, const common_json & spe
         if (!(step > 0) || !(hi >= lo)) {
             throw semantic_error("question \"" + id + "\": number needs ordered bounds and a positive step");
         }
-        const double    count = (hi - lo) / step;
-        const long long n     = std::llround(count);
-        if (std::fabs(count - (double) n) > 1e-7 ||
-            n + 1 < (long long) DECISION_MIN_OPTIONS || n + 1 > (long long) DECISION_MAX_NUMERIC_VALUES) {
-            throw semantic_error("question \"" + id + "\": the number grid must include both ends and hold " +
-                                 std::to_string(DECISION_MIN_OPTIONS) + "-" +
-                                 std::to_string(DECISION_MAX_NUMERIC_VALUES) + " values");
-        }
-        const int places = std::max({ decimal_places(lo), decimal_places(hi), decimal_places(step) });
-        for (long long i = 0; i <= n; ++i) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.*f", places, lo + (double) i * step);
-            const double v = std::strtod(buf, nullptr); // drop float noise: 0.1 + 0.2 -> "0.3"
+        // the shared grid encoder (D5): fixed-width text, both ends included, no float noise
+        const std::vector<numeric_grid_value> grid = numeric_grid(lo, hi, step);
+        for (const auto & gv : grid) {
             decision_option o;
-            o.key      = buf;
-            o.original = common_json(v);
+            o.key      = gv.text;
+            o.original = common_json(gv.value);
             q.options.push_back(std::move(o));
         }
     }
@@ -506,7 +497,71 @@ session_ref parse_session_ref(const common_json & body) {
             throw semantic_error("session_pos requires id_slot");
         }
     }
+    if (body.contains("turn") && !body.at("turn").is_null()) {
+        const common_json & v = body.at("turn");
+        if (!v.is_string()) {
+            throw semantic_error("turn must be a string");
+        }
+        ref.turn = v.get<std::string>();
+    }
     return ref;
+}
+
+decision_evidence parse_evidence(const common_json & body) {
+    decision_evidence out;
+    if (!body.is_object()) {
+        return out;
+    }
+    if (body.contains("contexts") && !body.at("contexts").is_null()) {
+        if (!body.at("contexts").is_array() || body.at("contexts").empty() ||
+            body.at("contexts").size() > DECISION_MAX_CONTEXTS) {
+            throw semantic_error("contexts must hold 1-" + std::to_string(DECISION_MAX_CONTEXTS) + " entries");
+        }
+        if (body.contains("state") && !body.at("state").is_null()) {
+            throw semantic_error("provide either state or contexts, not both");
+        }
+        for (const auto & c : body.at("contexts")) {
+            if (!c.is_string() || c.get<std::string>().empty()) {
+                throw semantic_error("every entry of contexts must be a non-empty string");
+            }
+            out.contexts.push_back(c.get<std::string>());
+        }
+        return out;
+    }
+    if (!body.contains("state") || body.at("state").is_null()) {
+        return out;
+    }
+    validate_state(body.at("state"));
+    out.state_present = true;
+    out.state         = body.at("state");
+    return out;
+}
+
+std::string render_state(const common_json & state) {
+    const std::string text = state.is_string() ? state.get<std::string>() : state.dump();
+    return "State:\n" + safe_data(text) + "\n";
+}
+
+std::vector<numeric_grid_value> numeric_grid(double lo, double hi, double step) {
+    const double    count = (hi - lo) / step;
+    const long long n     = std::llround(count);
+    if (std::fabs(count - (double) n) > 1e-7) {
+        throw semantic_error("the number grid must include both ends");
+    }
+    if (n < 0 || n + 1 < (long long) DECISION_MIN_OPTIONS || n + 1 > (long long) DECISION_MAX_NUMERIC_VALUES) {
+        throw semantic_error("the number grid must hold " + std::to_string(DECISION_MIN_OPTIONS) + "-" +
+                             std::to_string(DECISION_MAX_NUMERIC_VALUES) + " values");
+    }
+    const int places = std::max({ decimal_places(lo), decimal_places(hi), decimal_places(step) });
+    std::vector<numeric_grid_value> out;
+    out.reserve((size_t) n + 1);
+    for (long long i = 0; i <= n; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.*f", places, lo + (double) i * step);
+        const double v = std::strtod(buf, nullptr); // drop float noise: 0.1 + 0.2 -> "0.3"
+        out.push_back({ v, buf });
+    }
+    return out;
 }
 
 decision_request parse_decision_request(const common_json & body) {
@@ -588,16 +643,6 @@ decision_request parse_decision_request(const common_json & body) {
         }
         if (req.permutations > DECISION_MAX_PERMUTATIONS) {
             req.permutations = DECISION_MAX_PERMUTATIONS; // accepted but capped: more passes only add cost
-        }
-    }
-
-    if (body.contains("head") && !body.at("head").is_null()) {
-        if (!body.at("head").is_string()) {
-            throw semantic_error("head must be a string");
-        }
-        req.head = body.at("head").get<std::string>();
-        if (req.head != "auto" && req.head != "selected" && req.head != "full") {
-            throw semantic_error("head must be auto, selected or full");
         }
     }
 
@@ -717,7 +762,7 @@ static double option_number(const decision_option & o) {
 
 // Value-space weighted quantile of a numeric distribution: the same interpolation the score
 // quantile does, but over the actual grid values instead of level indices.
-static double value_quantile(const std::vector<float> & p, const std::vector<double> & values, double q) {
+double value_quantile(const std::vector<float> & p, const std::vector<double> & values, double q) {
     double cum = 0.0;
     for (size_t i = 0; i < p.size(); ++i) {
         const double prev = cum;
@@ -848,10 +893,11 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
         }
         out["usage"] = jev_usage;
     }
-    // The head and diagnostics objects are additive too; the caller hands over a ready payload and
-    // this assembler is the only place that decides whether the default or diagnostics envelope is
-    // emitted, so default and diagnostics responses cannot drift apart.
-    if (req.diagnostics && diagnostics != nullptr) {
+    // The diagnostics object and the session fork fields are additive too. The caller hands over a
+    // ready payload and decides whether it is emitted: the server passes it for a diagnostics
+    // request and for a session fork (which reports its fork fields additively, even without
+    // `diagnostics: true`). A null payload means the strict Jev default envelope.
+    if (diagnostics != nullptr) {
         for (auto it = diagnostics->begin(); it != diagnostics->end(); ++it) {
             out[it.key()] = it.value();
         }

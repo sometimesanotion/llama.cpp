@@ -266,8 +266,10 @@ target_include_directories(test-decision-engine PRIVATE ${PROJECT_SOURCE_DIR}/to
 target_sources(test-decision-engine PRIVATE
     ${PROJECT_SOURCE_DIR}/tools/parallel-decision/decision-engine.cpp
     ${PROJECT_SOURCE_DIR}/tools/parallel-decision/decision-protocol.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/generic_frontend.cpp
     ${PROJECT_SOURCE_DIR}/tools/parallel-decision/labels.cpp
-    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/letter_readout.cpp)
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/letter_readout.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/session_arena.cpp)
 target_compile_definitions(test-decision-engine PRIVATE
     DECISION_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/decision"
     DECISION_TEST_BASELINE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/decision-baseline"
@@ -285,8 +287,6 @@ endif()
 # filter-specific entries are gate-addressable by name and by label; each runs only its subset
 add_test(NAME test-decision-calibration COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*calibration.*)?")
 set_tests_properties(test-decision-calibration PROPERTIES LABELS "calibration")
-add_test(NAME test-decision-head COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*head.*)?")
-set_tests_properties(test-decision-head PROPERTIES LABELS "head")
 add_test(NAME test-decision-fork COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*fork.*)?")
 set_tests_properties(test-decision-fork PROPERTIES LABELS "fork")
 add_test(NAME test-decision-permut COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*permut.*)?")

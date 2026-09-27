@@ -114,8 +114,7 @@ llama_context::llama_context(
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
-    cparams.classifier_only         = params.classifier_only;
-    cparams.embeddings              = params.embeddings || params.classifier_only;
+    cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
@@ -218,17 +217,6 @@ llama_context::llama_context(
             cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
         } else {
             cparams.pooling_type = hparams.pooling_type;
-        }
-    }
-
-    if (cparams.classifier_only) {
-        const char * classifier_reason = nullptr;
-        if (!llama_model_classifier_supported(&model, &classifier_reason)) {
-            throw std::runtime_error(std::string("classifier_only requires a model with a usable answer head: ") +
-                                     (classifier_reason != nullptr ? classifier_reason : "unknown reason"));
-        }
-        if (params.n_samplers != 0 || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
-            throw std::runtime_error("classifier_only requires no sampler and unpooled outputs");
         }
     }
 
@@ -1181,14 +1169,6 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 }
 
 void llama_context::set_embeddings(bool value) {
-    // A classifier-only context publishes hidden states at the scored positions; those states are
-    // the answer head's input, so embeddings can never be turned off without breaking the context.
-    // Ignore the request rather than throwing across the void C API.
-    if (cparams.classifier_only && !value) {
-        LLAMA_LOG_WARN("%s: embeddings cannot be disabled on a classifier-only context; keeping them enabled\n", __func__);
-        return;
-    }
-
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.embeddings = value;
@@ -1247,12 +1227,6 @@ void llama_context::set_warmup(bool value) {
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
-    }
-
-    // A classifier-only context has no logits and never samples, so a sampler would be silently
-    // ignored. Reject it at this single mutation point, matching the creation-time guard.
-    if (get_cparams().classifier_only && sampler != nullptr) {
-        throw std::runtime_error("cannot attach a sampler to a classifier-only context (classifier_only requires no sampler)");
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
@@ -1704,7 +1678,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings && !cparams.classifier_only;
+    const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -2089,7 +2063,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = !cparams.classifier_only;
+    bool has_logits     = true;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -3829,7 +3803,6 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
-        /*.classifier_only             =*/ false,
     };
 
     return result;
@@ -3983,10 +3956,6 @@ const llama_model * llama_get_model(const llama_context * ctx) {
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
     return ctx->pooling_type();
-}
-
-bool llama_context_classifier_only(const llama_context * ctx) {
-    return ctx->get_cparams().classifier_only;
 }
 
 void llama_attach_threadpool(

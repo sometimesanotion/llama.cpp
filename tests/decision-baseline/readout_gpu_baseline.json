@@ -1,55 +1,52 @@
 {
  "backend": "gpu",
- "model": "qwen3.8-27b-tturbo-fcf-709/latest.gguf",
+ "model": "lfm2.5-350m-gguf/latest.gguf",
  "readout": {
-  "head_active": false,
-  "head_reason": "the decision context does not expose hidden states",
   "cache_hit": false,
-  "suffix_tokens": 124,
+  "suffix_tokens": 115,
   "common_suffix_tokens": 0,
-  "leaf_suffix_tokens": 124,
-  "rows": 124,
+  "leaf_suffix_tokens": 115,
+  "rows": 115,
   "rounds": 1,
   "questions": [
    {
     "options": 2,
     "winner": 1,
     "probs": [
-     0.0013760790461674333,
-     0.9986239075660706
+     0.0012721337843686342,
+     0.9987278580665588
     ],
-    "confidence": 0.9849361494983782,
-    "certainty": 0.9986239075660706
+    "confidence": 0.9859297931152394,
+    "certainty": 0.9987278580665588
    },
    {
     "options": 3,
-    "winner": 0,
+    "winner": 2,
     "probs": [
-     0.9994400143623352,
-     0.0004623840795829892,
-     9.757182851899415e-05
+     0.0011636739363893867,
+     0.04654329642653465,
+     0.9522930383682251
     ],
-    "confidence": 0.9954382474703863,
-    "certainty": 0.9994400143623352
+    "confidence": 0.8205208096437667,
+    "certainty": 0.9522930383682251
    },
    {
     "options": 3,
-    "winner": 1,
+    "winner": 2,
     "probs": [
-     0.1267482340335846,
-     0.8230634331703186,
-     0.0501883290708065
+     0.006241192575544119,
+     0.16619428992271423,
+     0.827564537525177
     ],
-    "confidence": 0.47912851261154454,
-    "certainty": 0.8230634331703186
+    "confidence": 0.5571071980891589,
+    "certainty": 0.827564537525177
    }
   ],
-  "head_mode": "full",
-  "label_pool_size": 64
+  "label_pool_size": 255
  },
  "timings": {
-  "prefill_ms": 807.931817,
-  "scoring_ms": 344.211011
+  "prefill_ms": 349.877499,
+  "scoring_ms": 29.14498
  },
- "note": "Frozen readout of the committed decision corpus. The deterministic core (probabilities, winners, confidence = 1 - H/log K, certainty = max p, head mode, label-pool size) is a contract; the timing block is recorded for context and excluded from the byte diff."
+ "note": "Frozen readout of the committed decision corpus. The deterministic core (probabilities, winners, confidence = 1 - H/log K, certainty = max p, label-pool size) is a contract; the timing block is recorded for context and excluded from the byte diff."
 }

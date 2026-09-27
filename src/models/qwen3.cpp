@@ -149,8 +149,6 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    if (finish_classifier_only(cur)) return;
-
     // lm_head
     cur = build_lora_mm(model.output, cur, model.output_s);
 
