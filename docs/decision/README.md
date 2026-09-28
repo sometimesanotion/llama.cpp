@@ -25,8 +25,9 @@ batched pass.  Both front-ends terminate at the same `field_input[]` plan, so
 the two contracts cannot drift.  A request may also ask for a permutation
 de-bias pass (`permutations: N`), which shuffles option order and averages,
 so no one fixed ordering biases the scores.  A request may also carry an
-`id_slot` (and optional `turn`) to answer about a live chat slot through an
-owned snapshot, without re-prefilling the transcript.
+`id_slot` or a first-class `session_id` (and optional `turn`) to answer about a
+live chat slot through an owned reference, without re-prefilling the
+transcript.
 
 This is classification-style work — routing, triage, RAG ranking, structured
 extraction — where you care about which option wins, not about fluent prose. 
@@ -120,8 +121,9 @@ about whose cache it touches and what survives:
     (llama_memory_seq_rm), reclaiming their cells.  Only the snapshot
     sequence's prefix survives, so the next matching query can reuse it.
 
-  - A session decision forks the slot's owned snapshot in the decision arena
-    (`--decision-arena-seqs`), never the live slot: the source slot's KV is
+  - A session decision forks the slot's owned reference (`host`/`clone`/`file`
+    backends; the reference lives in the reserved `--decision-arena-seqs`
+    sequences or on disk), never the live slot: the source slot's KV is
     never read for scoring and never written.
 
   - A preflight check estimates peak KV use and returns 422 rather than ever
@@ -132,24 +134,39 @@ So the short answer: decisions do update the KV cache, but transiently, in a
 reserved range, with self-cleanup - the design's whole point is that a
 decision never disturbs the state chat depends on.
 
-## Live-session decisions (owned snapshot)
+## Live-session decisions (owned reference)
 
-A request with `id_slot` answers about a chat slot that already holds decoded
-state.  The server does not fork the live slot and does not re-prefill the
-transcript.  On the first decision for a slot's current turn, it serializes
-the slot's decoded state in the self-contained host format
-(`llama_state_seq_*`) and restores it into a free arena sequence
-(`--decision-arena-seqs`): the on-demand snapshot trigger.  Later decisions
-in the same turn fork that arena sequence, so the answer survives the origin
-slot being cleared and reused by `cache_idle_slots`.  One retained turn per
-slot: when the slot decodes past the snapshot's position (a new completed
-turn), the snapshot is released before the next decision.  The optional
-`turn` tag pins the retained turn; a mismatched `turn` is a 422, never a
-silent answer about a different turn.  The trigger is a cost decision (fire
-on the first decision for a turn, reuse the arena), never a confidence
-decision; its exact counters are calibrated by the snapshot tests in
-`tests/test-decision-engine.cpp`.  A decision on an in-flight slot is a 422
-(the turn is not complete).
+A request with `id_slot` or a first-class `session_id` answers about a chat
+slot that already holds decoded state.  The server does not fork the live slot
+and does not re-prefill the transcript.  On the first decision for a slot's
+current turn, it captures the slot's decoded state into a reference (the
+`host` backend serializes it in the self-contained host format
+`llama_state_seq_*` and restores it into a reserved sequence; `clone` shares
+the attention cells by metadata only; `file` keeps the state on disk): the
+on-demand capture trigger.  Later decisions in the same turn fork that
+reference, so the answer survives the origin slot being cleared and reused by
+`cache_idle_slots`.  One retained turn per slot: when the slot decodes past
+the reference's position (a new completed turn), the reference is released
+before the next decision.  The optional `turn` tag pins the retained turn; a
+mismatched `turn` is a 422, never a silent answer about a different turn.  The
+trigger is a cost decision (fire on the first decision for a turn, reuse the
+reference), never a confidence decision; its exact counters are calibrated by
+the session tests in `tests/test-decision-engine.cpp`.  A decision on an
+in-flight slot is a 422 (the turn is not complete).
+
+A reference is bound to a memory epoch and to the turn's content identity: a
+whole-context replace/load or model reload makes every capture stale (HTTP
+409), and a clear plus a same-length re-prefill of different content is
+refused instead of answered.  `session_id` handles live outside the reused
+`id_slot` with a create/query/pin/erase lifecycle over `/v1/session`.  A slot
+save (`POST /slots/{id}?action=save`) co-writes a session manifest sidecar
+bound to the slot file by its content hash; a slot restore rebinds a matching
+manifest, marks a mismatched one unresolvable (never served), and drops any
+retained reference a restore does not account for - a restore never leaves a
+stale retained turn.  Under a configured byte budget, the registry evicts the
+least-recently-used unpinned, unleased reference to fit a capture, and a
+configured TTL reaps expired unpinned references; the defaults (unlimited
+budget, no expiry) never evict.
 
 ## What the benchmarks say: /v1/decision versus chat
 

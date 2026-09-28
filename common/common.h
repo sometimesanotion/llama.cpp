@@ -458,6 +458,10 @@ struct common_params {
     std::string decision_temperature;      // optional calibrated per-type decision temperatures with provenance
     std::string decision_contract;         // optional expected contract hash; the decision path refuses a mismatch
     int32_t n_decision_permutations = 1;   // default order-de-bias passes when a request omits "permutations"
+    std::string decision_session_backend;  // default retained-turn backend for created sessions: host (default) | clone | file
+    int64_t decision_session_ttl_ms = 0;   // default ttl for created sessions, ms (0 = no expiry)
+    int32_t decision_session_budget_mb = 0;// byte budget for all retained references (0 = unlimited)
+    std::string decision_session_persist;  // writable directory for the file backend; else slot_save_path
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence

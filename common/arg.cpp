@@ -2607,6 +2607,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_decision_permutations = value;
             }
         ).set_env("LLAMA_ARG_DECISION_PERMUTATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-backend"}, "NAME",
+            string_format("default retained-turn backend for created sessions: host | clone | file (default: %s; clone is selectable only on dense unified attention or recurrent/hybrid models, file needs a writable --slot-save-path or --decision-session-persist directory)", params.decision_session_backend.empty() ? "host" : params.decision_session_backend.c_str()),
+            [](common_params & params, const std::string & value) {
+                if (value != "host" && value != "clone" && value != "file") {
+                    throw std::invalid_argument("--decision-session-backend needs host, clone or file");
+                }
+                params.decision_session_backend = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_BACKEND").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-ttl"}, "MS",
+            string_format("default time-to-live for created sessions, milliseconds (default: %d = no expiry)", (int) params.decision_session_ttl_ms),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-session-ttl needs a non-negative count");
+                }
+                params.decision_session_ttl_ms = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-budget-mb"}, "N",
+            string_format("byte budget for all retained-turn references, mebibytes (default: %d = unlimited; a capture that would exceed it is refused until the eviction calibration lands)", params.decision_session_budget_mb),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-session-budget-mb needs a non-negative count");
+                }
+                params.decision_session_budget_mb = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-persist"}, "DIR",
+            string_format("writable directory for the file retained-turn backend (default: the --slot-save-path directory, when set)"),
+            [](common_params & params, const std::string & value) {
+                params.decision_session_persist = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_PERSIST").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

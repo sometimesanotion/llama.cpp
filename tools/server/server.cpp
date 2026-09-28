@@ -285,6 +285,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
     ctx_http.post("/decision",                 ex_wrapper(routes.post_decision));
     ctx_http.post("/v1/decision",              ex_wrapper(routes.post_decision));
+    ctx_http.post("/v1/session",               ex_wrapper(routes.post_session));
+    ctx_http.get ("/v1/session/:session_id",   ex_wrapper(routes.get_session));
+    ctx_http.del ("/v1/session/:session_id",   ex_wrapper(routes.delete_session));
+    ctx_http.patch("/v1/session/:session_id",  ex_wrapper(routes.patch_session));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

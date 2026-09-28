@@ -29,6 +29,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_DECISION,
+    SERVER_TASK_TYPE_SESSION,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -177,6 +178,16 @@ struct server_task {
     // used by SERVER_TASK_TYPE_DECISION: the request body
     json decision_request;
     std::shared_ptr<std::atomic<bool>> decision_cancel; // set when the HTTP client disconnects
+
+    // used by SERVER_TASK_TYPE_SESSION: the session action
+    struct session_action {
+        enum action_t { create, get, erase, patch };
+        action_t    action = create;
+        int         id_slot = -1;
+        std::string session_id;
+        json        body; // create/patch payload
+    };
+    session_action session;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
@@ -497,6 +508,15 @@ struct server_task_result_error : server_task_result {
 
 // the /v1/decision response payload
 struct server_task_result_decision : server_task_result {
+    json data;
+
+    virtual json to_json() override {
+        return data;
+    }
+};
+
+// the /v1/session response payload
+struct server_task_result_session : server_task_result {
     json data;
 
     virtual json to_json() override {

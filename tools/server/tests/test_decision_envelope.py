@@ -463,6 +463,111 @@ def run_session_checks(model):
     return True
 
 
+def run_session_handle_checks(model):
+    """The first-class session handle lifecycle over HTTP: create/query/pin/ttl/erase, the
+    session_id decision path, and the session_id + id_slot mutual exclusion."""
+    state = DECISION_VALID["state"]
+    user = "State:\n" + state + "\n"
+    server = Server(model, ["--parallel", "2", "--slots", "--jinja"])
+    try:
+        server.start()
+    except Exception as e:  # noqa: BLE001
+        server.stop()
+        print(f"skip session handle checks on {os.path.basename(model)}: {e}")
+        return True
+    if not supports_letter_labels(server):
+        server.stop()
+        print(f"skip session handle checks on {os.path.basename(model)}: no usable answer labels")
+        return True
+
+    def ses(method, path, body=None):
+        return http(method, f"http://127.0.0.1:{server.port}{path}", body)
+
+    try:
+        # a session needs a slot that holds a completed turn
+        status, text = ses("POST", "/v1/session", json.dumps({"id_slot": 0}))
+        check(status in (400, 422), f"empty slot create status {status}: {text}")
+
+        prefill_slot(server, 0, LETTER_SYSTEM, user)
+
+        # create
+        status, text = ses("POST", "/v1/session", json.dumps({"id_slot": 0, "turn": "turn-1"}))
+        check(status == 200, f"session create status {status}: {text}")
+        sid = json.loads(text).get("session_id")
+        check(bool(sid) and str(sid).startswith("ses_"), f"a session handle is issued: {sid!r}")
+
+        # query
+        status, text = ses("GET", f"/v1/session/{sid}")
+        check(status == 200, f"session get status {status}: {text}")
+        body = json.loads(text)
+        check(body.get("session_id") == sid, "session get echoes the handle")
+        check(body.get("id_slot") == 0, "session get reports the slot")
+        check(isinstance(body.get("counters"), dict), "session get reports the registry counters")
+
+        # a decision by session_id resolves and reports the handle additively
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id=sid, diagnostics=True)))
+        check(status == 200, f"session_id decision status {status}: {text[:200]}")
+        resp = json.loads(text)
+        check(resp.get("session_fork") is True, "a session_id decision is a session fork")
+        check(resp.get("session_id") == sid, f"the decision reports the session handle: {resp.get('session_id')}")
+        check(resp["answers"]["dept"]["choice"] in ("billing", "technical"), "the session answer is a real answer")
+
+        # session_id + id_slot together are refused, never silently one of them
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id=sid, id_slot=0)))
+        check(status == 422, f"session_id + id_slot is refused: {status} {text}")
+        check("not both" in text, f"the mutual-exclusion error names the fields: {text}")
+
+        # an unknown session_id is a request error, never an answer
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id="ses_nope")))
+        check(status == 400, f"unknown session_id status {status}: {text}")
+
+        # patch pin/ttl
+        status, text = ses("PATCH", f"/v1/session/{sid}", json.dumps({"pinned": True, "ttl_ms": 60000}))
+        check(status == 200, f"session patch status {status}: {text}")
+        body = json.loads(text)
+        check(body.get("pinned") is True, "the patch records the pin")
+        check(body.get("ttl_ms") == 60000, "the patch records the ttl")
+
+        # erase
+        status, text = ses("DELETE", f"/v1/session/{sid}")
+        check(status == 200, f"session delete status {status}: {text}")
+        status, text = ses("GET", f"/v1/session/{sid}")
+        check(status == 400, f"a deleted session is gone: {status} {text}")
+
+        # an eager session captures at create and resolves by handle
+        prefill_slot(server, 1, LETTER_SYSTEM, user)
+        status, text = ses("POST", "/v1/session",
+                           json.dumps({"id_slot": 1, "policy": {"capture_on_turn_complete": True}}))
+        check(status == 200, f"eager session create status {status}: {text}")
+        sid2 = json.loads(text).get("session_id")
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id=sid2)))
+        check(status == 200, f"an eager session resolves by handle: {status} {text[:120]}")
+
+        # the clone backend is selectable on a capable model and answers a decision additively
+        prefill_slot(server, 0, LETTER_SYSTEM, user)
+        status, text = ses("POST", "/v1/session",
+                           json.dumps({"id_slot": 0, "policy": {"backend": "clone", "capture_on_turn_complete": True}}))
+        check(status == 200, f"clone session create status {status}: {text}")
+        clone_sid = json.loads(text).get("session_id")
+        check(bool(clone_sid), "a clone session handle is issued")
+        status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id=clone_sid, diagnostics=True)))
+        check(status == 200, f"a clone session decision status {status}: {text[:160]}")
+        clone_resp = json.loads(text)
+        check(clone_resp.get("session_id") == clone_sid, "the clone decision reports the handle")
+        check(clone_resp["answers"]["dept"]["choice"] in ("billing", "technical"), "the clone answer is a real answer")
+
+        # the file backend needs a writable directory; without one it is a capability refusal, 501
+        status, text = ses("POST", "/v1/session", json.dumps({"id_slot": 0, "policy": {"backend": "file"}}))
+        check(status == 501, f"the file backend without a directory is refused: {status} {text}")
+    except Exception as e:  # noqa: BLE001
+        server.stop()
+        print(f"FAIL: session handle checks: {e}")
+        return False
+    server.stop()
+    print("decision session handle checks passed")
+    return True
+
+
 def supports_letter_labels(server):
     """A usable model must yield at least two single-token letter labels."""
     try:
@@ -795,6 +900,10 @@ def main():
 
         # session fork: a decision about a live slot must not re-prefill or corrupt it
         if not run_session_checks(model):
+            return 1
+
+        # session handle: the first-class create/query/pin/ttl/erase lifecycle over HTTP
+        if not run_session_handle_checks(model):
             return 1
 
         # adapter contract: the decision decode is scoped to the base model while chat keeps

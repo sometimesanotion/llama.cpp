@@ -473,10 +473,21 @@ session_ref parse_session_ref(const common_json & body) {
     if (!body.is_object()) {
         return ref;
     }
+    if (body.contains("session_id") && !body.at("session_id").is_null()) {
+        const common_json & v = body.at("session_id");
+        if (!v.is_string() || v.get<std::string>().empty()) {
+            throw semantic_error("session_id must be a non-empty string");
+        }
+        ref.session_id = v.get<std::string>();
+        ref.present    = true;
+    }
     if (body.contains("id_slot") && !body.at("id_slot").is_null()) {
         const common_json & v = body.at("id_slot");
         if (!v.is_number_integer()) {
             throw semantic_error("id_slot must be an integer");
+        }
+        if (!ref.session_id.empty()) {
+            throw semantic_error("provide either session_id or id_slot, not both");
         }
         ref.id_slot = (int) v.get<long long>();
         if (ref.id_slot < 0) {
@@ -494,7 +505,7 @@ session_ref parse_session_ref(const common_json & body) {
             throw semantic_error("session_pos must be >= 0");
         }
         if (!ref.present) {
-            throw semantic_error("session_pos requires id_slot");
+            throw semantic_error("session_pos requires id_slot or session_id");
         }
     }
     if (body.contains("turn") && !body.at("turn").is_null()) {

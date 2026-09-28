@@ -269,7 +269,8 @@ target_sources(test-decision-engine PRIVATE
     ${PROJECT_SOURCE_DIR}/tools/parallel-decision/generic_frontend.cpp
     ${PROJECT_SOURCE_DIR}/tools/parallel-decision/labels.cpp
     ${PROJECT_SOURCE_DIR}/tools/parallel-decision/letter_readout.cpp
-    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/session_arena.cpp)
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/session-registry.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/session-store.cpp)
 target_compile_definitions(test-decision-engine PRIVATE
     DECISION_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/decision"
     DECISION_TEST_BASELINE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/decision-baseline"

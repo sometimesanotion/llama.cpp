@@ -207,13 +207,16 @@ top-level shape: `questions` selects the Jev front-end, `schema` selects the
 generic front-end, and a body carrying both is a 400. Both terminate at the
 same engine, so the two shapes cannot drift.
 
-### 2.4 Live-session request (`id_slot`, `session_pos`, `turn`)
+### 2.4 Live-session request (`id_slot`, `session_id`, `session_pos`, `turn`)
 
 The unified shape accepts an optional `id_slot` (int) so the decision is answered about
 a chat slot that already holds decoded state, without re-prefilling the
-transcript. `session_pos` (int) optionally pins the continuation position; it
-requires `id_slot` and must equal the slot's next position exactly, otherwise the
-request is a 422 (a shifted position is never scored silently). `turn` (string)
+transcript. A first-class `session_id` (string) is the alternative: a server-side
+session handle that owns its slot and turn, decoupled from the reused `id_slot`.
+`session_id` and `id_slot` are mutually exclusive; a body carrying both is a 400.
+`session_pos` (int) optionally pins the continuation position; it
+requires a session and must equal the session's next position exactly, otherwise
+the request is a 422 (a shifted position is never scored silently). `turn` (string)
 optionally pins the retained-turn identity; a mismatched `turn` is a 422, never a
 silent answer about a different turn.
 
@@ -236,25 +239,77 @@ silent answer about a different turn.
   and `session_pos` (and `turn` when the request set one). With
   `diagnostics: true`, `diagnostics.permutations` reports the pass count used.
 
-#### Session snapshot substrate
+#### First-class session handles (`/v1/session`)
+
+A client may create a server-side session that outlives the slot's current turn
+and survives the slot's KV being cleared and reused:
+
+- `POST /v1/session` - create. Body: `{"id_slot": N, "turn": "...",
+  "policy": {"backend": "host|clone|file", "capture_on_turn_complete": bool,
+  "pinned": bool, "ttl_ms": N, "max_turns": N}}`. Returns `session_id`, `id_slot`,
+  `turn`, `backend`, and `captured`. `id_slot` alone keeps working byte-identically;
+  `session_id` is additive.
+- `GET /v1/session/{id}` - status: `session_id`, `id_slot`, `turn`, `backend`,
+  `pinned`, `ttl_ms`, `captured`, `bytes`, `created_ms`, `last_used_ms`, and the
+  exact trigger counters (`n_snapshots`, `n_reuses`, `n_releases`,
+  `n_evictions`, `n_ttl_reaps`, `n_sessions`, `bytes_total`).
+- `PATCH /v1/session/{id}` - set `pinned` and/or `ttl_ms`.
+- `DELETE /v1/session/{id}` - erase, releasing the owned reference.
+
+`session_id` is mutually exclusive with `id_slot` in a decision request (400 when
+both appear). A session handle is bound to one source slot; when the slot's turn
+ends the session ends with it.
+
+#### Session substrate
 
 A session decision never forks the live slot. The server keeps a decision-owned
-arena of reserved sequences (`--decision-arena-seqs N`, default `n_parallel`):
+session registry that owns one retained-turn reference per chat slot, materialized
+into reserved sequences (`--decision-arena-seqs N`, default `n_parallel`) or, for
+the `file` backend, onto disk:
+
 - On the first decision referencing a slot's current turn, the server
-  serializes the slot's decoded state in the self-contained host format
-  (`llama_state_seq_*`) and restores it into a free arena sequence. This is the
-  on-demand snapshot trigger: a turn that is never queried produces no snapshot.
-- Later decisions in the same turn fork the arena sequence
+  captures the slot's decoded state into the reference and restores it. This is
+  the on-demand capture trigger: a turn that is never queried produces no
+  reference. Later decisions in the same turn fork the reference
   (`decide_batch_from_seq`) instead of the slot, so the source survives the
   slot's KV being cleared and reused by `cache_idle_slots`.
-- The retained-turn policy keeps one snapshot per slot. When the slot decodes
-  past the snapshot's position (a completed new turn), the snapshot is released
+- The retained-turn policy keeps one reference per slot. When the slot decodes
+  past the reference's position (a completed new turn), the reference is released
   before the next decision. A slot with no decoded state (no `pos_max`) cannot
-  have advanced, so a cleared slot still matches its snapshot.
+  have advanced, so a cleared slot still matches its reference.
+- The reference backend is selected per session (`host` default, `clone`, or
+  `file`). `host` serializes the slot's decoded state in the self-contained host
+  format and restores it into a reserved arena sequence (an owned byte copy).
+  `clone` is a metadata-only cell reference: it shares the source slot's
+  attention cells (plus an owned partial copy for recurrent/hybrid layers), so it
+  pins those cells and reduces the chat free `n_ctx` by the retained turn length
+  while the session lives. It is not a reserved region. `clone` is selectable
+  only on dense unified attention or recurrent/hybrid models (never a
+  sliding-window cache). `file` keeps the turn state on disk under a writable
+  directory and loads it on demand; it needs `--slot-save-path` or
+  `--decision-session-persist`. A backend that is not selectable on the model or
+  configuration is a capability refusal, never a silent fallback.
 - A decision on an in-flight slot (`is_processing()`) is a 422: it measures
   task validity (is the turn complete), never confidence.
-- An arena that is full (every sequence holds a snapshot) is a 422 naming the
-  arena; raise `--decision-arena-seqs` to hold more retained turns.
+- The reference is bound to a `memory_epoch`: a whole-context replace/load or a
+  model reload bumps the epoch, and a reference captured under an older epoch is
+  stale (HTTP 409), never served. `semantic_error` (422) keeps its existing
+  meaning; "stale" and "invalid request" are different outcomes.
+- Lifecycle: a reference is released by `SLOT_ERASE`, by the slot's release
+  callback, by an expired TTL (`ttl_ms`, reaped only when a session is older than
+  its TTL and never when pinned or held by an in-flight decision), and, under
+  byte-budget pressure (`--decision-session-budget-mb`), by LRU eviction of the
+  least-recently-used unpinned, unleased reference. A pinned or in-flight
+  reference is never evicted. The default budget is unlimited and the default TTL
+  is 0 (no expiry), so a deployment that never sets them sees no eviction.
+- Window persistence: `POST /slots/{id}?action=save` co-writes a session manifest
+  sidecar next to the slot file when a session exists. The manifest is bound to
+  the slot file by its content hash and carries the session identity, policy,
+  backend, and the reference state. `POST /slots/{id}?action=restore` reads the
+  sidecar: a matching manifest rebinds the session to the restored window, a
+  mismatched or foreign one is unresolvable (dropped, never served), and a slot
+  restored without a sidecar drops any retained reference - a restore never
+  leaves a stale retained turn. The slot file format is unchanged.
 
 ### 2.5 Generic typed-schema front-end (`schema`)
 
@@ -508,7 +563,7 @@ same value.
 | answer-label pool | `LABEL_POOL_CAP` (equal to `DECISION_MAX_CHOICE_OPTIONS`) |
 | request body | `LLAMA_DECISION_MAX_BODY` (default 2 MiB) |
 | concurrent decisions | `LLAMA_DECISION_MAX_QUEUE` (default 4), then 429/529 |
-| retained session snapshots | one per chat slot; `--decision-arena-seqs` sets the arena pool |
+| retained session references | one per chat slot; `--decision-arena-seqs` sets the reserved-sequence pool; `--decision-session-budget-mb` sets the byte budget (0 = unlimited) and `--decision-session-ttl` sets the default expiry (0 = none) |
 | trie fields / values per field | 1-32 fields, 1-255 values |
 
 The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (255); the label-pool
@@ -577,12 +632,23 @@ Rules:
   surface-form values.
 - **branch / trunk / prefix**: one KV sequence per scored path; a trunk is
   `shared prefix + context`; the prefix is the cacheable head.
-- **session fork**: answering `id_slot` by forking the slot's owned snapshot
-  instead of re-prefilling `state`; the source slot is read-only.
-- **session snapshot / retained turn**: the arena copy of a completed turn's
+- **session fork**: answering `id_slot` or `session_id` by forking the slot's
+  owned reference instead of re-prefilling `state`; the source slot is read-only.
+- **session reference / retained turn**: the owned copy of a completed turn's
   decoded state, taken on the first decision for that turn, reused by later
   decisions in the same turn, and released when the turn advances. One retained
-  turn per slot. `turn` is the opaque client tag that pins the snapshot.
+  turn per slot. `turn` is the opaque client tag that pins the reference.
+- **session handle / `session_id`**: a first-class, server-side session identity
+  decoupled from the reused `id_slot`, with an explicit create/query/pin/erase
+  lifecycle over `/v1/session`.
+- **session backend**: how a retained turn is referenced (`host`: owned host-format
+  copy in a reserved sequence; `clone`: metadata-only shared cells; `file`: state
+  on disk). Selected per session; a non-selectable backend is a capability refusal.
+- **session manifest**: the sidecar a slot save co-writes, bound to the slot file
+  by its content hash, that a slot restore uses to rebind or refuse the retained
+  reference - a restore never answers from a stale turn.
+- **memory epoch**: a monotonic counter over the context's memory generations; a
+  retained reference captured under an older epoch is stale (HTTP 409), never served.
 - **producer confidence vs task value**: two DIFFERENT axes (Section 6). Never
   use a confidence number to gate caching/admission/correctness.
 - **closed-world probabilities**: `probabilities` are conditional on the

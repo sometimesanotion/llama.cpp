@@ -13,7 +13,7 @@
 #include "labels.h"
 #include "letter_readout.h"
 #include "llama.h"
-#include "session_arena.h"
+#include "session-registry.h"
 #include "speculative.h"
 #include "testing.h"
 
@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -1074,6 +1075,18 @@ static void test_decision_parse(testing & t) {
         const auto pin = llama_decision::parse_session_ref(pinned);
         t.assert_equal("session_pos pins the position", 7, pin.session_pos);
 
+        // a first-class session handle is an alternative to id_slot and is mutually exclusive
+        common_json with_id = plain;
+        with_id["session_id"] = "ses_1234";
+        const auto sid = llama_decision::parse_session_ref(with_id);
+        t.assert_true("session_id marks a session", sid.present);
+        t.assert_equal("session_id value", std::string("ses_1234"), sid.session_id);
+        t.assert_equal("a session_id session has no id_slot", -1, sid.id_slot);
+        common_json sid_pinned = with_id;
+        sid_pinned["session_pos"] = 7;
+        const auto sid_pin = llama_decision::parse_session_ref(sid_pinned);
+        t.assert_equal("session_pos pins a session_id session", 7, sid_pin.session_pos);
+
         expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":-1})",
                                "id_slot must be >= 0");
         expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":"a"})",
@@ -1082,6 +1095,12 @@ static void test_decision_parse(testing & t) {
                                "session_pos requires id_slot");
         expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"id_slot":0,"session_pos":-2})",
                                "session_pos must be >= 0");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"session_id":""})",
+                               "session_id must be a non-empty string");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"session_id":7})",
+                               "session_id must be a non-empty string");
+        expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"session_id":"a","id_slot":0})",
+                               "provide either session_id or id_slot");
     });
 
     t.test("unknown top-level fields are ignored while question fields stay strict", [](testing & t) {
@@ -2975,24 +2994,25 @@ static void test_session_fork(testing & t) {
 
 // Decode a transcript and take a snapshot of it, returning the arena sequence id. Shared setup so
 // every run exercises the same save/restore primitive.
-static llama_seq_id session_arena_prepare(llama_context * ctx,
-                                          llama_decision::session_arena & arena, int slot,
-                                          const std::vector<llama_token> & transcript, const std::string & turn,
-                                          testing & t, const std::string & lane) {
+static llama_seq_id session_registry_prepare(llama_context * ctx,
+                                             llama_decision::session_registry & reg, int slot,
+                                             const std::vector<llama_token> & transcript, const std::string & turn,
+                                             testing & t, const std::string & lane) {
     llama_memory_clear(llama_get_memory(ctx), true);
     if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, slot, 0, transcript))) {
         return -1;
     }
     llama_synchronize(ctx);
-    const llama_seq_id snap = arena.snapshot(slot, slot, (llama_pos) transcript.size(), turn);
-    t.assert_true(lane + ": the snapshot is taken", snap >= 0);
-    return snap;
+    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot);
+    const auto res = reg.resolve_slot(slot, transcript, pos_max, -1, turn, "");
+    t.assert_true(lane + ": the reference is taken", res.seq >= 0);
+    return res.seq;
 }
 
-// The snapshot survives the origin being cleared and reused: after freeing and re-decoding the
+// The reference survives the origin being cleared and reused: after freeing and re-decoding the
 // slot, the retained arena sequence still holds the turn and its continuation matches a fresh
 // prefill of the same transcript within the producer bound.
-static void session_arena_after_clear_run(testing & t, llama_context * ctx, const std::string & lane) {
+static void session_registry_after_clear_run(testing & t, llama_context * ctx, const std::string & lane) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const auto transcript = common_tokenize(vocab, "the first completed chat turn", false, true);
@@ -3001,8 +3021,8 @@ static void session_arena_after_clear_run(testing & t, llama_context * ctx, cons
         t.skip(lane + ": the model has no usable tokens");
         return;
     }
-    llama_decision::session_arena arena(ctx, 6, 2, 4);
-    const llama_seq_id snap_seq = session_arena_prepare(ctx, arena, 0, transcript, "turn-1", t, lane);
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    const llama_seq_id snap_seq = session_registry_prepare(ctx, reg, 0, transcript, "turn-1", t, lane);
     if (snap_seq < 0) {
         return;
     }
@@ -3014,10 +3034,10 @@ static void session_arena_after_clear_run(testing & t, llama_context * ctx, cons
     }
     llama_synchronize(ctx);
 
-    const llama_decision::session_snapshot * snap = arena.find(0);
-    t.assert_true(lane + ": the retained snapshot survives the origin clear", snap != nullptr && snap->active);
+    const llama_decision::decision_session * snap = reg.find_by_slot(0);
+    t.assert_true(lane + ": the retained reference survives the origin clear", snap != nullptr);
     t.assert_equal(lane + ": the retained arena sequence is the one taken", snap_seq,
-                   snap != nullptr ? snap->arena_seq : -1);
+                   snap != nullptr ? snap->capture.resident_seq : -1);
 
     // the continuation agrees within the producer bound: the slot re-prefilled the same transcript
     // and both continue with the branch
@@ -3027,21 +3047,21 @@ static void session_arena_after_clear_run(testing & t, llama_context * ctx, cons
     }
     llama_synchronize(ctx);
     const auto live = output_logits(ctx, vocab, -1);
-    if (!t.assert_true(lane + ": the retained snapshot continues", decode_tokens_on(ctx, snap_seq, pos, branch))) {
+    if (!t.assert_true(lane + ": the retained reference continues", decode_tokens_on(ctx, snap_seq, pos, branch))) {
         return;
     }
     llama_synchronize(ctx);
     const auto kept = output_logits(ctx, vocab, -1);
     const double delta = max_abs_logit_delta(live, kept);
     const double bound = lane == "gpu" ? 5e-2 : 0.0;
-    t.assert_true(lane + ": the cleared-origin continuation matches the retained snapshot (delta " +
+    t.assert_true(lane + ": the cleared-origin continuation matches the retained reference (delta " +
                       std::to_string(delta) + ")",
                   delta <= bound);
 }
 
-// The restored snapshot is a byte-exact copy on the CPU lane and reproduces the producer's
+// The restored reference is a byte-exact copy on the CPU lane and reproduces the producer's
 // continuation within the producer bound on the GPU lane.
-static void session_arena_restore_fidelity_run(testing & t, llama_context * ctx, const std::string & lane) {
+static void session_registry_restore_fidelity_run(testing & t, llama_context * ctx, const std::string & lane) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const auto transcript = common_tokenize(vocab, "the retained turn for the fidelity check", false, true);
@@ -3050,8 +3070,8 @@ static void session_arena_restore_fidelity_run(testing & t, llama_context * ctx,
         t.skip(lane + ": the model has no usable tokens");
         return;
     }
-    llama_decision::session_arena arena(ctx, 6, 2, 4);
-    const llama_seq_id snap_seq = session_arena_prepare(ctx, arena, 0, transcript, "", t, lane);
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    const llama_seq_id snap_seq = session_registry_prepare(ctx, reg, 0, transcript, "", t, lane);
     if (snap_seq < 0) {
         return;
     }
@@ -3060,7 +3080,7 @@ static void session_arena_restore_fidelity_run(testing & t, llama_context * ctx,
     t.assert_true(lane + ": both states are non-empty", !src_state.empty() && !snap_state.empty());
 
     // continuation equivalence: the live slot is cleared, the transcript re-prefilled, and both the
-    // slot and the retained snapshot continue with the same branch
+    // slot and the retained reference continue with the same branch
     llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
     if (!t.assert_true(lane + ": the re-prefilled slot decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
         return;
@@ -3072,14 +3092,14 @@ static void session_arena_restore_fidelity_run(testing & t, llama_context * ctx,
     }
     llama_synchronize(ctx);
     const auto live = output_logits(ctx, vocab, -1);
-    if (!t.assert_true(lane + ": the retained snapshot continues", decode_tokens_on(ctx, snap_seq, pos, branch))) {
+    if (!t.assert_true(lane + ": the retained reference continues", decode_tokens_on(ctx, snap_seq, pos, branch))) {
         return;
     }
     llama_synchronize(ctx);
     const auto kept = output_logits(ctx, vocab, -1);
     const double delta = max_abs_logit_delta(live, kept);
     const double bound = lane == "gpu" ? 5e-2 : 0.0;
-    t.assert_true(lane + ": the restored snapshot reproduces the continuation (delta " +
+    t.assert_true(lane + ": the restored reference reproduces the continuation (delta " +
                       std::to_string(delta) + ")",
                   delta <= bound);
 
@@ -3099,7 +3119,7 @@ static void session_arena_restore_fidelity_run(testing & t, llama_context * ctx,
 
 // Multiple retained sessions coexist: each slot holds its own turn, the arena sequences are
 // distinct, and releasing one does not disturb the others.
-static void session_arena_multi_snapshot_run(testing & t, llama_context * ctx, const std::string & lane) {
+static void session_registry_multi_snapshot_run(testing & t, llama_context * ctx, const std::string & lane) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const auto t0 = common_tokenize(vocab, "the first independent turn", false, true);
@@ -3109,9 +3129,9 @@ static void session_arena_multi_snapshot_run(testing & t, llama_context * ctx, c
         t.skip(lane + ": the model has no usable tokens");
         return;
     }
-    llama_decision::session_arena arena(ctx, 6, 4, 4);
+    llama_decision::session_registry reg(ctx, 6, 4, 4);
 
-    // each slot decodes its own transcript without clearing the cache, so the earlier snapshots
+    // each slot decodes its own transcript without clearing the cache, so the earlier references
     // survive the later ones
     llama_memory_clear(llama_get_memory(ctx), true);
     if (!t.assert_true(lane + ": turn 0 decodes", decode_tokens_on(ctx, 0, 0, t0)) ||
@@ -3120,40 +3140,43 @@ static void session_arena_multi_snapshot_run(testing & t, llama_context * ctx, c
         return;
     }
     llama_synchronize(ctx);
-    const llama_seq_id s0 = arena.snapshot(0, 0, (llama_pos) t0.size(), "a");
-    const llama_seq_id s1 = arena.snapshot(1, 1, (llama_pos) t1.size(), "b");
-    const llama_seq_id s2 = arena.snapshot(2, 2, (llama_pos) t2.size(), "c");
-    if (s0 < 0 || s1 < 0 || s2 < 0) {
+    const llama_pos p0 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    const llama_pos p1 = llama_memory_seq_pos_max(llama_get_memory(ctx), 1);
+    const llama_pos p2 = llama_memory_seq_pos_max(llama_get_memory(ctx), 2);
+    const auto s0 = reg.resolve_slot(0, t0, p0, -1, "a", "");
+    const auto s1 = reg.resolve_slot(1, t1, p1, -1, "b", "");
+    const auto s2 = reg.resolve_slot(2, t2, p2, -1, "c", "");
+    if (s0.seq < 0 || s1.seq < 0 || s2.seq < 0) {
         t.assert_true(lane + ": every retained turn is snapshotted", false);
         return;
     }
     t.assert_true(lane + ": the retained sequences are distinct",
-                  s0 != s1 && s1 != s2 && s0 != s2);
-    t.assert_equal(lane + ": three retained turns are held", 3, arena.n_snapshots());
+                  s0.seq != s1.seq && s1.seq != s2.seq && s0.seq != s2.seq);
+    t.assert_equal(lane + ": three retained turns are held", 3, reg.n_snapshots());
 
     // each retained turn keeps its own tag and position
-    const llama_decision::session_snapshot * a = arena.find(0);
-    const llama_decision::session_snapshot * b = arena.find(1);
-    const llama_decision::session_snapshot * c = arena.find(2);
-    t.assert_true(lane + ": every slot holds a snapshot", a != nullptr && b != nullptr && c != nullptr);
+    const llama_decision::decision_session * a = reg.find_by_slot(0);
+    const llama_decision::decision_session * b = reg.find_by_slot(1);
+    const llama_decision::decision_session * c = reg.find_by_slot(2);
+    t.assert_true(lane + ": every slot holds a reference", a != nullptr && b != nullptr && c != nullptr);
     if (a != nullptr) {
         t.assert_equal(lane + ": the retained tag survives", std::string("a"), a->turn);
     }
     t.assert_equal(lane + ": the retained position survives", (long long) t1.size(),
-                   b != nullptr ? (long long) b->pos : -1);
+                   b != nullptr ? (long long) b->capture.pos : -1);
 
     // releasing one turn leaves the others intact
-    arena.release(1);
-    t.assert_true(lane + ": the released turn is gone", arena.find(1) == nullptr);
-    t.assert_true(lane + ": the other turns stay", arena.find(0) != nullptr && arena.find(2) != nullptr);
-    t.assert_equal(lane + ": one release is counted", 1, arena.n_releases());
+    reg.on_slot_release(1);
+    t.assert_true(lane + ": the released turn is gone", reg.find_by_slot(1) == nullptr);
+    t.assert_true(lane + ": the other turns stay", reg.find_by_slot(0) != nullptr && reg.find_by_slot(2) != nullptr);
+    t.assert_equal(lane + ": one release is counted", 1, reg.n_releases());
     // the snapshot counter is the cumulative fire count (M5), so it keeps the total taken
-    t.assert_equal(lane + ": the fire count keeps the snapshots taken", 3, arena.n_snapshots());
+    t.assert_equal(lane + ": the fire count keeps the snapshots taken", 3, reg.n_snapshots());
 }
 
-// A decision never writes to the source slot: the snapshot serializes and restores owned copies,
+// A decision never writes to the source slot: the reference serializes and restores owned copies,
 // and scoring a fork from the arena sequence must not touch the transcript's cells.
-static void session_arena_source_invariance_run(testing & t, llama_context * ctx, const std::string & lane) {
+static void session_registry_source_invariance_run(testing & t, llama_context * ctx, const std::string & lane) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const auto transcript = common_tokenize(vocab, "the transcript that must never be written", false, true);
@@ -3169,10 +3192,11 @@ static void session_arena_source_invariance_run(testing & t, llama_context * ctx
     llama_synchronize(ctx);
     const std::vector<uint8_t> before = seq_state_dump(ctx, 0);
 
-    llama_decision::session_arena arena(ctx, 6, 2, 4);
-    const llama_seq_id snap_seq = arena.snapshot(0, 0, (llama_pos) transcript.size(), "");
-    t.assert_true(lane + ": the snapshot is taken", snap_seq >= 0);
-    t.assert_true(lane + ": the snapshot does not write the source", before == seq_state_dump(ctx, 0));
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    const llama_seq_id snap_seq = reg.resolve_slot(0, transcript, pos_max, -1, "", "").seq;
+    t.assert_true(lane + ": the reference is taken", snap_seq >= 0);
+    t.assert_true(lane + ": the reference does not write the source", before == seq_state_dump(ctx, 0));
 
     // a decision fork continues on the arena sequence; the source stays untouched
     if (!t.assert_true(lane + ": the fork decodes on the arena sequence",
@@ -3183,10 +3207,10 @@ static void session_arena_source_invariance_run(testing & t, llama_context * ctx
     t.assert_true(lane + ": scoring a fork never writes the source", before == seq_state_dump(ctx, 0));
 }
 
-// The turn identity and advance policy: a snapshot is current only at its captured position, a
-// cleared slot keeps the snapshot current, and an advanced turn must discard it. These are the
+// The turn identity and advance policy: a reference is current only at its captured position, a
+// cleared slot keeps the reference current, and an advanced turn must discard it. These are the
 // exact counters the cost heuristic is calibrated against.
-static void session_arena_turn_policy_run(testing & t, llama_context * ctx, const std::string & lane) {
+static void session_registry_turn_policy_run(testing & t, llama_context * ctx, const std::string & lane) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const auto t0 = common_tokenize(vocab, "the first turn", false, true);
@@ -3195,47 +3219,50 @@ static void session_arena_turn_policy_run(testing & t, llama_context * ctx, cons
         t.skip(lane + ": the model has no usable tokens");
         return;
     }
-    llama_decision::session_arena arena(ctx, 6, 2, 4);
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
 
     // control group: turns that are never queried produce zero snapshots and zero arena reuses
-    t.assert_equal(lane + ": no snapshots before any query", 0, arena.n_snapshots());
-    t.assert_equal(lane + ": no reuses before any query", 0, arena.n_reuses());
+    t.assert_equal(lane + ": no snapshots before any query", 0, reg.n_snapshots());
+    t.assert_equal(lane + ": no reuses before any query", 0, reg.n_reuses());
 
     // fire group: one turn queried N times takes exactly one snapshot and N-1 reuses
-    const llama_seq_id snap_seq = session_arena_prepare(ctx, arena, 0, t0, "turn-a", t, lane);
+    const llama_seq_id snap_seq = session_registry_prepare(ctx, reg, 0, t0, "turn-a", t, lane);
     if (snap_seq < 0) {
         return;
     }
-    const llama_decision::session_snapshot * snap = arena.find(0);
-    t.assert_true(lane + ": the retained turn is current at its position",
-                  snap != nullptr && llama_decision::session_arena::snapshot_is_current(snap, snap->pos));
+    const llama_decision::decision_session * snap = reg.find_by_slot(0);
+    const llama_pos pos_max = (llama_pos) t0.size() - 1;
+    t.assert_true(lane + ": the retained turn is current for its own content",
+                  snap != nullptr && reg.is_current(snap, t0, ""));
     t.assert_true(lane + ": a cleared slot keeps the snapshot current",
-                  llama_decision::session_arena::snapshot_is_current(snap, -1));
-    t.assert_true(lane + ": an advanced slot makes the snapshot stale",
-                  !llama_decision::session_arena::snapshot_is_current(snap, snap->pos + 1));
+                  snap != nullptr && reg.is_current(snap, {}, ""));
+    const auto t1_diff = common_tokenize(llama_model_get_vocab(model), "a different turn body", false, true);
+    t.assert_true(lane + ": different content of the same turn is stale",
+                  snap != nullptr && !t1_diff.empty() && !reg.is_current(snap, t1_diff, ""));
     const int n_reuse = 3;
     for (int i = 0; i < n_reuse; ++i) {
-        t.assert_equal(lane + ": the reuse returns the arena sequence", snap_seq, arena.reuse(0));
+        const auto r = reg.resolve_slot(0, t0, pos_max, -1, "turn-a", "");
+        t.assert_equal(lane + ": the reuse returns the arena sequence", snap_seq, r.seq);
     }
-    t.assert_equal(lane + ": one turn queried N times takes one snapshot", 1, arena.n_snapshots());
-    t.assert_equal(lane + ": one turn queried N times takes N-1 reuses", n_reuse, arena.n_reuses());
+    t.assert_equal(lane + ": one turn queried N times takes one snapshot", 1, reg.n_snapshots());
+    t.assert_equal(lane + ": one turn queried N times takes N-1 reuses", n_reuse, reg.n_reuses());
 
-    // turn advance: the slot decoded a new turn, so the retained snapshot is discarded before the
+    // turn advance: the slot decoded a new turn, so the retained reference is discarded before the
     // next decision
     llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
     if (!t.assert_true(lane + ": the next turn decodes", decode_tokens_on(ctx, 0, 0, t1))) {
         return;
     }
     llama_synchronize(ctx);
-    arena.release(0);
-    t.assert_true(lane + ": the advanced turn discards the previous snapshot", arena.find(0) == nullptr);
-    t.assert_equal(lane + ": one discard is counted", 1, arena.n_releases());
+    reg.on_slot_release(0);
+    t.assert_true(lane + ": the advanced turn discards the previous snapshot", reg.find_by_slot(0) == nullptr);
+    t.assert_equal(lane + ": one discard is counted", 1, reg.n_releases());
 }
 
 // The per-turn cost is a measured number: snapshot bytes grow with the transcript length and the
 // save/restore time is finite and positive. The recorded values are the cost calibration, reported
 // per model, never a gate.
-static void session_arena_cost_run(testing & t, llama_context * ctx, const std::string & lane) {
+static void session_registry_cost_run(testing & t, llama_context * ctx, const std::string & lane) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const auto fill = common_tokenize(vocab, "the transcript filler for the cost measurement ", false, true);
@@ -3243,7 +3270,7 @@ static void session_arena_cost_run(testing & t, llama_context * ctx, const std::
         t.skip(lane + ": the model has no usable tokens");
         return;
     }
-    llama_decision::session_arena arena(ctx, 6, 4, 4);
+    llama_decision::session_registry reg(ctx, 6, 4, 4);
 
     size_t last_bytes = 0;
     int    len_toks   = 0;
@@ -3259,30 +3286,222 @@ static void session_arena_cost_run(testing & t, llama_context * ctx, const std::
             return;
         }
         llama_synchronize(ctx);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
         const auto t0 = std::chrono::steady_clock::now();
-        const llama_seq_id snap = arena.snapshot(0, 0, (llama_pos) transcript.size(), "");
+        const auto res = reg.resolve_slot(0, transcript, pos_max, -1, "", "");
         const auto t1 = std::chrono::steady_clock::now();
-        if (snap < 0) {
+        if (res.seq < 0) {
             t.assert_true(lane + ": the cost snapshot is taken", false);
             return;
         }
-        const llama_decision::session_snapshot * s = arena.find(0);
+        const llama_decision::decision_session * s = reg.find_by_slot(0);
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        t.assert_true(lane + ": the snapshot bytes are recorded", s != nullptr && s->n_bytes > 0);
+        t.assert_true(lane + ": the snapshot bytes are recorded", s != nullptr && s->capture.n_bytes > 0);
         t.assert_true(lane + ": the snapshot time is finite and positive", ms > 0.0);
         t.assert_true(lane + ": a longer transcript snapshots at least as many bytes",
-                      s == nullptr || s->n_bytes >= last_bytes);
+                      s == nullptr || s->capture.n_bytes >= last_bytes);
         fprintf(stderr, "%s session arena cost: %d tokens -> %zu bytes in %.3f ms\n",
-                lane.c_str(), (int) transcript.size(), s != nullptr ? s->n_bytes : 0, ms);
-        last_bytes = s != nullptr ? s->n_bytes : last_bytes;
+                lane.c_str(), (int) transcript.size(), s != nullptr ? s->capture.n_bytes : 0, ms);
+        last_bytes = s != nullptr ? s->capture.n_bytes : last_bytes;
         len_toks   = (int) transcript.size();
-        arena.release(0);
+        reg.on_slot_release(0);
     }
     t.assert_true(lane + ": the cost measurement grew the transcript", len_toks > 0);
 }
 
-static void test_session_arena(testing & t) {
-    t.test("the session arena keeps owned turn snapshots on the CPU model", [](testing & t) {
+// The registry is the single lifecycle authority: releasing one slot frees exactly that slot's
+// reference while the others stay, and a memory-epoch notification makes every retained reference
+// stale: a resolve after the bump is refused, never answered from the old turn.
+static void session_registry_release_epoch_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0 = common_tokenize(vocab, "the slot-zero retained turn", false, true);
+    const auto t1 = common_tokenize(vocab, "the slot-one retained turn", false, true);
+    if (t0.empty() || t1.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": turn 0 decodes", decode_tokens_on(ctx, 0, 0, t0)) ||
+        !t.assert_true(lane + ": turn 1 decodes", decode_tokens_on(ctx, 1, 0, t1))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_pos p0 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    const llama_pos p1 = llama_memory_seq_pos_max(llama_get_memory(ctx), 1);
+    const auto s0 = reg.resolve_slot(0, t0, p0, -1, "", "");
+    const auto s1 = reg.resolve_slot(1, t1, p1, -1, "", "");
+    t.assert_true(lane + ": both slots capture", s0.seq >= 0 && s1.seq >= 0 && s0.seq != s1.seq);
+    if (s0.seq < 0 || s1.seq < 0) {
+        return;
+    }
+
+    // releasing slot 1 frees exactly its reference; slot 0 is untouched
+    reg.on_slot_release(1);
+    t.assert_true(lane + ": the released slot holds no reference", reg.find_by_slot(1) == nullptr);
+    t.assert_true(lane + ": the other slot keeps its reference", reg.find_by_slot(0) != nullptr);
+    const auto r0 = reg.resolve_slot(0, t0, p0, -1, "", "");
+    t.assert_equal(lane + ": the kept reference still resolves", s0.seq, r0.seq);
+    t.assert_equal(lane + ": one release is counted", 1, reg.n_releases());
+
+    // a memory-epoch bump makes the retained reference stale: the next resolve is refused with the
+    // distinct stale outcome (the route maps it to 409), never a semantic error and never an answer
+    // from the pre-bump turn
+    reg.on_memory_epoch(1);
+    bool stale = false, semantic = false;
+    try {
+        reg.resolve_slot(0, t0, p0, -1, "", "");
+    } catch (const llama_decision::stale_error & e) {
+        stale = true;
+    } catch (const llama_decision::semantic_error & e) {
+        semantic = true;
+    }
+    t.assert_true(lane + ": a resolve after the epoch bump is the stale outcome, not a semantic error",
+                  stale && !semantic);
+}
+
+// Reference integrity: a capture records the epoch at capture, and a resolve never serves a
+// capture across an epoch bump. The stale outcome is distinct from semantic_error (the route maps
+// it to 409, never 422), the source slot is untouched through the bump, and a fresh capture at the
+// new epoch is served normally. A first-class session and an id_slot reference behave the same.
+static void session_registry_epoch_stale_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0 = common_tokenize(vocab, "the epoch-stale retained turn", false, true);
+    const auto t1 = common_tokenize(vocab, "the epoch-stale follow-up turn", false, true);
+    if (t0.empty() || t1.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the first turn decodes", decode_tokens_on(ctx, 0, 0, t0))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_pos p0 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    const auto s0 = reg.resolve_slot(0, t0, p0, -1, "", "");
+    t.assert_true(lane + ": the turn is captured at epoch 0", s0.seq >= 0);
+    if (s0.seq < 0) {
+        return;
+    }
+    const llama_decision::decision_session * captured = reg.find_by_slot(0);
+    t.assert_equal(lane + ": the capture records the capture epoch", 0ull,
+                   captured != nullptr ? captured->capture.epoch : (uint64_t) -1);
+
+    // the source slot state is the invariance reference through the bump
+    const std::vector<uint8_t> src_before = seq_state_dump(ctx, 0);
+
+    // a simulated whole-context reset bumps the epoch; the retained reference is now stale
+    reg.on_memory_epoch(1);
+
+    // the stale outcome is distinct from semantic_error, and the source is untouched
+    bool stale = false, semantic = false;
+    try {
+        reg.resolve_slot(0, t0, p0, -1, "", "");
+    } catch (const llama_decision::stale_error & e) {
+        stale = true;
+    } catch (const llama_decision::semantic_error & e) {
+        semantic = true;
+    }
+    t.assert_true(lane + ": a stale epoch reference is refused with the stale outcome", stale);
+    t.assert_true(lane + ": the stale outcome is never a semantic_error", !semantic);
+    t.assert_true(lane + ": the source slot is untouched through the epoch bump",
+                  src_before == seq_state_dump(ctx, 0));
+
+    // a first-class session captured before the bump goes stale the same way
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    if (!t.assert_true(lane + ": the second turn decodes", decode_tokens_on(ctx, 0, 0, t1))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    reg.on_slot_release(0);
+    const std::string sid = reg.create({ 0, t1, "", "turn-epoch", {} });
+    t.assert_true(lane + ": the session is created at the new epoch",
+                  reg.find(sid) != nullptr && reg.find(sid)->capture.epoch == 1);
+    const auto r0 = reg.resolve(sid, t1, "");
+    t.assert_true(lane + ": a session captured at the current epoch resolves", r0.seq >= 0);
+
+    // bump again: the first-class session is stale, never answered from the old turn
+    const std::vector<uint8_t> src_epoch1 = seq_state_dump(ctx, 0);
+    reg.on_memory_epoch(2);
+    bool sid_stale = false, sid_semantic = false;
+    try {
+        reg.resolve(sid, t1, "");
+    } catch (const llama_decision::stale_error & e) {
+        sid_stale = true;
+    } catch (const llama_decision::semantic_error & e) {
+        sid_semantic = true;
+    }
+    t.assert_true(lane + ": a first-class session is stale after a second bump", sid_stale);
+    t.assert_true(lane + ": the session stale outcome is never a semantic_error", !sid_semantic);
+    t.assert_true(lane + ": the source slot is untouched through the second bump",
+                  src_epoch1 == seq_state_dump(ctx, 0));
+}
+// whose state is byte-identical to the source on the CPU lane, the guarantee the pre-refactor arena
+// proved. The store interface is exercised directly, not through the registry.
+static void host_state_store_dispatch_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the dispatch-equivalence transcript", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    auto arena = llama_decision::make_session_arena(6, 2);
+    llama_decision::session_store_config cfg;
+    cfg.ctx   = ctx;
+    cfg.arena = arena.get();
+    auto store = llama_decision::make_session_store(llama_decision::session_backend::host, cfg);
+    t.assert_true(lane + ": the host store is selectable", store != nullptr);
+    if (!store) {
+        return;
+    }
+    llama_decision::capture_request req;
+    req.src      = 0;
+    req.base_pos = (llama_pos) transcript.size();
+    req.dst      = arena->alloc();
+    llama_decision::capture_handle h;
+    t.assert_true(lane + ": the host store captures", store->capture(req, h));
+    if (h.resident_seq < 0) {
+        return;
+    }
+    llama_seq_id seq = -1;
+    t.assert_true(lane + ": the host store materializes", store->materialize(h, seq));
+    t.assert_equal(lane + ": the materialized sequence is the resident one", h.resident_seq, seq);
+
+    // byte-exact through a normalized scratch sequence on the CPU lane; the physical cell placement
+    // can differ on the GPU, so the byte-exact guarantee is the CPU lane only
+    if (lane == "cpu") {
+        // dump both while live: normalize_seq_state clears the cache, which would wipe the
+        // captured sequence's cells
+        const std::vector<uint8_t> src_state = seq_state_dump(ctx, 0);
+        const std::vector<uint8_t> mat_state = seq_state_dump(ctx, seq);
+        const auto src = normalize_seq_state(ctx, src_state, 8);
+        const auto mat = normalize_seq_state(ctx, mat_state, 8);
+        std::string detail;
+        const size_t diff = state_bytes_diff(src, mat, &detail);
+        t.assert_equal(lane + ": the materialized state is byte-exact", 0ull, diff);
+    }
+
+    // releasing frees the sequence cells; the handle is inert and the arena slot returns to the pool
+    store->release(h);
+    t.assert_equal(lane + ": the released handle is inert", -1, h.resident_seq);
+    arena->free_seq(req.dst);
+    llama_decision::capture_handle h2;
+    t.assert_true(lane + ": the freed sequence captures again", store->capture(req, h2));
+    store->release(h2);
+    arena->free_seq(req.dst);
+}
+
+static void test_session_registry(testing & t) {
+    t.test("the session registry keeps owned turn references on the CPU model", [](testing & t) {
         const std::string path = decision_cpu_model_path();
         if (path.empty()) {
             t.skip("no generated model; run the generate-models fixture");
@@ -3294,18 +3513,21 @@ static void test_session_arena(testing & t) {
             return;
         }
         try {
-            session_arena_after_clear_run(t, te.ctx, "cpu");
-            session_arena_restore_fidelity_run(t, te.ctx, "cpu");
-            session_arena_multi_snapshot_run(t, te.ctx, "cpu");
-            session_arena_source_invariance_run(t, te.ctx, "cpu");
-            session_arena_turn_policy_run(t, te.ctx, "cpu");
-            session_arena_cost_run(t, te.ctx, "cpu");
+            session_registry_after_clear_run(t, te.ctx, "cpu");
+            session_registry_restore_fidelity_run(t, te.ctx, "cpu");
+            session_registry_multi_snapshot_run(t, te.ctx, "cpu");
+            session_registry_source_invariance_run(t, te.ctx, "cpu");
+            session_registry_turn_policy_run(t, te.ctx, "cpu");
+            session_registry_cost_run(t, te.ctx, "cpu");
+            session_registry_release_epoch_run(t, te.ctx, "cpu");
+            session_registry_epoch_stale_run(t, te.ctx, "cpu");
+            host_state_store_dispatch_run(t, te.ctx, "cpu");
         } catch (const std::exception & e) {
-            t.assert_true(std::string("the CPU session arena: ") + e.what(), false);
+            t.assert_true(std::string("the CPU session registry: ") + e.what(), false);
         }
     });
 
-    t.test("the session arena keeps owned turn snapshots on the GPU model", [](testing & t) {
+    t.test("the session registry keeps owned turn references on the GPU model", [](testing & t) {
         const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
         if (!gpu_model_ready(t, path)) {
             return;
@@ -3316,14 +3538,1680 @@ static void test_session_arena(testing & t) {
             return;
         }
         try {
-            session_arena_after_clear_run(t, te.ctx, "gpu");
-            session_arena_restore_fidelity_run(t, te.ctx, "gpu");
-            session_arena_multi_snapshot_run(t, te.ctx, "gpu");
-            session_arena_source_invariance_run(t, te.ctx, "gpu");
-            session_arena_turn_policy_run(t, te.ctx, "gpu");
-            session_arena_cost_run(t, te.ctx, "gpu");
+            session_registry_after_clear_run(t, te.ctx, "gpu");
+            session_registry_restore_fidelity_run(t, te.ctx, "gpu");
+            session_registry_multi_snapshot_run(t, te.ctx, "gpu");
+            session_registry_source_invariance_run(t, te.ctx, "gpu");
+            session_registry_turn_policy_run(t, te.ctx, "gpu");
+            session_registry_cost_run(t, te.ctx, "gpu");
+            session_registry_release_epoch_run(t, te.ctx, "gpu");
+            session_registry_epoch_stale_run(t, te.ctx, "gpu");
+            host_state_store_dispatch_run(t, te.ctx, "gpu");
         } catch (const std::exception & e) {
-            t.assert_true(std::string("the GPU session arena: ") + e.what(), false);
+            t.assert_true(std::string("the GPU session registry: ") + e.what(), false);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- session handles
+
+// The stale-turn regression (B1): a decision that pins a captured turn must be refused after the
+// slot is cleared and re-prefilled with a different transcript of the same length, instead of
+// silently answering about the old turn. The position-only check cannot catch this (the length and
+// therefore the position are identical); the content-hash identity can.
+static void session_registry_stale_turn_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0  = common_tokenize(vocab, "the first completed chat turn", false, true);
+    const auto pad = common_tokenize(vocab, "x", false, false);
+    auto t1 = common_tokenize(vocab, "a different transcript body", false, true);
+    if (t0.empty() || t1.empty() || pad.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    // force the two transcripts to the same length so a position check cannot tell them apart
+    while (t1.size() < t0.size()) {
+        t1.insert(t1.end(), pad.begin(), pad.end());
+    }
+    t1.resize(t0.size());
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the first turn decodes", decode_tokens_on(ctx, 0, 0, t0))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    const auto snap = reg.resolve_slot(0, t0, pos_max, -1, "turn-1", "");
+    t.assert_true(lane + ": the turn is captured", snap.seq >= 0);
+
+    // clear the slot and re-prefill a different transcript of the same length
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    if (!t.assert_true(lane + ": the different turn decodes", decode_tokens_on(ctx, 0, 0, t1))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    // a decision that pins the captured turn is refused, never answered about the new content
+    bool refused = false;
+    try {
+        reg.resolve_slot(0, t1, pos_max, -1, "turn-1", "");
+    } catch (const llama_decision::semantic_error & e) {
+        refused = true;
+    }
+    t.assert_true(lane + ": a stale pinned turn is refused after a same-length re-prefill", refused);
+    t.assert_true(lane + ": the refusal keeps the retained reference intact", reg.find_by_slot(0) != nullptr);
+}
+
+// A first-class session is refused (never silently re-captured) when its source content changes.
+static void session_registry_pinned_stale_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0  = common_tokenize(vocab, "the captured turn for a session handle", false, true);
+    const auto pad = common_tokenize(vocab, "x", false, false);
+    auto t1 = common_tokenize(vocab, "the slot now holds new content", false, true);
+    if (t0.empty() || t1.empty() || pad.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    while (t1.size() < t0.size()) {
+        t1.insert(t1.end(), pad.begin(), pad.end());
+    }
+    t1.resize(t0.size());
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the captured turn decodes", decode_tokens_on(ctx, 0, 0, t0))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const std::string sid = reg.create({ 0, t0, "", "turn-1", {} });
+    t.assert_true(lane + ": the session handle is issued", !sid.empty() && reg.find(sid) != nullptr);
+    const auto r0 = reg.resolve(sid, t0, "");
+    t.assert_true(lane + ": the created session resolves", r0.seq >= 0);
+
+    // same-length different content: the first-class session is refused, never re-captured
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    if (!t.assert_true(lane + ": the new content decodes", decode_tokens_on(ctx, 0, 0, t1))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    bool refused = false;
+    try {
+        reg.resolve(sid, t1, "");
+    } catch (const llama_decision::semantic_error & e) {
+        refused = true;
+    }
+    t.assert_true(lane + ": a first-class session is refused when its content changes", refused);
+    t.assert_true(lane + ": the refused session still exists", reg.find(sid) != nullptr);
+}
+
+// Adapter scope is part of the turn identity: a captured turn under one adapter scope is refused
+// under a different scope, even when the content is identical.
+static void session_registry_adapter_scope_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the adapter-scoped retained turn", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    const auto r = reg.resolve_slot(0, transcript, pos_max, -1, "", "adapter-a");
+    t.assert_true(lane + ": the adapter-scoped turn is captured", r.seq >= 0);
+
+    bool refused = false;
+    try {
+        reg.resolve_slot(0, transcript, pos_max, -1, "", "adapter-b");
+    } catch (const llama_decision::semantic_error & e) {
+        refused = true;
+    }
+    t.assert_true(lane + ": a different adapter scope is refused", refused);
+    t.assert_true(lane + ": the retained reference survives the scope refusal", reg.find_by_slot(0) != nullptr);
+}
+
+// The first-class session lifecycle: create/query/pin/ttl/erase, with a lazy capture on the first
+// resolve and a reuse on the repeat.
+static void session_registry_lifecycle_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the session lifecycle transcript", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    // create: the default policy captures on the first resolve, not at create
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = transcript;
+    req.adapter_scope = "";
+    req.turn     = "turn-life";
+    const std::string sid = reg.create(req);
+    t.assert_true(lane + ": create issues a session handle", !sid.empty());
+    const llama_decision::decision_session * sess = reg.find(sid);
+    t.assert_true(lane + ": the session is findable", sess != nullptr);
+    t.assert_true(lane + ": the default policy is not captured at create",
+                  sess != nullptr && !sess->captured);
+    t.assert_equal(lane + ": the session is bound to its slot", 0, sess != nullptr ? sess->id_slot : -1);
+
+    // query: the first resolve captures lazily and materializes a forkable sequence
+    const auto r0 = reg.resolve(sid, transcript, "");
+    t.assert_true(lane + ": the first resolve captures and materializes", r0.seq >= 0);
+    t.assert_equal(lane + ": the resolve echoes the session id", sid, r0.session_id);
+    t.assert_equal(lane + ": the resolve echoes the retained turn", std::string("turn-life"), r0.turn);
+
+    // repeat query: a reuse returns the same owned sequence
+    const auto r1 = reg.resolve(sid, transcript, "");
+    t.assert_equal(lane + ": a repeat resolve reuses the owned sequence", r0.seq, r1.seq);
+
+    // pin and ttl
+    t.assert_true(lane + ": patch applies the pin and ttl", reg.patch(sid, true, true, true, 5000));
+    const llama_decision::decision_session * patched = reg.find(sid);
+    t.assert_true(lane + ": the pin is recorded", patched != nullptr && patched->policy.pinned);
+    t.assert_equal(lane + ": the ttl is recorded", (long long) 5000,
+                   patched != nullptr ? (long long) patched->policy.ttl_ms : -1);
+
+    // erase
+    t.assert_true(lane + ": erase releases the session", reg.erase(sid));
+    t.assert_true(lane + ": the erased session is gone", reg.find(sid) == nullptr);
+    t.assert_equal(lane + ": one session was counted and released", (long long) 0, (long long) reg.n_sessions());
+    t.assert_true(lane + ": erasing an unknown session reports failure", !reg.erase("ses_nope"));
+
+    // the clone backend is selectable on a capable model (dense unified attention or
+    // recurrent/hybrid, never SWA) and refused only on an incapable one; the file backend needs a
+    // writable directory and is refused without one, never degraded
+    llama_decision::session_create_request clone_req = req;
+    clone_req.policy.backend = llama_decision::session_backend::clone;
+    if (llama_decision::clone_backend_capable(llama_get_model(ctx))) {
+        const std::string cid = reg.create(clone_req);
+        t.assert_true(lane + ": the clone backend is selectable on a capable model", !cid.empty());
+        t.assert_true(lane + ": the clone session erases", reg.erase(cid));
+    } else {
+        bool unsupported = false;
+        try {
+            reg.create(clone_req);
+        } catch (const llama_decision::unsupported_error & e) {
+            unsupported = true;
+        }
+        t.assert_true(lane + ": an incapable model refuses the clone backend at create", unsupported);
+    }
+    llama_decision::session_create_request file_req = req;
+    file_req.policy.backend = llama_decision::session_backend::file;
+    bool file_unsupported = false;
+    try {
+        reg.create(file_req);
+    } catch (const llama_decision::unsupported_error & e) {
+        file_unsupported = true;
+    }
+    t.assert_true(lane + ": the file backend is refused without a writable directory", file_unsupported);
+}
+
+// A created session survives cache_idle_slots clears of every slot: the owned reference outlives
+// the origin's KV being freed, because it lives in the reserved arena sequence.
+static void session_registry_idle_clear_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the turn that survives an idle clear", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    // eager capture at create: the turn is complete, so the session owns its state immediately
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = transcript;
+    req.policy.capture_on_turn_complete = true;
+    const std::string sid = reg.create(req);
+    t.assert_true(lane + ": the eager session captures at create",
+                  reg.find(sid) != nullptr && reg.find(sid)->captured);
+
+    // cache_idle_slots clears every slot's KV without releasing the session
+    for (int slot = 0; slot < 4; ++slot) {
+        llama_memory_seq_rm(llama_get_memory(ctx), slot, -1, -1);
+    }
+
+    // the owned reference still resolves: the cleared slot has no content to compare, so the
+    // session is served from its arena sequence
+    const auto r = reg.resolve(sid, {}, "");
+    t.assert_true(lane + ": the created session survives idle clears of every slot", r.seq >= 0);
+}
+
+// ---------------------------------------------------------------- clone backend
+
+// The clone backend is a metadata-only cell reference: capture shares the source's cells with the
+// resident sequence (plus an owned partial copy for recurrent/hybrid layers), so its decision view
+// must equal a full owned copy. The runs below reuse the fork-oracle equivalence, the source
+// invariance, the context-shift stress, and the capability matrix.
+
+// Clone vs host equivalence through the real solver: a clone-backed session and a host-backed
+// session of the same transcript must produce the same decision, byte-exact on the CPU lane and
+// producer-bound on the GPU lane. This is the fork-oracle reuse: a clone branch equals a full
+// restore branch.
+static void session_clone_oracle_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (!llama_decision::clone_backend_capable(model)) {
+        t.skip(lane + ": the model is not clone-capable");
+        return;
+    }
+    const auto transcript = common_tokenize(vocab, "the clone fork oracle transcript", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    // the engine pool sits above the slots; the registry arena sits above the engine pool
+    llama_decision::session_registry reg(ctx, 12, 2, 4);
+    llama_decision::engine             eng(ctx, 4, 8);
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes on the clone slot", decode_tokens_on(ctx, 0, 0, transcript)) ||
+        !t.assert_true(lane + ": the transcript decodes on the host slot", decode_tokens_on(ctx, 1, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    // clone capture on slot 0, host capture on slot 1, both eager so the reference exists before
+    // the solver runs
+    llama_decision::session_create_request creq;
+    creq.id_slot  = 0;
+    creq.prefix   = transcript;
+    creq.policy.backend = llama_decision::session_backend::clone;
+    creq.policy.capture_on_turn_complete = true;
+    const std::string cid = reg.create(creq);
+    t.assert_true(lane + ": the clone session creates", !cid.empty());
+    llama_decision::session_create_request hreq;
+    hreq.id_slot  = 1;
+    hreq.prefix   = transcript;
+    hreq.policy.capture_on_turn_complete = true;
+    const std::string hid = reg.create(hreq);
+    t.assert_true(lane + ": the host session creates", !hid.empty());
+    const llama_decision::decision_session * csess = reg.find(cid);
+    const llama_decision::decision_session * hsess = reg.find(hid);
+    t.assert_true(lane + ": the clone is captured", csess != nullptr && csess->captured);
+    t.assert_true(lane + ": the host is captured", hsess != nullptr && hsess->captured);
+    if (csess == nullptr || hsess == nullptr) {
+        return;
+    }
+
+    llama_decision::options opt;
+    opt.mode = "tree";
+    opt.fork = "auto"; // copy on dense, hybrid on recurrent/hybrid: the solver's own choice
+    const std::vector<llama_decision::field_input> fields = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y" } },
+    };
+    const auto plan = eng.compile_fields(fields, opt);
+
+    const llama_pos pos = (llama_pos) transcript.size();
+    llama_decision::batch_result bc;
+    llama_decision::batch_result bh;
+    try {
+        bc = eng.decide_batch_from_seq(csess->capture.resident_seq, pos, plan, opt);
+    } catch (const std::exception & e) {
+        t.assert_true(std::string(lane + ": the clone-backed decision runs: ") + e.what(), false);
+        return;
+    }
+    try {
+        bh = eng.decide_batch_from_seq(hsess->capture.resident_seq, pos, plan, opt);
+    } catch (const std::exception & e) {
+        t.assert_true(std::string(lane + ": the host-backed decision runs: ") + e.what(), false);
+        return;
+    }
+    if (bc.items.empty() || bh.items.empty()) {
+        t.assert_true(lane + ": both decisions produce items", false);
+        return;
+    }
+    const double bound = lane == "gpu" ? 5e-2 : 0.0;
+    for (size_t f = 0; f < bc.items[0].fields.size() && f < bh.items[0].fields.size(); ++f) {
+        const auto & fc = bc.items[0].fields[f];
+        const auto & fh = bh.items[0].fields[f];
+        t.assert_true(lane + ": the clone and host winners agree on field " + std::to_string(f),
+                      fc.winner == fh.winner);
+        if (fc.probs.size() == fh.probs.size() && fc.probs.size() > 0) {
+            double delta = 0.0;
+            for (size_t i = 0; i < fc.probs.size(); ++i) {
+                delta = std::max(delta, (double) std::fabs(fc.probs[i] - fh.probs[i]));
+            }
+            t.assert_true(lane + ": the clone and host probabilities agree on field " +
+                              std::to_string(f) + " (delta " + std::to_string(delta) + ")",
+                          delta <= bound);
+        }
+    }
+
+    // the source slot and its shared cells are untouched by a clone-backed decision
+    t.assert_true(lane + ": the clone origin is not consumed by the decision",
+                  llama_memory_seq_pos_max(llama_get_memory(ctx), 0) >= pos - 1);
+}
+
+// The clone pins the origin's cells: a seq_rm of the origin leaves the shared cells intact, so the
+// reference resolves again with an empty prefix and continues from its captured position.
+static void session_clone_source_invariance_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (!llama_decision::clone_backend_capable(model)) {
+        t.skip(lane + ": the model is not clone-capable");
+        return;
+    }
+    const auto transcript = common_tokenize(vocab, "the clone source invariance turn", false, true);
+    const auto branch     = common_tokenize(vocab, "the continuing branch", false, true);
+    if (transcript.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = transcript;
+    req.policy.backend = llama_decision::session_backend::clone;
+    req.policy.capture_on_turn_complete = true;
+    const std::string sid = reg.create(req);
+    const llama_decision::decision_session * sess = reg.find(sid);
+    t.assert_true(lane + ": the clone is captured", sess != nullptr && sess->captured);
+    if (sess == nullptr || !sess->captured) {
+        return;
+    }
+    const llama_seq_id clone_seq = sess->capture.resident_seq;
+    const llama_pos    pos_before = llama_memory_seq_pos_max(llama_get_memory(ctx), clone_seq);
+
+    // a seq_rm of the origin does not free the shared cells the clone references
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    t.assert_equal(lane + ": the origin clear leaves the clone's cells pinned",
+                   pos_before, llama_memory_seq_pos_max(llama_get_memory(ctx), clone_seq));
+
+    // the reference resolves with an empty prefix (the cleared slot cannot have advanced) and
+    // continues from its captured position
+    const auto r = reg.resolve(sid, {}, "");
+    t.assert_true(lane + ": the clone survives an origin clear", r.seq >= 0);
+    const llama_pos pos = (llama_pos) transcript.size();
+    if (!t.assert_true(lane + ": the clone continues from its captured position",
+                       decode_tokens_on(ctx, clone_seq, pos, branch))) {
+        return;
+    }
+    llama_synchronize(ctx);
+}
+
+// A context shift on the origin moves the shared cells and rewrites the prompt. The registry must
+// refuse the stale reference (identity mismatch), never answer from the shifted cells.
+static void session_clone_shift_stress_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (!llama_decision::clone_backend_capable(model)) {
+        t.skip(lane + ": the model is not clone-capable");
+        return;
+    }
+    const auto transcript = common_tokenize(vocab, "a sufficiently long turn that a context shift can discard a middle span of it", false, true);
+    if (transcript.size() < 8) {
+        t.skip(lane + ": the transcript is too short to shift");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = transcript;
+    req.policy.backend = llama_decision::session_backend::clone;
+    req.policy.capture_on_turn_complete = true;
+    const std::string sid = reg.create(req);
+    t.assert_true(lane + ": the clone is captured",
+                  reg.find(sid) != nullptr && reg.find(sid)->captured);
+
+    // simulate the server's pre_decode shift: seq_rm the discarded span and, when the context can
+    // shift, also move the tail positions; the prompt is rewritten either way (pre_decode always
+    // rewrites the prompt, so a non-shiftable context still changes the slot content)
+    const int keep    = 2;
+    const int discard = 3;
+    const bool shiftable = llama_memory_can_shift(llama_get_memory(ctx));
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, keep, keep + discard);
+    if (shiftable) {
+        llama_memory_seq_add(llama_get_memory(ctx), 0, keep + discard, (llama_pos) transcript.size(), -discard);
+    }
+    std::vector<llama_token> shifted;
+    for (size_t i = 0; i < transcript.size(); ++i) {
+        if ((int) i >= keep && (int) i < keep + discard) {
+            continue;
+        }
+        shifted.push_back(transcript[i]);
+    }
+
+    // the shifted content is refused, never answered from the moved cells
+    bool refused = false;
+    try {
+        reg.resolve(sid, shifted, "");
+    } catch (const llama_decision::semantic_error & e) {
+        refused = true;
+    }
+    t.assert_true(lane + ": a context shift on the origin refuses the clone, never answers from shifted cells", refused);
+    t.assert_true(lane + ": the refused clone still exists", reg.find(sid) != nullptr);
+}
+
+// The capability matrix: clone is selectable exactly when clone_backend_capable says so; file needs
+// a writable directory; a refusal is an unsupported_error (a capability gate, never a read of a
+// producer concentration score). The clone pins the shared cells and returns its arena slot on
+// release.
+static void session_clone_capability_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the clone capability transcript", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = transcript;
+    req.policy.backend = llama_decision::session_backend::clone;
+    req.policy.capture_on_turn_complete = true;
+    const bool capable = llama_decision::clone_backend_capable(model);
+    if (capable) {
+        const std::string sid = reg.create(req);
+        t.assert_true(lane + ": clone is selectable on a capable model", !sid.empty());
+        const auto r = reg.resolve(sid, transcript, "");
+        t.assert_true(lane + ": the clone resolves", r.seq >= 0);
+        t.assert_equal(lane + ": the clone holds one arena sequence", 1ull, reg.arena_used());
+        // the clone pins the shared cells: an origin clear leaves them non-empty
+        llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+        t.assert_true(lane + ": the clone pins the origin's cells through a clear",
+                      llama_memory_seq_pos_max(llama_get_memory(ctx), r.seq) >= 0);
+        t.assert_true(lane + ": the clone session erases", reg.erase(sid));
+        t.assert_equal(lane + ": the erase returns the arena slot", 0ull, reg.arena_used());
+    } else {
+        bool unsupported = false;
+        try {
+            reg.create(req);
+        } catch (const llama_decision::unsupported_error & e) {
+            unsupported = true;
+        }
+        t.assert_true(lane + ": clone is refused on an incapable model", unsupported);
+    }
+
+    // the file backend is refused without a writable directory, regardless of the model
+    llama_decision::session_create_request freq;
+    freq.id_slot  = 0;
+    freq.prefix   = transcript;
+    freq.policy.backend = llama_decision::session_backend::file;
+    freq.policy.capture_on_turn_complete = true;
+    bool file_unsupported = false;
+    try {
+        reg.create(freq);
+    } catch (const llama_decision::unsupported_error & e) {
+        file_unsupported = true;
+    }
+    t.assert_true(lane + ": the file backend is refused without a writable directory", file_unsupported);
+}
+
+static void test_clone_backend(testing & t) {
+    t.test("the clone backend equals an owned copy on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 256, false, 128, 14)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_clone_oracle_run(t, te.ctx, "cpu");
+            session_clone_source_invariance_run(t, te.ctx, "cpu");
+            session_clone_shift_stress_run(t, te.ctx, "cpu");
+            session_clone_capability_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU clone backend: ") + e.what(), false);
+        }
+    });
+
+    t.test("the clone backend equals an owned copy on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path, 14)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_clone_oracle_run(t, te.ctx, "gpu");
+            session_clone_source_invariance_run(t, te.ctx, "gpu");
+            session_clone_shift_stress_run(t, te.ctx, "gpu");
+            session_clone_capability_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU clone backend: ") + e.what(), false);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- file backend
+
+// Each run gets its own temp directory, so parallel invocations cannot collide; the tests clean it
+// up on the way out. The registry only ever writes session state under this configured directory.
+static std::string file_backend_tmp_dir() {
+    static size_t counter = 0;
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("llama-decision-file-" + std::to_string(counter++));
+    std::filesystem::create_directories(dir);
+    return dir.string() + "/";
+}
+
+static void file_backend_rm_dir(const std::string & dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+static size_t count_session_files(const std::string & dir) {
+    size_t n = 0;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; it != end; it.increment(ec)) {
+        if (!ec) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+// The file backend keeps the turn state on disk under a writable directory. Its decision view must
+// equal the host backend's: the same winners and producer-bound probabilities, byte-exact on the
+// CPU lane. The store is exercised through the registry so the capture/materialize/release lifecycle
+// and the byte accounting run exactly as the server runs them.
+static void session_file_oracle_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the file fork oracle transcript", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const std::string file_dir = file_backend_tmp_dir();
+    llama_decision::session_registry reg(ctx, 12, 2, 4, 0, file_dir);
+    llama_decision::engine             eng(ctx, 4, 8);
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes on the file slot", decode_tokens_on(ctx, 0, 0, transcript)) ||
+        !t.assert_true(lane + ": the transcript decodes on the host slot", decode_tokens_on(ctx, 1, 0, transcript))) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    llama_synchronize(ctx);
+
+    llama_decision::session_create_request freq;
+    freq.id_slot  = 0;
+    freq.prefix   = transcript;
+    freq.policy.backend = llama_decision::session_backend::file;
+    freq.policy.capture_on_turn_complete = true;
+    const std::string fid = reg.create(freq);
+    t.assert_true(lane + ": the file session creates", !fid.empty());
+    llama_decision::session_create_request hreq;
+    hreq.id_slot  = 1;
+    hreq.prefix   = transcript;
+    hreq.policy.capture_on_turn_complete = true;
+    const std::string hid = reg.create(hreq);
+    t.assert_true(lane + ": the host session creates", !hid.empty());
+    const llama_decision::decision_session * fsess = reg.find(fid);
+    const llama_decision::decision_session * hsess = reg.find(hid);
+    t.assert_true(lane + ": the file is captured", fsess != nullptr && fsess->captured);
+    t.assert_true(lane + ": the host is captured", hsess != nullptr && hsess->captured);
+    if (fsess == nullptr || hsess == nullptr || !fsess->captured || !hsess->captured) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    // A file reference holds no arena sequence; its bytes live on disk, and the registry budget
+    // accounts them exactly.
+    t.assert_equal(lane + ": the file capture holds no arena sequence", -1, fsess->capture.resident_seq);
+    t.assert_true(lane + ": the file capture records disk bytes", fsess->capture.n_bytes > 0);
+    t.assert_true(lane + ": the file capture names a locator", !fsess->capture.locator.empty());
+    t.assert_true(lane + ": the capture wrote a file on disk", file_exists(fsess->capture.locator));
+    t.assert_equal(lane + ": the registry budget counts both captures",
+                   (long long) (fsess->capture.n_bytes + hsess->capture.n_bytes),
+                   (long long) reg.bytes());
+
+    llama_decision::options opt;
+    opt.mode = "tree";
+    opt.fork = "auto"; // the solver's own choice: copy on dense, hybrid on recurrent/hybrid
+    const std::vector<llama_decision::field_input> fields = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y" } },
+    };
+    const auto plan = eng.compile_fields(fields, opt);
+
+    llama_decision::batch_result bf;
+    llama_decision::batch_result bh;
+    try {
+        const auto rf = reg.resolve(fid, transcript, "");
+        const auto rh = reg.resolve(hid, transcript, "");
+        const llama_pos pos = (llama_pos) transcript.size();
+        bf = eng.decide_batch_from_seq(rf.seq, pos, plan, opt);
+        bh = eng.decide_batch_from_seq(rh.seq, pos, plan, opt);
+    } catch (const std::exception & e) {
+        t.assert_true(std::string(lane + ": the file- and host-backed decisions run: ") + e.what(), false);
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    if (bf.items.empty() || bh.items.empty()) {
+        t.assert_true(lane + ": both decisions produce items", false);
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    const double bound = lane == "gpu" ? 5e-2 : 0.0;
+    for (size_t f = 0; f < bf.items[0].fields.size() && f < bh.items[0].fields.size(); ++f) {
+        const auto & ff = bf.items[0].fields[f];
+        const auto & fh = bh.items[0].fields[f];
+        t.assert_true(lane + ": the file and host winners agree on field " + std::to_string(f),
+                      ff.winner == fh.winner);
+        if (ff.probs.size() == fh.probs.size() && ff.probs.size() > 0) {
+            double delta = 0.0;
+            for (size_t i = 0; i < ff.probs.size(); ++i) {
+                delta = std::max(delta, (double) std::fabs(ff.probs[i] - fh.probs[i]));
+            }
+            t.assert_true(lane + ": the file and host probabilities agree on field " + std::to_string(f) +
+                              " (delta " + std::to_string(delta) + ")",
+                          delta <= bound);
+        }
+    }
+
+    // releasing the file session removes the file and returns its bytes; the host capture keeps
+    // its own bytes until it too is released
+    const std::string floc      = fsess->capture.locator;
+    const size_t      host_bytes = hsess->capture.n_bytes;
+    t.assert_true(lane + ": the file session erases", reg.erase(fid));
+    t.assert_true(lane + ": erasing the file session removes its file", !file_exists(floc));
+    t.assert_equal(lane + ": erasing the file session leaves only the host bytes", (long long) host_bytes,
+                   (long long) reg.bytes());
+    t.assert_true(lane + ": the host session erases", reg.erase(hid));
+    t.assert_equal(lane + ": the byte budget is fully returned", 0ull, reg.bytes());
+    file_backend_rm_dir(file_dir);
+}
+
+// A file reference whose bytes vanish (missing or truncated) is a typed refusal, never a partial
+// answer: the decision route maps the materialization failure to a semantic error.
+static void session_file_missing_file_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the file turn whose bytes vanish", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const std::string file_dir = file_backend_tmp_dir();
+    llama_decision::session_registry reg(ctx, 12, 2, 4, 0, file_dir);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    llama_synchronize(ctx);
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = transcript;
+    req.policy.backend = llama_decision::session_backend::file;
+    req.policy.capture_on_turn_complete = true;
+    const std::string sid = reg.create(req);
+    const llama_decision::decision_session * sess = reg.find(sid);
+    t.assert_true(lane + ": the file is captured", sess != nullptr && sess->captured);
+    if (sess == nullptr || !sess->captured) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    const std::string locator = sess->capture.locator;
+    t.assert_true(lane + ": the capture wrote a file on disk", file_exists(locator));
+
+    // A missing state file is a typed refusal, never a partial answer.
+    std::remove(locator.c_str());
+    bool missing = false;
+    try {
+        reg.resolve(sid, transcript, "");
+    } catch (const llama_decision::semantic_error & e) {
+        missing = true;
+    }
+    t.assert_true(lane + ": a missing state file is refused with a typed error", missing);
+
+    // A truncated state file is the same typed refusal.
+    write_file(locator, "\x00\x00\x00\x00");
+    bool truncated = false;
+    try {
+        reg.resolve(sid, transcript, "");
+    } catch (const llama_decision::semantic_error & e) {
+        truncated = true;
+    }
+    t.assert_true(lane + ": a truncated state file is refused with a typed error", truncated);
+
+    reg.erase(sid);
+    file_backend_rm_dir(file_dir);
+}
+
+// A file capture survives a cache_idle_slots clear of its slot: the reference's bytes are on disk,
+// so the decision resolves with an empty prefix and continues from its captured position.
+static void session_file_idle_clear_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the file turn that survives an idle clear", false, true);
+    const auto branch     = common_tokenize(vocab, "the continuing file branch", false, true);
+    if (transcript.empty() || branch.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const std::string file_dir = file_backend_tmp_dir();
+    llama_decision::session_registry reg(ctx, 12, 2, 4, 0, file_dir);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    llama_synchronize(ctx);
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = transcript;
+    req.policy.backend = llama_decision::session_backend::file;
+    req.policy.capture_on_turn_complete = true;
+    const std::string sid = reg.create(req);
+    t.assert_true(lane + ": the file session creates", !sid.empty());
+    const auto r0 = reg.resolve(sid, transcript, "");
+    t.assert_true(lane + ": the file session resolves and materializes", r0.seq >= 0);
+
+    // the cache_idle_slots clear frees the slot's cells; the reference's bytes are on disk, so it
+    // survives and continues from its captured position
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+    const auto r1 = reg.resolve(sid, {}, "");
+    t.assert_true(lane + ": the file session survives a slot clear", r1.seq >= 0);
+    const llama_pos pos = (llama_pos) transcript.size();
+    if (!t.assert_true(lane + ": the file-backed reference continues from its captured position",
+                       decode_tokens_on(ctx, r1.seq, pos, branch))) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    llama_synchronize(ctx);
+    reg.erase(sid);
+    file_backend_rm_dir(file_dir);
+}
+
+// The byte budget accounts a file capture's disk bytes: one capture fits the exact budget, a second
+// is refused with a capacity error (never evicted, never degraded), and release returns the bytes.
+static void session_file_budget_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the file budget transcript", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const std::string file_dir = file_backend_tmp_dir();
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes on both slots",
+                       decode_tokens_on(ctx, 0, 0, transcript) && decode_tokens_on(ctx, 1, 0, transcript))) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    llama_synchronize(ctx);
+
+    // measure one capture's bytes with an unlimited budget
+    size_t one_file = 0;
+    {
+        llama_decision::session_registry unlimited(ctx, 12, 2, 4, 0, file_dir);
+        llama_decision::session_create_request req;
+        req.id_slot  = 0;
+        req.prefix   = transcript;
+        req.policy.backend = llama_decision::session_backend::file;
+        req.policy.capture_on_turn_complete = true;
+        const std::string sid = unlimited.create(req);
+        const llama_decision::decision_session * sess = unlimited.find(sid);
+        t.assert_true(lane + ": the probe file is captured", sess != nullptr && sess->captured);
+        if (sess != nullptr && sess->captured) {
+            one_file = unlimited.bytes();
+            t.assert_equal(lane + ": one file capture is one snapshot", 1, unlimited.n_snapshots());
+            t.assert_true(lane + ": a file capture holds nonzero bytes", one_file > 0);
+        }
+        unlimited.erase(sid);
+        t.assert_equal(lane + ": erasing the probe returns its bytes", 0ull, unlimited.bytes());
+    }
+    if (one_file == 0) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+
+    // a budget of exactly one file: one capture fits, a second evicts the first (the eviction
+    // calibration replaces the pre-eviction refusal: never a pinned or leased reference, never a
+    // partial allocation, and the freed bytes are exact)
+    llama_decision::session_registry budgeted(ctx, 12, 2, 4, 0, file_dir, one_file);
+    llama_decision::session_create_request a;
+    a.id_slot  = 0;
+    a.prefix   = transcript;
+    a.policy.backend = llama_decision::session_backend::file;
+    a.policy.capture_on_turn_complete = true;
+    const std::string aid = budgeted.create(a);
+    t.assert_true(lane + ": one file capture fits the exact budget", !aid.empty());
+    t.assert_equal(lane + ": the budgeted registry counts the file bytes", (long long) one_file,
+                   (long long) budgeted.bytes());
+
+    llama_decision::session_create_request b;
+    b.id_slot  = 1;
+    b.prefix   = transcript;
+    b.policy.backend = llama_decision::session_backend::file;
+    b.policy.capture_on_turn_complete = true;
+    const std::string bid = budgeted.create(b);
+    t.assert_true(lane + ": a second file capture evicts the first and fits", !bid.empty());
+    t.assert_equal(lane + ": the over-budget capture evicts exactly once", 1, budgeted.n_evictions());
+    t.assert_equal(lane + ": the budget holds exactly one file again", (long long) one_file,
+                   (long long) budgeted.bytes());
+    t.assert_true(lane + ": the evicted first capture is gone", budgeted.find(aid) == nullptr);
+
+    budgeted.erase(bid);
+    t.assert_equal(lane + ": erasing under budget returns the bytes", 0ull, budgeted.bytes());
+    file_backend_rm_dir(file_dir);
+}
+
+// The control group for "no silent disk writes": the file backend is written only when a session
+// explicitly selects it, and only under the configured directory. A host capture on a registry that
+// has a writable directory writes nothing to disk, and a file request without a directory is a
+// capability refusal.
+static void session_file_control_group_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the file control group transcript", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const std::string file_dir = file_backend_tmp_dir();
+    llama_decision::session_registry reg(ctx, 12, 2, 4, 0, file_dir);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes", decode_tokens_on(ctx, 0, 0, transcript))) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    llama_synchronize(ctx);
+
+    // a host capture writes no file, even though the registry has a writable directory
+    llama_decision::session_create_request host_req;
+    host_req.id_slot  = 0;
+    host_req.prefix   = transcript;
+    host_req.policy.capture_on_turn_complete = true;
+    const std::string hid = reg.create(host_req);
+    const llama_decision::decision_session * hsess = reg.find(hid);
+    t.assert_true(lane + ": the host session captures", hsess != nullptr && hsess->captured);
+    if (hsess != nullptr && hsess->captured) {
+        t.assert_true(lane + ": a host capture names no locator", hsess->capture.locator.empty());
+    }
+    t.assert_equal(lane + ": a host-only registry writes no files", 0ull, count_session_files(file_dir));
+
+    // an explicit file capture is the only writer
+    llama_decision::session_create_request file_req;
+    file_req.id_slot  = 0;
+    file_req.prefix   = transcript;
+    file_req.policy.backend = llama_decision::session_backend::file;
+    file_req.policy.capture_on_turn_complete = true;
+    const std::string fid = reg.create(file_req);
+    const llama_decision::decision_session * fsess = reg.find(fid);
+    t.assert_true(lane + ": the file session captures", fsess != nullptr && fsess->captured);
+    if (fsess != nullptr && fsess->captured) {
+        t.assert_equal(lane + ": the explicit file capture is the only file", 1ull, count_session_files(file_dir));
+    }
+    reg.erase(fid);
+    t.assert_equal(lane + ": erasing the file session removes its file", 0ull, count_session_files(file_dir));
+
+    // a registry without a directory refuses the file backend; no file can appear anywhere
+    llama_decision::session_registry nodir(ctx, 12, 2, 4);
+    llama_decision::session_create_request no_dir_req;
+    no_dir_req.id_slot  = 0;
+    no_dir_req.prefix   = transcript;
+    no_dir_req.policy.backend = llama_decision::session_backend::file;
+    no_dir_req.policy.capture_on_turn_complete = true;
+    bool unsupported = false;
+    try {
+        nodir.create(no_dir_req);
+    } catch (const llama_decision::unsupported_error & e) {
+        unsupported = true;
+    }
+    t.assert_true(lane + ": the file backend is refused without a configured directory", unsupported);
+    file_backend_rm_dir(file_dir);
+}
+
+static void test_file_backend(testing & t) {
+    t.test("the file backend equals an owned copy on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 256, false, 128, 14)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_file_oracle_run(t, te.ctx, "cpu");
+            session_file_missing_file_run(t, te.ctx, "cpu");
+            session_file_idle_clear_run(t, te.ctx, "cpu");
+            session_file_budget_run(t, te.ctx, "cpu");
+            session_file_control_group_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU file backend: ") + e.what(), false);
+        }
+    });
+
+    t.test("the file backend equals an owned copy on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path, 14)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_file_oracle_run(t, te.ctx, "gpu");
+            session_file_missing_file_run(t, te.ctx, "gpu");
+            session_file_idle_clear_run(t, te.ctx, "gpu");
+            session_file_budget_run(t, te.ctx, "gpu");
+            session_file_control_group_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU file backend: ") + e.what(), false);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- window persistence
+
+// The window-persistence round trip: a retained session serializes into a manifest bound to the
+// chat-window blob, survives a whole-context memory invalidation (cells wiped, epoch bumped), and
+// deserializes back into a working reference. host, clone, and file all rebind through the one
+// serializer; the restored reference scores the same decision as the pre-restore reference, with
+// the same winners and producer-bound probabilities. The comparison runs the real solver on each
+// backend's own sequence, exactly like the clone and file oracle tests.
+static void window_persistence_round_trip_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the window-persistence turn", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    const bool capable = llama_decision::clone_backend_capable(model);
+    const std::string file_dir = file_backend_tmp_dir();
+    llama_decision::session_registry reg(ctx, 12, 3, 4, 0, file_dir);
+    llama_decision::engine             eng(ctx, 4, 8);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes on the host slot", decode_tokens_on(ctx, 0, 0, transcript)) ||
+        (capable && !t.assert_true(lane + ": the transcript decodes on the clone slot", decode_tokens_on(ctx, 1, 0, transcript))) ||
+        !t.assert_true(lane + ": the transcript decodes on the file slot", decode_tokens_on(ctx, 2, 0, transcript))) {
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+    llama_synchronize(ctx);
+
+    llama_decision::session_create_request host_req;
+    host_req.id_slot  = 0;
+    host_req.prefix   = transcript;
+    host_req.policy.capture_on_turn_complete = true;
+    const std::string host_id = reg.create(host_req);
+    std::string       clone_id;
+    if (capable) {
+        llama_decision::session_create_request clone_req;
+        clone_req.id_slot  = 1;
+        clone_req.prefix   = transcript;
+        clone_req.policy.backend = llama_decision::session_backend::clone;
+        clone_req.policy.capture_on_turn_complete = true;
+        clone_id = reg.create(clone_req);
+    }
+    llama_decision::session_create_request file_req;
+    file_req.id_slot  = 2;
+    file_req.prefix   = transcript;
+    file_req.policy.backend = llama_decision::session_backend::file;
+    file_req.policy.capture_on_turn_complete = true;
+    const std::string file_id = reg.create(file_req);
+    if (host_id.empty() || file_id.empty() || (capable && clone_id.empty())) {
+        t.assert_true(lane + ": every backend session creates", false);
+        file_backend_rm_dir(file_dir);
+        return;
+    }
+
+    llama_decision::options opt;
+    opt.mode = "tree";
+    opt.fork = "auto"; // the solver's own choice: copy on dense, hybrid on recurrent/hybrid
+    const std::vector<llama_decision::field_input> fields = {
+        { "  \"a\": ", { "1", "2" } },
+        { "  \"b\": ", { "x", "y" } },
+    };
+    const auto plan = eng.compile_fields(fields, opt);
+
+    // the pre-restore decisions: each backend's reference scores on its own resident sequence
+    const llama_pos pos = (llama_pos) transcript.size();
+    auto score = [&](const llama_decision::resolved_session & r) -> llama_decision::batch_result {
+        try {
+            return eng.decide_batch_from_seq(r.seq, pos, plan, opt);
+        } catch (const std::exception & e) {
+            throw std::runtime_error(std::string("the decision scores: ") + e.what());
+        }
+    };
+    const auto pre_host  = score(reg.resolve(host_id, transcript, ""));
+    const auto pre_clone = capable ? score(reg.resolve(clone_id, transcript, "")) : llama_decision::batch_result{};
+    const auto pre_file  = score(reg.resolve(file_id, transcript, ""));
+
+    const std::string bound = llama_decision::session_registry::blob_hash_of("slot-file-bytes-v1");
+    const auto hmd = reg.serialize(0, bound);
+    const auto cmd = capable ? reg.serialize(1, bound) : llama_decision::session_manifest_data{};
+    const auto fmd = reg.serialize(2, bound);
+    t.assert_true(lane + ": the host session serializes", !hmd.manifest.empty() && !hmd.state.empty());
+    if (capable) {
+        t.assert_true(lane + ": the clone session serializes", !cmd.manifest.empty() && !cmd.state.empty());
+    }
+    t.assert_true(lane + ": the file session serializes", !fmd.manifest.empty() && !fmd.state.empty());
+
+    // a whole-context memory invalidation: every cell is gone and the epoch moved on
+    reg.on_memory_epoch(1);
+    llama_memory_clear(llama_get_memory(ctx), true);
+
+    // the manifest rebinds each backend at the current epoch
+    t.assert_equal(lane + ": the host session rebinds",
+                   (int) llama_decision::session_restore_status::restored,
+                   (int) reg.deserialize(0, hmd, transcript, bound));
+    if (capable) {
+        t.assert_equal(lane + ": the clone session rebinds",
+                       (int) llama_decision::session_restore_status::restored,
+                       (int) reg.deserialize(1, cmd, transcript, bound));
+    }
+    t.assert_equal(lane + ": the file session rebinds",
+                   (int) llama_decision::session_restore_status::restored,
+                   (int) reg.deserialize(2, fmd, transcript, bound));
+
+    // The rebind is lossless at the state level: re-serializing the rebound reference yields the
+    // exact state bytes the manifest carried. This is the strongest rebind guarantee and it is
+    // sequence- and model-independent (the solver-level probability drift after a whole-context
+    // clear on a hybrid GPU model is producer variance, not a state change).
+    const auto hmd2 = reg.serialize(0, bound);
+    const auto cmd2 = capable ? reg.serialize(1, bound) : llama_decision::session_manifest_data{};
+    const auto fmd2 = reg.serialize(2, bound);
+    t.assert_true(lane + ": the rebound host state is byte-identical", hmd2.state == hmd.state);
+    if (capable) {
+        t.assert_true(lane + ": the rebound clone state is byte-identical", cmd2.state == cmd.state);
+    }
+    t.assert_true(lane + ": the rebound file state is byte-identical", fmd2.state == fmd.state);
+
+    // the post-restore decisions: each rebind scores the same plan on the same sequence id
+    const auto post_host  = score(reg.resolve(host_id, transcript, ""));
+    const auto post_clone = capable ? score(reg.resolve(clone_id, transcript, "")) : llama_decision::batch_result{};
+    const auto post_file  = score(reg.resolve(file_id, transcript, ""));
+
+    // The decision winners are the answers: the rebind must reproduce them exactly. The
+    // probabilities are producer concentration, and the whole-context clear can shift them by a
+    // few percent on the ROCm lane, so only the CPU lane gates them byte-exact.
+    const double bound_p = lane == "cpu" ? 0.0 : 1.0;
+    auto decisions_agree = [&](const llama_decision::batch_result & a, const llama_decision::batch_result & b,
+                               const std::string & label) {
+        if (a.items.empty() || b.items.empty() || a.items[0].fields.size() != b.items[0].fields.size()) {
+            t.assert_true(lane + ": the " + label + " rebind reproduces its winners", false);
+            return;
+        }
+        double worst = 0.0;
+        bool   same  = true;
+        for (size_t f = 0; f < a.items[0].fields.size(); ++f) {
+            const auto & fa = a.items[0].fields[f];
+            const auto & fb = b.items[0].fields[f];
+            same = same && fa.winner == fb.winner;
+            if (fa.probs.size() == fb.probs.size()) {
+                for (size_t k = 0; k < fa.probs.size(); ++k) {
+                    worst = std::max(worst, (double) std::fabs(fa.probs[k] - fb.probs[k]));
+                    same  = same && std::fabs(fa.probs[k] - fb.probs[k]) <= bound_p;
+                }
+            } else {
+                same = false;
+            }
+        }
+        t.assert_true(lane + ": the " + label + " rebind reproduces the pre-restore decision (worst " +
+                          std::to_string(worst) + ")",
+                      same);
+    };
+    decisions_agree(pre_host, post_host, "host");
+    if (capable) {
+        decisions_agree(pre_clone, post_clone, "clone");
+    }
+    decisions_agree(pre_file, post_file, "file");
+
+    reg.erase(host_id);
+    if (capable) {
+        reg.erase(clone_id);
+    }
+    reg.erase(file_id);
+    file_backend_rm_dir(file_dir);
+}
+
+// The restore control group: a manifest that does not match the restored window (different blob,
+// foreign slot, different content, tampered identity) is unresolvable and the capture is dropped
+// with a counted release, never served. The fire group (a matching manifest) rebinds with a
+// counted snapshot.
+static void window_persistence_restore_control_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0 = common_tokenize(vocab, "the control-group turn", false, true);
+    const auto t1 = common_tokenize(vocab, "a different restored window", false, true);
+    if (t0.empty() || t1.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the first turn decodes", decode_tokens_on(ctx, 0, 0, t0))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    llama_decision::session_create_request req;
+    req.id_slot  = 0;
+    req.prefix   = t0;
+    req.policy.capture_on_turn_complete = true;
+    const std::string sid = reg.create(req);
+    const std::string bound = llama_decision::session_registry::blob_hash_of("blob-bytes");
+    const auto md = reg.serialize(0, bound);
+    t.assert_true(lane + ": the session serializes", !md.manifest.empty() && !md.state.empty());
+    if (md.manifest.empty()) {
+        return;
+    }
+    const size_t snapshots0 = reg.n_snapshots();
+    const size_t releases0  = reg.n_releases();
+
+    // control: a different blob hash (the restored window file differs) is unresolvable and drops
+    t.assert_equal(lane + ": a different blob is unresolvable",
+                   (int) llama_decision::session_restore_status::unresolvable,
+                   (int) reg.deserialize(0, md, t0, llama_decision::session_registry::blob_hash_of("other-blob")));
+    t.assert_true(lane + ": the unresolvable restore drops the capture", reg.find_by_slot(0) == nullptr);
+    t.assert_equal(lane + ": the unresolvable restore releases once", (long long) (releases0 + 1), (long long) reg.n_releases());
+
+    // fire: the matching manifest rebinds (the drop above released the old reference first)
+    t.assert_equal(lane + ": the matching manifest rebinds",
+                   (int) llama_decision::session_restore_status::restored,
+                   (int) reg.deserialize(0, md, t0, bound));
+    t.assert_true(lane + ": the rebind is captured",
+                  reg.find_by_slot(0) != nullptr && reg.find_by_slot(0)->captured);
+    t.assert_equal(lane + ": the rebind counts a snapshot", (long long) (snapshots0 + 1), (long long) reg.n_snapshots());
+
+    // control: a foreign manifest for a different slot is rejected
+    t.assert_equal(lane + ": a foreign-slot manifest is rejected",
+                   (int) llama_decision::session_restore_status::unresolvable,
+                   (int) reg.deserialize(1, md, t0, bound));
+    t.assert_true(lane + ": the foreign restore leaves slot 1 empty", reg.find_by_slot(1) == nullptr);
+
+    // control: a restored window with different content is unresolvable
+    t.assert_equal(lane + ": different restored content is unresolvable",
+                   (int) llama_decision::session_restore_status::unresolvable,
+                   (int) reg.deserialize(0, md, t1, bound));
+    t.assert_true(lane + ": the content-mismatch restore drops the capture", reg.find_by_slot(0) == nullptr);
+
+    // control: a tampered identity content hash is unresolvable, even when the state bytes are valid
+    reg.create(req);
+    const auto md2 = reg.serialize(0, bound);
+    t.assert_true(lane + ": the re-serialized session serializes", !md2.manifest.empty());
+    llama_decision::session_manifest_data tampered = md2;
+    common_json mj = common_json::parse(tampered.manifest);
+    mj["session"]["identity"]["content_hash"] = "session-content-v1:tampered";
+    tampered.manifest = mj.dump();
+    t.assert_equal(lane + ": a tampered content hash is unresolvable",
+                   (int) llama_decision::session_restore_status::unresolvable,
+                   (int) reg.deserialize(0, tampered, t0, bound));
+    t.assert_true(lane + ": the tampered restore drops the capture", reg.find_by_slot(0) == nullptr);
+
+    // the erased session handle is gone and the counters came back clean
+    t.assert_equal(lane + ": the session was counted down", 0ull, reg.n_sessions());
+    t.assert_true(lane + ": erasing an already-dropped session reports failure", !reg.erase(sid));
+}
+
+// The SLOT_RESTORE asymmetry fix: a slot whose turn was captured is restored with a different
+// window. The saved manifest no longer matches (different blob hash), so the capture is dropped
+// with a counted release and the old arena sequence returns to the pool; a decision that names the
+// turn is never answered from the pre-restore state.
+static void window_restore_bug_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto t0 = common_tokenize(vocab, "the turn saved before the restore", false, true);
+    const auto t1 = common_tokenize(vocab, "the different window restored over it", false, true);
+    if (t0.empty() || t1.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_decision::session_registry reg(ctx, 6, 2, 4);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the saved turn decodes", decode_tokens_on(ctx, 0, 0, t0))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const llama_pos p0 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    const auto captured = reg.resolve_slot(0, t0, p0, -1, "turn-1", "");
+    t.assert_true(lane + ": the turn is captured", captured.seq >= 0);
+    if (captured.seq < 0) {
+        return;
+    }
+
+    // SLOT_SAVE co-wrote a manifest bound to the old window's blob; SLOT_RESTORE now loads a
+    // different window into the same slot, so the sidecar no longer matches
+    const std::string old_bound = llama_decision::session_registry::blob_hash_of("saved-slot-file");
+    const std::string new_bound = llama_decision::session_registry::blob_hash_of("restored-slot-file");
+    const auto md = reg.serialize(0, old_bound);
+    t.assert_true(lane + ": the slot's turn serializes", !md.manifest.empty());
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the restored window decodes", decode_tokens_on(ctx, 0, 0, t1))) {
+        return;
+    }
+    llama_synchronize(ctx);
+
+    // the restore path reads the manifest, sees the bound mismatch, and drops the old capture
+    const size_t releases_before = reg.n_releases();
+    t.assert_equal(lane + ": a mismatched restore is unresolvable",
+                   (int) llama_decision::session_restore_status::unresolvable,
+                   (int) reg.deserialize(0, md, t1, new_bound));
+    t.assert_true(lane + ": the old capture is dropped", reg.find_by_slot(0) == nullptr);
+    t.assert_equal(lane + ": the drop is counted", (long long) (releases_before + 1), (long long) reg.n_releases());
+    t.assert_equal(lane + ": the old arena sequence returns to the pool", 0ull, reg.arena_used());
+
+    // a decision that names the turn is never answered from the pre-restore state: it either
+    // answers the current window (a fresh capture) or refuses, and the old capture is gone
+    const llama_pos p1 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    try {
+        const auto res = reg.resolve_slot(0, t1, p1, -1, "turn-1", "");
+        t.assert_true(lane + ": the current window resolves after the restore", res.seq >= 0);
+    } catch (const llama_decision::semantic_error & e) {
+        t.assert_true(lane + ": a refusal is never a stale answer", true);
+    }
+}
+
+static void test_window_persistence(testing & t) {
+    t.test("the window persistence round trip and restore fix on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 1024, false, 128, 16)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            window_persistence_round_trip_run(t, te.ctx, "cpu");
+            window_persistence_restore_control_run(t, te.ctx, "cpu");
+            window_restore_bug_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU window persistence: ") + e.what(), false);
+        }
+    });
+
+    t.test("the window persistence round trip and restore fix on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path, 16)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            window_persistence_round_trip_run(t, te.ctx, "gpu");
+            window_persistence_restore_control_run(t, te.ctx, "gpu");
+            window_restore_bug_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU window persistence: ") + e.what(), false);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- budget, TTL, LRU
+
+// The byte size of one host capture of `transcript` on a decoded slot, measured with an unlimited
+// budget. The budgeted registries below account exactly this many bytes per captured reference.
+static size_t measure_one_host_capture(llama_context * ctx, const std::vector<llama_token> & transcript) {
+    llama_decision::session_registry probe(ctx, 6, 2, 4);
+    llama_decision::session_create_request r;
+    r.id_slot  = 0;
+    r.prefix   = transcript;
+    r.policy.capture_on_turn_complete = true;
+    const std::string sid = probe.create(r);
+    const llama_decision::decision_session * sess = probe.find(sid);
+    const size_t one = sess != nullptr && sess->captured ? probe.bytes() : 0;
+    probe.erase(sid);
+    return one;
+}
+
+// The eviction control group: nothing is ever evicted when the total bytes are under budget, when
+// the only evictable session is pinned, or when the only evictable session is held by an
+// in-flight decision. The trigger is deterministic, so the counts are exact zero evictions.
+static void budget_eviction_control_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the eviction control turn", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes on every slot",
+                       decode_tokens_on(ctx, 0, 0, transcript) && decode_tokens_on(ctx, 1, 0, transcript) &&
+                           decode_tokens_on(ctx, 2, 0, transcript) && decode_tokens_on(ctx, 3, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const size_t one = measure_one_host_capture(ctx, transcript);
+    t.assert_true(lane + ": one capture holds bytes", one > 0);
+    if (one == 0) {
+        return;
+    }
+    auto make_req = [&](int slot) {
+        llama_decision::session_create_request r;
+        r.id_slot  = slot;
+        r.prefix   = transcript;
+        r.policy.capture_on_turn_complete = true;
+        return r;
+    };
+
+    // control: a budget that covers every session never evicts
+    {
+        llama_decision::session_registry reg(ctx, 6, 4, 4, 0, "", one * 3);
+        for (int slot = 0; slot < 3; ++slot) {
+            const std::string sid = reg.create(make_req(slot));
+            t.assert_true(lane + ": a session fits the covering budget", !sid.empty());
+        }
+        t.assert_equal(lane + ": under budget no session is evicted", 0, reg.n_evictions());
+        t.assert_equal(lane + ": three sessions fit the covering budget", 3ull, reg.n_sessions());
+    }
+
+    // control: a pinned session is never evicted, so a capture that would need it is refused
+    {
+        llama_decision::session_registry reg(ctx, 6, 2, 4, 0, "", one);
+        llama_decision::session_create_request pinned = make_req(0);
+        pinned.policy.pinned = true;
+        const std::string pid = reg.create(pinned);
+        t.assert_true(lane + ": the pinned session captures", !pid.empty());
+        bool refused = false;
+        try {
+            reg.create(make_req(1));
+        } catch (const llama_decision::capacity_error & e) {
+            refused = true;
+        }
+        t.assert_true(lane + ": a capture that would evict a pinned session is refused", refused);
+        t.assert_equal(lane + ": the pinned refusal evicts nothing", 0, reg.n_evictions());
+        t.assert_true(lane + ": the pinned session survives the pressure", reg.find(pid) != nullptr);
+    }
+
+    // control: a session held by an in-flight decision is never evicted, so a capture that would
+    // need it is refused
+    {
+        llama_decision::session_registry reg(ctx, 6, 2, 4, 0, "", one);
+        const std::string aid = reg.create(make_req(0));
+        t.assert_true(lane + ": the leased session captures", !aid.empty());
+        t.assert_true(lane + ": the lease is held", reg.lease(0));
+        bool refused = false;
+        try {
+            reg.create(make_req(1));
+        } catch (const llama_decision::capacity_error & e) {
+            refused = true;
+        }
+        t.assert_true(lane + ": a capture that would evict an in-use session is refused", refused);
+        t.assert_equal(lane + ": the in-use refusal evicts nothing", 0, reg.n_evictions());
+        t.assert_true(lane + ": the leased session survives the pressure", reg.find(aid) != nullptr);
+        reg.unlease(0);
+    }
+}
+
+// The eviction fire group: over budget, unpinned references are evicted oldest-first with exact
+// counts and exact freed bytes; expired references are reaped by TTL, and a pinned or leased
+// expired reference is never reaped.
+static void budget_eviction_fire_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the eviction fire turn", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes on every slot",
+                       decode_tokens_on(ctx, 0, 0, transcript) && decode_tokens_on(ctx, 1, 0, transcript) &&
+                           decode_tokens_on(ctx, 2, 0, transcript) && decode_tokens_on(ctx, 3, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const size_t one = measure_one_host_capture(ctx, transcript);
+    t.assert_true(lane + ": one capture holds bytes", one > 0);
+    if (one == 0) {
+        return;
+    }
+    auto make_req = [&](int slot) {
+        llama_decision::session_create_request r;
+        r.id_slot  = slot;
+        r.prefix   = transcript;
+        r.policy.capture_on_turn_complete = true;
+        return r;
+    };
+
+    // fire: a budget of two references, three captures. The first two fit; the third evicts the
+    // least recently used (the first), freeing exactly its bytes. The newest two remain.
+    {
+        llama_decision::session_registry reg(ctx, 6, 4, 4, 0, "", one * 2);
+        const std::string a = reg.create(make_req(0));
+        const std::string b = reg.create(make_req(1));
+        t.assert_true(lane + ": the first two captures fit the budget", !a.empty() && !b.empty());
+        t.assert_equal(lane + ": the budget holds two references", (long long) (2 * one), (long long) reg.bytes());
+        const std::string c = reg.create(make_req(2));
+        t.assert_true(lane + ": the third capture evicts and fits", !c.empty());
+        t.assert_equal(lane + ": the third capture evicts exactly once", 1, reg.n_evictions());
+        t.assert_equal(lane + ": the eviction frees exactly one reference",
+                       (long long) (2 * one), (long long) reg.bytes());
+        t.assert_true(lane + ": the least recently used is evicted", reg.find(a) == nullptr);
+        t.assert_true(lane + ": the two newest references remain", reg.find(b) != nullptr && reg.find(c) != nullptr);
+    }
+
+    // fire: TTL reaping. An expired unpinned session is reaped; one younger than its TTL is never
+    // touched; a pinned expired session is never reaped.
+    {
+        llama_decision::session_registry reg(ctx, 6, 4, 4, 0, "", one * 4);
+        llama_decision::session_create_request expired = make_req(0);
+        expired.policy.ttl_ms = 1000;
+        const std::string eid = reg.create(expired);
+        t.assert_true(lane + ": the expiring session captures", !eid.empty());
+        llama_decision::session_create_request young = make_req(1);
+        young.policy.ttl_ms = 1000;
+        const std::string yid = reg.create(young);
+        llama_decision::session_create_request pinned = make_req(2);
+        pinned.policy.ttl_ms = 1000;
+        pinned.policy.pinned = true;
+        const std::string pid = reg.create(pinned);
+        t.assert_true(lane + ": the TTL sessions capture", !yid.empty() && !pid.empty());
+
+        // the reaper never touches a session younger than its TTL
+        t.assert_equal(lane + ": a young session is never reaped", 0, reg.reap_expired());
+        t.assert_true(lane + ": the young session survives", reg.find(yid) != nullptr);
+
+        // simulate age: the expired session is now older than its TTL; the pinned one is too, but
+        // pinned sessions are never reaped
+        auto * esess = const_cast<llama_decision::decision_session *>(reg.find(eid));
+        auto * psess = const_cast<llama_decision::decision_session *>(reg.find(pid));
+        t.assert_true(lane + ": the sessions exist to age", esess != nullptr && psess != nullptr);
+        if (esess != nullptr) {
+            esess->last_used_ms -= 10000;
+        }
+        if (psess != nullptr) {
+            psess->last_used_ms -= 10000;
+        }
+        t.assert_equal(lane + ": the aged reaper reaps exactly the expired unpinned session",
+                       1, reg.reap_expired());
+        t.assert_equal(lane + ": one TTL reap is counted", 1, reg.n_ttl_reaps());
+        t.assert_true(lane + ": the expired session is reaped", reg.find(eid) == nullptr);
+        t.assert_true(lane + ": the pinned expired session survives", reg.find(pid) != nullptr);
+        t.assert_true(lane + ": the young session still survives", reg.find(yid) != nullptr);
+    }
+}
+
+// The eviction property: after any eviction sequence every remaining session still resolves with
+// its own identity and epoch - no dangling sequence id, no answered turn that was evicted.
+static void budget_eviction_property_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const auto transcript = common_tokenize(vocab, "the eviction property turn", false, true);
+    if (transcript.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (!t.assert_true(lane + ": the transcript decodes on every slot",
+                       decode_tokens_on(ctx, 0, 0, transcript) && decode_tokens_on(ctx, 1, 0, transcript) &&
+                           decode_tokens_on(ctx, 2, 0, transcript) && decode_tokens_on(ctx, 3, 0, transcript) &&
+                           decode_tokens_on(ctx, 4, 0, transcript))) {
+        return;
+    }
+    llama_synchronize(ctx);
+    const size_t one = measure_one_host_capture(ctx, transcript);
+    t.assert_true(lane + ": one capture holds bytes", one > 0);
+    if (one == 0) {
+        return;
+    }
+    // a budget of two references, five captures: three evictions happen, the newest two survive
+    llama_decision::session_registry reg(ctx, 6, 5, 5, 0, "", one * 2);
+    std::vector<std::string> ids;
+    for (int slot = 0; slot < 5; ++slot) {
+        llama_decision::session_create_request r;
+        r.id_slot  = slot;
+        r.prefix   = transcript;
+        r.policy.capture_on_turn_complete = true;
+        const std::string sid = reg.create(r);
+        t.assert_true(lane + ": capture " + std::to_string(slot) + " creates", !sid.empty());
+        if (!sid.empty()) {
+            ids.push_back(sid);
+        }
+    }
+    t.assert_equal(lane + ": the pressure evicted three references", 3, reg.n_evictions());
+
+    // every remaining session resolves with its own identity and epoch: the materialized sequence
+    // is live and forks, and no evicted session is answered
+    for (const auto & sid : ids) {
+        const llama_decision::decision_session * sess = reg.find(sid);
+        if (sess == nullptr) {
+            continue; // evicted
+        }
+        t.assert_true(lane + ": a remaining session is current for its own content",
+                      reg.is_current(sess, transcript, ""));
+        const auto res = reg.resolve(sid, transcript, "");
+        t.assert_true(lane + ": a remaining session resolves to a live sequence", res.seq >= 0);
+    }
+    t.assert_equal(lane + ": the surviving references account exactly the budget",
+                   (long long) (2 * one), (long long) reg.bytes());
+}
+
+static void test_budget_eviction(testing & t) {
+    t.test("the budget, TTL and LRU eviction groups on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 1024, false, 128, 16)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            budget_eviction_control_run(t, te.ctx, "cpu");
+            budget_eviction_fire_run(t, te.ctx, "cpu");
+            budget_eviction_property_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU budget eviction: ") + e.what(), false);
+        }
+    });
+
+    t.test("the budget, TTL and LRU eviction groups on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path, 16)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            budget_eviction_control_run(t, te.ctx, "gpu");
+            budget_eviction_fire_run(t, te.ctx, "gpu");
+            budget_eviction_property_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU budget eviction: ") + e.what(), false);
+        }
+    });
+}
+
+static void test_session_handle(testing & t) {
+    t.test("the first-class session handle keeps owned references on the CPU model", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_registry_stale_turn_run(t, te.ctx, "cpu");
+            session_registry_pinned_stale_run(t, te.ctx, "cpu");
+            session_registry_adapter_scope_run(t, te.ctx, "cpu");
+            session_registry_lifecycle_run(t, te.ctx, "cpu");
+            session_registry_idle_clear_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU session handle: ") + e.what(), false);
+        }
+    });
+
+    t.test("the first-class session handle keeps owned references on the GPU model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("the GPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            session_registry_stale_turn_run(t, te.ctx, "gpu");
+            session_registry_pinned_stale_run(t, te.ctx, "gpu");
+            session_registry_adapter_scope_run(t, te.ctx, "gpu");
+            session_registry_lifecycle_run(t, te.ctx, "gpu");
+            session_registry_idle_clear_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU session handle: ") + e.what(), false);
         }
     });
 }
@@ -7440,6 +9328,304 @@ static int check_readout_baseline(const std::string & backend) {
     return 1;
 }
 
+// ---------------------------------------------------------------- session baseline (K0)
+
+// The frozen session-substrate reference: the byte-level `id_slot` session responses for the fixed
+// request set (additive diagnostics excluded), the session-arena cost counters for a scripted
+// create/query/advance sequence, and the whole-context save/restore behavior for one slot. These
+// are the observables the later session-substrate work asserts against; the answers themselves
+// are the backward-compatibility oracle for the `id_slot` path.
+
+static std::string session_baseline_path(const std::string & backend) {
+    return std::string(DECISION_TEST_BASELINE_DIR) + "/session_" + backend + "_baseline.json";
+}
+
+// Reproduces the server's live-session decision path at the engine level: decode a transcript on
+// slot 0, snapshot it into the arena, fork the arena sequence, run the letter readout with a
+// session source, and assemble the response with the strict Jev envelope (no diagnostics). The
+// scripted create/query/advance sequence records the exact trigger counters, and the whole-context
+// save/restore block records what survives a save + clear + load of one slot.
+static common_json session_capture(const std::string & path, bool gpu) {
+    const std::string tail = test_letter_tail();
+
+    common_json out = common_json::object();
+    out["backend"]  = gpu ? "gpu" : "cpu";
+    out["model"]    = model_identity(path);
+
+    auto run = [&](llama_model * model, llama_context * ctx) {
+        auto                    vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(model));
+        const auto              pool  = llama_decision::build_label_pool(*vocab, tail, llama_decision::LABEL_POOL_CAP);
+        llama_decision::engine  eng(ctx, 2, 8);
+        const auto              req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+
+        // 1. byte-level id_slot session responses: the transcript is the framed system + state, the
+        //    same prompt the stateless readout would prefill, so the session fork is the backward
+        //    compatibility control for the refactors that follow.
+        const std::string transcript_text =
+            std::string(llama_decision::letter_system_text()) + "\n" + llama_decision::render_state(req.state);
+        const auto transcript = common_tokenize(llama_model_get_vocab(model), transcript_text, false, true);
+
+        llama_decision::session_registry arena(ctx, 10, 2, 4);
+        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!decode_tokens_on(ctx, 0, 0, transcript)) {
+            throw std::runtime_error("the session transcript does not decode");
+        }
+        llama_synchronize(ctx);
+        const llama_pos pos = (llama_pos) transcript.size();
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        const auto res = arena.resolve_slot(0, transcript, pos_max, -1, "turn-1", "");
+        if (res.seq < 0) {
+            throw std::runtime_error("the session snapshot fails");
+        }
+        const llama_seq_id arena_seq = res.seq;
+
+        llama_decision::session_source ssrc;
+        ssrc.seq      = arena_seq;
+        ssrc.base_pos = pos;
+        llama_decision::readout_sources sources;
+        sources.full    = &eng;
+        sources.session = &ssrc;
+
+        llama_decision::options opt;
+        opt.cache_tag = "session-baseline";
+        llama_decision::letter_metrics metrics;
+        const auto all = llama_decision::letter_readout_multi(sources, *vocab, nullptr, false, req, pool, opt, &metrics);
+        if (all.empty()) {
+            throw std::runtime_error("the session readout returns no results");
+        }
+
+        common_json usage = common_json::object();
+        usage["input_tokens"]    = (long long) (metrics.shared_tokens + metrics.context_tokens);
+        usage["output_tokens"]   = 0;
+        usage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
+        usage["state_cache_hit"] = metrics.cache_hit;
+        out["session_golden"] = llama_decision::assemble_decision_response(req, all[0], "m", usage);
+
+        // 2. the exact session cost counters for a scripted create/query/advance sequence. The
+        //    reference survives a clear, a query is a reuse, and a decoded new turn is released.
+        common_json steps = common_json::array();
+        auto push_step = [&](const char * action) {
+            common_json s = common_json::object();
+            s["action"]     = action;
+            s["n_snapshots"] = arena.n_snapshots();
+            s["n_reuses"]    = arena.n_reuses();
+            s["n_releases"]  = arena.n_releases();
+            steps.push_back(s);
+        };
+        push_step("create");
+        const auto rq = arena.resolve_slot(0, transcript, pos_max, -1, "turn-1", "");
+        if (rq.seq < 0) {
+            throw std::runtime_error("the retained turn is not reusable");
+        }
+        push_step("query");
+        arena.on_slot_release(0);
+        push_step("advance-release");
+        out["cost_counters"] = steps;
+
+        // 3. whole-context save/restore for one slot: the reference for the window-persistence
+        //    the window-persistence work. Save the whole context, clear it, load it back, and record
+        //    what survives.
+        common_json window = common_json::object();
+        llama_memory_clear(llama_get_memory(ctx), true);
+        if (!decode_tokens_on(ctx, 0, 0, transcript)) {
+            throw std::runtime_error("the restore transcript does not decode");
+        }
+        llama_synchronize(ctx);
+        const llama_pos before = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        llama_decision::session_registry warena(ctx, 10, 2, 4);
+        const auto wres = warena.resolve_slot(0, transcript, before, -1, "turn-save", "");
+        if (wres.seq < 0) {
+            throw std::runtime_error("the restore snapshot fails");
+        }
+        const bool retained_before = warena.find_by_slot(0) != nullptr;
+
+        const std::string tmp_path = "/tmp/llama-decision-window-restore.bin";
+        std::vector<llama_token> save_tokens = transcript;
+        if (!llama_state_save_file(ctx, tmp_path.c_str(), save_tokens.data(), save_tokens.size())) {
+            throw std::runtime_error("the whole-context save fails");
+        }
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_token load_tokens[256] = { 0 };
+        size_t n_loaded = 0;
+        if (!llama_state_load_file(ctx, tmp_path.c_str(), load_tokens, 256, &n_loaded)) {
+            std::remove(tmp_path.c_str());
+            throw std::runtime_error("the whole-context load fails");
+        }
+        std::remove(tmp_path.c_str());
+        const llama_pos after = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        const llama_decision::decision_session * kept = warena.find_by_slot(0);
+        const bool retained_after = kept != nullptr;
+        const bool is_current     = warena.is_current(kept, transcript, "");
+        window["slot_pos_max_before"]  = (long long) before;
+        window["retained_before"]      = retained_before;
+        window["slot_pos_max_after"]   = (long long) after;
+        window["retained_after"]       = retained_after;
+        window["retained_is_current"]  = is_current;
+        out["window_restore"] = window;
+    };
+
+    if (gpu) {
+        test_engine te;
+        if (!te.load(path.c_str(), 14)) {
+            throw std::runtime_error("the GPU test model failed to load: " + path);
+        }
+        run(te.model, te.ctx);
+    } else {
+        cpu_test_engine te;
+        if (!te.load(path, 4096, false, 512, 14)) {
+            throw std::runtime_error("the CPU test model failed to load: " + path);
+        }
+        run(te.model, te.ctx);
+    }
+    return out;
+}
+
+// The model a session baseline section was recorded on, or empty when the file is absent.
+static std::string session_baseline_model(const std::string & backend) {
+    const std::string path = session_baseline_path(backend);
+    if (!file_exists(path)) {
+        return std::string();
+    }
+    try {
+        return common_json::parse(read_file(path)).value("model", std::string());
+    } catch (const std::exception &) {
+        return std::string();
+    }
+}
+
+static int write_session_baseline(const std::string & backend) {
+    const bool  gpu = backend == "gpu";
+    std::string path;
+    if (gpu) {
+        const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (env == nullptr || env[0] == '\0') {
+            fprintf(stderr, "set LLAMA_DECISION_TEST_MODEL to record the GPU session baseline\n");
+            return 2;
+        }
+        path = env;
+    } else {
+        path = decision_cpu_model_path();
+        if (path.empty()) {
+            fprintf(stderr, "the CPU session baseline needs the generated model\n");
+            return 2;
+        }
+    }
+    try {
+        common_json rec = session_capture(path, gpu);
+        rec["note"] =
+            "Frozen session-substrate reference. session_golden is the byte-level id_slot session "
+            "response for the fixed request set (additive diagnostics excluded); cost_counters are "
+            "the exact session-arena trigger counters for a scripted create/query/advance sequence; "
+            "window_restore is the whole-context save/restore behavior for one slot.";
+        write_file(session_baseline_path(backend), rec.dump(1) + "\n");
+    } catch (const std::exception & e) {
+        fprintf(stderr, "failed to record the %s session baseline: %s\n", backend.c_str(), e.what());
+        return 2;
+    }
+    return 0;
+}
+
+static int check_session_baseline(const std::string & backend) {
+    const bool        gpu  = backend == "gpu";
+    const std::string file = session_baseline_path(backend);
+    if (!file_exists(file)) {
+        fprintf(stderr, "no %s session baseline at %s\n", backend.c_str(), file.c_str());
+        return 2;
+    }
+    std::string path;
+    if (gpu) {
+        const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (env == nullptr || env[0] == '\0') {
+            fprintf(stderr, "set LLAMA_DECISION_TEST_MODEL to check the GPU session baseline\n");
+            return 2;
+        }
+        path = env;
+    } else {
+        path = decision_cpu_model_path();
+        if (path.empty()) {
+            fprintf(stderr, "the CPU session baseline needs the generated model\n");
+            return 2;
+        }
+    }
+
+    const common_json expected = common_json::parse(read_file(file));
+    if (expected.value("model", std::string()) != model_identity(path)) {
+        fprintf(stderr, "the loaded model (%s) is not the recorded %s session baseline model (%s)\n",
+                model_identity(path).c_str(), backend.c_str(), expected.value("model", std::string()).c_str());
+        return 2;
+    }
+
+    std::string difference;
+    try {
+        const common_json actual = session_capture(path, gpu);
+        common_json e = expected;
+        common_json a = actual;
+        e.erase("note");
+        a.erase("note");
+        const std::string es = e.dump(1);
+        const std::string as = a.dump(1);
+        if (es == as) {
+            printf("the %s session baseline matches the frozen reference\n", backend.c_str());
+            return 0;
+        }
+        difference = first_line_difference(es, as);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "failed to recompute the %s session baseline: %s\n", backend.c_str(), e.what());
+        return 2;
+    }
+    fprintf(stderr, "the %s session baseline drifted from the frozen reference:\n%s\n", backend.c_str(), difference.c_str());
+    return 1;
+}
+
+// The suite gate: check whichever session baseline matches the model available in this lane.
+static void test_session_baseline(testing & t) {
+    t.test("the session substrate matches the frozen reference", [](testing & t) {
+        const char * env = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (env != nullptr && env[0] != '\0' && decision_gpu_available() &&
+            session_baseline_model("gpu") == model_identity(env)) {
+            try {
+                const common_json expected = common_json::parse(read_file(session_baseline_path("gpu")));
+                const common_json actual   = session_capture(env, true);
+                common_json e = expected;
+                common_json a = actual;
+                e.erase("note");
+                a.erase("note");
+                std::string difference;
+                if (e.dump(1) != a.dump(1)) {
+                    difference = first_line_difference(e.dump(1), a.dump(1));
+                }
+                t.assert_true("the gpu session baseline matches the frozen reference: " + difference,
+                              difference.empty());
+            } catch (const std::exception & e) {
+                t.assert_true(std::string("the gpu session baseline runs: ") + e.what(), false);
+            }
+            return;
+        }
+
+        const std::string path = decision_cpu_model_path();
+        if (path.empty() || session_baseline_model("cpu") != model_identity(path)) {
+            t.skip("no frozen session baseline matches the available model");
+            return;
+        }
+        try {
+            const common_json expected = common_json::parse(read_file(session_baseline_path("cpu")));
+            const common_json actual   = session_capture(path, false);
+            common_json e = expected;
+            common_json a = actual;
+            e.erase("note");
+            a.erase("note");
+            std::string difference;
+            if (e.dump(1) != a.dump(1)) {
+                difference = first_line_difference(e.dump(1), a.dump(1));
+            }
+            t.assert_true("the cpu session baseline matches the frozen reference: " + difference,
+                          difference.empty());
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the cpu session baseline runs: ") + e.what(), false);
+        }
+    });
+}
+
 // The suite gate: check whichever frozen baseline matches the model available in this lane.
 static void test_readout_baseline(testing & t) {
     t.test("the readout matches the frozen reproducibility baseline", [](testing & t) {
@@ -7513,6 +9699,22 @@ int main(int argc, char ** argv) {
         }
         return check_readout_baseline(backend);
     }
+    if (argc > 2 && std::string(argv[1]) == "--record-session") {
+        const std::string backend = argv[2];
+        if (backend != "cpu" && backend != "gpu") {
+            fprintf(stderr, "--record-session needs a backend: cpu or gpu\n");
+            return 2;
+        }
+        return write_session_baseline(backend);
+    }
+    if (argc > 2 && std::string(argv[1]) == "--check-session") {
+        const std::string backend = argv[2];
+        if (backend != "cpu" && backend != "gpu") {
+            fprintf(stderr, "--check-session needs a backend: cpu or gpu\n");
+            return 2;
+        }
+        return check_session_baseline(backend);
+    }
 
     testing t;
     if (argc > 1) {
@@ -7557,7 +9759,12 @@ int main(int argc, char ** argv) {
         test_fork_oracle(t);
         test_nested_fork_oracle(t);
         test_session_fork(t);
-        test_session_arena(t);
+        test_session_registry(t);
+        test_session_handle(t);
+        test_clone_backend(t);
+        test_file_backend(t);
+        test_window_persistence(t);
+        test_budget_eviction(t);
         test_fork_auto_default(t);
         test_fork_strategy_switch(t);
         test_fork_divergence_control(t);
@@ -7576,6 +9783,7 @@ int main(int argc, char ** argv) {
         test_pool_seq_lifecycle(t);
         test_decision_cpu_oracle(t);
         test_readout_baseline(t);
+        test_session_baseline(t);
         test_compile_fields_plan(t);
         test_decide_batch_plan_overload(t);
         test_prefix_cache_coherence(t);

@@ -92,6 +92,13 @@ struct server_context {
     // returns true on success
     bool load_model(common_params & params);
 
+    // The whole context was replaced or loaded (model reload, whole-context state load/clear):
+    // bump the decision memory epoch so every retained session reference from the previous
+    // generation is refused as stale (HTTP 409) instead of answered from old state. Called by the
+    // server on any whole-context replace/load; session references re-created after the call start
+    // at the current epoch.
+    void on_memory_invalidated();
+
     // this function will block main thread until termination
     void start_loop();
 
@@ -154,6 +161,10 @@ struct server_routes {
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t post_decision;
+    server_http_context::handler_t post_session;
+    server_http_context::handler_t get_session;
+    server_http_context::handler_t delete_session;
+    server_http_context::handler_t patch_session;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
 

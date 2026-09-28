@@ -36,6 +36,14 @@ struct semantic_error : std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+// A retained-turn reference outlived the memory epoch it was captured under (a model reload or a
+// whole-context load/clear). The server maps this to HTTP 409 (stale session); it is NEVER a
+// semantic_error (422): "stale" and "invalid request" are different outcomes, and a stale
+// reference is never answered from old state.
+struct stale_error : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // FNV-1a 64 over the bytes of `s` (offset basis 1469598103934665603, prime 1099511628211).
 // The single hash primitive behind the decision prefix tag and the permutation seed.
 uint64_t fnv1a64(const std::string & s);
@@ -94,14 +102,16 @@ struct decision_question {
 };
 
 // A request may name a live chat slot to answer about, so the transcript is not re-prefilled.
-// `present` is true only when id_slot is supplied; `session_pos` is the source's next position
-// when pinned by the caller and -1 when the server derives it from the slot. `turn` is an opaque
-// client tag that must match the slot's retained snapshot; a mismatch is a 409/422, never a
-// silent answer about a different turn. All are capability inputs: the slot must exist, hold
-// decoded state, and the position must continue it exactly.
+// `present` is true only when id_slot or session_id is supplied; `session_pos` is the source's
+// next position when pinned by the caller and -1 when the server derives it from the slot. `turn`
+// is an opaque client tag that must match the slot's retained snapshot; a mismatch is a 409/422,
+// never a silent answer about a different turn. All are capability inputs: the slot must exist,
+// hold decoded state, and the position must continue it exactly. `session_id` names a first-class
+// server-side session handle and is mutually exclusive with `id_slot`.
 struct session_ref {
     bool        present     = false;
     int         id_slot     = -1;
+    std::string session_id; // first-class session handle; mutually exclusive with id_slot
     int         session_pos = -1;
     std::string turn;       // opaque turn tag, matched against the retained snapshot
 };

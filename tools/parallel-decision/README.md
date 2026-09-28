@@ -200,20 +200,31 @@ Both shapes are served by `POST /v1/decision`, the canonical route. `POST /decis
 alias for the same handler; use `/v1/decision`. `model` is optional and echoed back verbatim;
 `GET /v1/models` keeps the OpenAI list shape, not Jev's.
 
-### Live session (`id_slot`)
+### Live session (`id_slot`, `session_id`)
 
 Both shapes accept `id_slot` (and optional `session_pos` and `turn`) to answer about a chat slot
-that already holds decoded state, so the transcript is not re-prefilled. The slot must exist and
-hold state; a `session_pos` that does not exactly continue it is a 422. The generic shape scores
-one context per session request; the Jev shape appends the questions as a fresh user turn through
-the slot's chat template and runs full logits on the shared context. The server answers through an
-owned snapshot: on the first decision for the slot's current turn it serializes the slot's decoded
-state into a decision-owned arena sequence (`--decision-arena-seqs`), later decisions in the same
-turn fork the arena sequence, and the snapshot is released when the slot decodes past it (a new
-completed turn). One retained turn per slot; the opaque `turn` tag pins it, and a mismatched
-`turn` is a 422. A decision on an in-flight slot is a 422. The source slot
-is never mutated, and the response reports `session_fork`, `source_slot` and `session_pos`
-additively.
+that already holds decoded state, so the transcript is not re-prefilled. A first-class `session_id`
+is the alternative: a server-side handle decoupled from the reused `id_slot`, mutually exclusive
+with it (a body carrying both is a 400), with a create/query/pin/erase lifecycle over
+`POST/GET/PATCH/DELETE /v1/session`. The slot must exist and hold state; a `session_pos` that does
+not exactly continue it is a 422. The generic shape scores one context per session request; the Jev
+shape appends the questions as a fresh user turn through the slot's chat template and runs full
+logits on the shared context. The server answers through an owned reference: on the first decision
+for the slot's current turn it captures the slot's decoded state (`host`: host-format copy in a
+reserved `--decision-arena-seqs` sequence; `clone`: metadata-only shared cells on dense unified
+attention or recurrent/hybrid models; `file`: state on disk under `--slot-save-path` or
+`--decision-session-persist`), later decisions in the same turn fork the reference, and the
+reference is released when the slot decodes past it (a new completed turn). One retained turn per
+slot; the opaque `turn` tag pins it, and a mismatched `turn` is a 422. A decision on an in-flight
+slot is a 422. The source slot is never mutated, and the response reports `session_fork`,
+`source_slot` and `session_pos` additively. References are bound to a memory epoch: a whole-context
+replace/load or model reload makes every capture stale (HTTP 409), and a clear plus a same-length
+re-prefill of different content is refused instead of answered. A slot save co-writes a session
+manifest sidecar bound to the slot file by its content hash; a slot restore rebinds a matching
+manifest, marks a mismatched one unresolvable, and drops any retained reference the restore does
+not account for. Under a configured byte budget or TTL, the registry evicts the
+least-recently-used unpinned, unleased reference and reaps expired unpinned references; the
+defaults never evict.
 
 ### Limits and errors
 

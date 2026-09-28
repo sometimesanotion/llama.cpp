@@ -13,7 +13,8 @@ add_library(llama-decision STATIC
         generic_frontend.cpp generic_frontend.h
         labels.cpp labels.h
         letter_readout.cpp letter_readout.h
-        session_arena.cpp session_arena.h)
+        session-registry.cpp session-registry.h
+        session-store.cpp session-store.h)
     target_include_directories(llama-decision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(llama-decision PUBLIC llama-common llama)
     target_compile_features(llama-decision PUBLIC cxx_std_17)

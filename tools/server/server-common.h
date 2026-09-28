@@ -69,6 +69,7 @@ enum error_type {
     ERROR_TYPE_RATE_LIMIT,        // custom error: decision queue full (429)
     ERROR_TYPE_CLIENT_CLOSED,     // custom error: client disconnected mid-evaluation (499)
     ERROR_TYPE_OVERLOADED,        // custom error: server overloaded (529)
+    ERROR_TYPE_CONFLICT,          // custom error: a stale session reference (409)
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions
