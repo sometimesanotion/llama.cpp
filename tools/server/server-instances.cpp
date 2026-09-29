@@ -484,8 +484,10 @@ server_http_res_ptr server_instances::dispatch(const server_http_req & req, cons
     }
 
     // A stateless request that names no target may be pinned to a declared decision
-    // instance; a session-pinned request must name the owning instance instead.
-    if (!opt.require_instance && model_id.empty() && instance_field.empty() && !opt.implicit_instance.empty()) {
+    // instance; a session-pinned request must name the owning instance instead. A bare
+    // pool id is not a target: handle_post_decision stamps it onto an untargeted body.
+    if (!opt.require_instance && (model_id.empty() || model_id == base_name) && instance_field.empty() &&
+        !opt.implicit_instance.empty()) {
         instance_field = opt.implicit_instance;
     }
 
