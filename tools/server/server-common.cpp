@@ -69,6 +69,30 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_INVALID_REQUEST_SEMANTIC:
+            type_str = "invalid_request_error";
+            code = 422;
+            break;
+        case ERROR_TYPE_PAYLOAD_TOO_LARGE:
+            type_str = "payload_too_large";
+            code = 413;
+            break;
+        case ERROR_TYPE_RATE_LIMIT:
+            type_str = "rate_limit_error";
+            code = 429;
+            break;
+        case ERROR_TYPE_CLIENT_CLOSED:
+            type_str = "client_closed_request";
+            code = 499;
+            break;
+        case ERROR_TYPE_OVERLOADED:
+            type_str = "overloaded_error";
+            code = 529;
+            break;
+        case ERROR_TYPE_CONFLICT:
+            type_str = "conflict_error";
+            code = 409;
+            break;
     }
     return json {
         {"code", code},

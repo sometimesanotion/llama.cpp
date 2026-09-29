@@ -465,6 +465,16 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t n_seq_decision        =     0; // sequences reserved for llama-server's /decision endpoint (0 = disabled)
+    int32_t n_seq_arena           =     0; // sequences reserved for decision session snapshots (0 = derive from n_parallel when decisions are enabled)
+    std::string decision_temperature;      // optional calibrated per-type decision temperatures with provenance
+    std::string decision_contract;         // optional expected contract hash; the decision path refuses a mismatch
+    int32_t n_decision_permutations = 1;   // default order-de-bias passes when a request omits "permutations"
+    std::string decision_session_backend;  // default retained-turn backend for created sessions: host (default) | clone | file
+    int64_t decision_session_ttl_ms = 0;   // default ttl for created sessions, ms (0 = no expiry)
+    int32_t decision_session_budget_mb = 0;// byte budget for all retained references (0 = unlimited)
+    std::string decision_session_persist;  // writable directory for the file backend; else slot_save_path
+    std::string decision_instance;         // multi-instance: route stateless decisions to this instance when the request names none
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
@@ -583,6 +593,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool kv_unified_explicit = false; // kv_unified was set on the command line or via env (not defaulted)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

@@ -284,6 +284,8 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    // LFM2 stops at the post-norm hidden state through the embeddings seam: an embeddings
+    // context requests the hidden state, so the output projection is skipped there
     if (!cparams.embeddings) {
         cur = build_lora_mm(model.output, cur, model.output_s);
         cb(cur, "result_output", -1);

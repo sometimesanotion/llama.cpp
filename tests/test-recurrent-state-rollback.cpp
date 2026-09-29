@@ -45,6 +45,11 @@ struct cache_buffer_collector : llama_io_write_i {
         size += n;
     }
 
+    void write_tensor_strided(ggml_tensor * tensor, size_t, size_t row_size, size_t n_rows, size_t) override {
+        buffers.insert(tensor->buffer);
+        size += row_size * n_rows;
+    }
+
     size_t n_bytes() override {
         return size;
     }

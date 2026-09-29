@@ -1,34 +1,41 @@
 #include "server-context.h"
-#include "server-chat.h"
-#include "server-common.h"
-#include "server-http.h"
-#include "server-task.h"
-#include "server-queue.h"
-#include "server-schema.h"
-#include "server-stream.h"
 
 #include "build-info.h"
 #include "common.h"
+#include "decision-engine.h"
+#include "decision-protocol.h"
 #include "fit.h"
+#include "generic_frontend.h"
+#include "labels.h"
+#include "letter_readout.h"
 #include "llama.h"
 #include "log.h"
-#include "sampling.h"
-#include "speculative.h"
-#include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd.h"
+#include "sampling.h"
+#include "server-chat.h"
+#include "server-common.h"
+#include "server-decision-state.h"
+#include "server-http.h"
+#include "server-queue.h"
+#include "server-schema.h"
+#include "server-stream.h"
+#include "server-task.h"
+#include "speculative.h"
 
 #include "../../src/llama-ext.h" // llama_get_memory_breakdown for the manager memory-reporting API
 
 #include <algorithm>
 #include <chrono>
-#include <cstddef>
 #include <cinttypes>
+#include <cstddef>
 #include <exception>
-#include <memory>
 #include <filesystem>
-#include <random>
-#include <utility>
 #include <fstream>
+#include <memory>
+#include <random>
+#include <thread>
+#include <utility>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -39,6 +46,28 @@
 #include <windows.h>
 #endif
 
+// The manifest sidecar is written next to the slot save file and read back on restore; these
+// helpers move its raw bytes and test for its presence.
+static bool server_read_file(const std::string & path, std::string & out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static bool server_write_file(const std::string & path, const std::string & bytes) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        return false;
+    }
+    out << bytes;
+    return (bool) out;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -47,6 +76,13 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+
+    // /decision scores one output row per branch sequence, all in the same ubatch. Chat and
+    // decision decodes never run at the same time on the one context, so the shared row budget is
+    // the larger of the chat need and the decision need - not their sum. The context also holds
+    // every decision sequence alongside the chat slots, so the budget must always cover the full
+    // sequence count (n_parallel + n_seq_decision), which the context's output reserve requires.
+    result.total = std::max(result.total, params.n_parallel + params.n_seq_decision + params.n_seq_arena);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -859,6 +895,7 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
+    server_decision_state decision; // all /v1/decision state tied to the loaded model
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
@@ -1001,6 +1038,8 @@ private:
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
+
+        decision.reset();
 
         llama_init.reset();
 
@@ -1195,6 +1234,10 @@ private:
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
+        // a whole-context replace/load starts a new memory generation: any retained session capture
+        // from the previous generation is stale (409), never answered from old state
+        decision.on_memory_invalidated();
+
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (has_spec) {
@@ -1381,8 +1424,20 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                // the instance manager uses this to wake group-dispatch waiters
                 if (callback_on_slot_release) {
                     callback_on_slot_release(id_slot);
+                }
+                // a completed turn advances the slot: an eager session captures it, any retained
+                // session whose turn is over is released, so the next decision never answers a
+                // previous turn
+                if (decision.decision_sessions) {
+                    server_slot * released = get_slot_by_id(id_slot);
+                    const llama_tokens prefix =
+                        released != nullptr ? released->prompt.tokens.get_tokens() : llama_tokens{};
+                    const std::string scope =
+                        released != nullptr ? adapter_scope_of(released->lora) : std::string();
+                    decision.decision_sessions->on_turn_complete(id_slot, prefix, scope);
                 }
             };
 
@@ -1619,6 +1674,22 @@ private:
         }
 
         return nullptr;
+    }
+
+    // The retained-turn session registry, created on first use. One owned reference per chat slot,
+    // restored into a reserved arena sequence so a decision about a slot survives cache_idle_slots
+    // clears. The registry starts at the current memory epoch; captures record it and a
+    // whole-context replace/load bumps it, making every old capture stale (409).
+    llama_decision::session_registry & decision_registry() {
+        if (!decision.decision_sessions) {
+            const std::string file_dir = !params_base.decision_session_persist.empty()
+                ? params_base.decision_session_persist : params_base.slot_save_path;
+            decision.decision_sessions = std::make_unique<llama_decision::session_registry>(
+                ctx_tgt, (llama_seq_id) (params_base.n_parallel + params_base.n_seq_decision),
+                params_base.n_seq_arena, params_base.n_parallel, decision.memory_epoch,
+                file_dir, (size_t) params_base.decision_session_budget_mb * 1024 * 1024);
+        }
+        return *decision.decision_sessions;
     }
 
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
@@ -2485,7 +2556,616 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // The decision decode scope. A stateless request answers for the base model, so adapters
+    // applied for chat must not leak into it. A live-session decision reads the slot's own K/V,
+    // so it must use the adapter set that conditioned that K/V: decoding it under base weights
+    // would attend adapter-conditioned cells with base queries. Chat re-applies its own set
+    // before every batch, so the scope set here never leaks.
+    void decision_scope_adapters(server_slot * slot) {
+        if (!ctx_tgt) {
+            return;
+        }
+        // common_set_adapter_lora takes a mutable reference; it only reads the entries
+        static std::vector<common_adapter_lora_info> base;
+        common_set_adapter_lora(ctx_tgt, slot != nullptr ? slot->lora : base);
+    }
+
+    // The identity of the active adapter set for a slot: "" for the base model, else a hash of the
+    // enabled (name, scale) pairs. A retained turn captured under one scope is never answered under
+    // another, so the session identity records this and resolve refuses a scope change.
+    static std::string adapter_scope_of(const std::vector<common_adapter_lora_info> & loras) {
+        std::string scope;
+        for (const auto & lora : loras) {
+            if (lora.scale <= 0.0f) {
+                continue;
+            }
+            scope += lora.path + "@" + std::to_string(lora.scale) + ";";
+        }
+        if (scope.empty()) {
+            return std::string();
+        }
+        return "adapter-scope-v1:" + std::to_string(llama_decision::fnv1a64(scope));
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
+    // POST /decision: answer a finite JSON schema in one batched pass on this thread.
+    // Uses the sequence ids above the slots reserved by --decision-seqs (see tools/parallel-decision).
+    json handle_decision(const json & body, const std::shared_ptr<std::atomic<bool>> & cancel_flag = nullptr) {
+        if (params_base.n_seq_decision < 3) {
+            throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
+        }
+        // A session decision holds a lease on its materialized reference for the duration of the
+        // decode, so a concurrent capture never evicts it mid-decision. The guard releases the
+        // lease on every exit path.
+        struct session_lease_guard {
+            llama_decision::session_registry * registry = nullptr;
+            int id_slot = -1;
+            ~session_lease_guard() {
+                if (registry != nullptr && id_slot >= 0) {
+                    registry->unlease(id_slot);
+                }
+            }
+        } lease_guard;
+        const llama_decision::request_shape shape = llama_decision::select_request_shape(body);
+        if (shape == llama_decision::request_shape::none) {
+            throw std::invalid_argument("request must be a decision request: schema, or questions with state/contexts");
+        }
+        // An optional live sessions reference: the slot holds the decoded evidence, so the request
+        // is answered by forking an owned reference instead of re-prefilling. The checks below are
+        // capability checks only (slot exists, turn complete, position continues it, turn identity
+        // matches); they never inspect a producer concentration score.
+        struct session_resolution {
+            server_slot * slot = nullptr;
+            llama_seq_id  seq  = -1;
+            llama_pos     pos  = -1;
+            std::string   turn; // retained-turn tag, echoed additively
+            std::string   session_id; // first-class session handle, echoed additively
+        };
+        auto resolve_session = [&](const llama_decision::session_ref & ref) -> session_resolution {
+            session_resolution out;
+            if (!ref.present) {
+                return out;
+            }
+            llama_decision::session_registry & registry = decision_registry();
+            server_slot * slot = nullptr;
+            if (!ref.session_id.empty()) {
+                // A first-class session handle: the session owns its source slot and turn.
+                const llama_decision::decision_session * sess = registry.find(ref.session_id);
+                if (sess == nullptr) {
+                    throw std::invalid_argument("session " + ref.session_id + " does not exist");
+                }
+                slot = get_slot_by_id(sess->id_slot);
+                if (slot == nullptr) {
+                    throw std::invalid_argument("session " + ref.session_id + " references a slot that does not exist");
+                }
+            } else {
+                if (ref.id_slot < 0 || ref.id_slot >= (int) slots.size()) {
+                    throw std::invalid_argument("id_slot " + std::to_string(ref.id_slot) + " is out of range [0, " +
+                                                std::to_string(slots.size()) + ")");
+                }
+                slot = get_slot_by_id(ref.id_slot);
+                if (slot == nullptr) {
+                    throw std::invalid_argument("id_slot " + std::to_string(ref.id_slot) + " does not exist");
+                }
+            }
+            // M4.4: an in-flight slot has no completed turn to answer about. This is a task-validity
+            // check (is the turn complete), never a read of a producer concentration score.
+            if (slot->is_processing()) {
+                throw llama_decision::semantic_error(
+                    "id_slot " + std::to_string(slot->id) + " is still processing; a decision needs a completed turn");
+            }
+            const llama_tokens      prefix       = slot->prompt.tokens.get_tokens();
+            const std::string       adapter_scope = adapter_scope_of(slot->lora);
+            const llama_pos         pos_max      = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+            llama_decision::resolved_session res;
+            if (!ref.session_id.empty()) {
+                res = registry.resolve(ref.session_id, prefix, adapter_scope);
+                if (ref.session_pos >= 0 && (llama_pos) ref.session_pos != res.pos) {
+                    throw llama_decision::semantic_error(
+                        "session_pos " + std::to_string(ref.session_pos) + " does not continue session " +
+                        ref.session_id + " (expected " + std::to_string(res.pos) + ")");
+                }
+            } else {
+                res = registry.resolve_slot(ref.id_slot, prefix, pos_max,
+                                            ref.session_pos, ref.turn, adapter_scope);
+            }
+            out.slot       = slot;
+            out.seq        = res.seq;
+            out.pos        = res.pos;
+            out.turn       = res.turn;
+            out.session_id = res.session_id;
+            // The materialized reference is held for the in-flight decision: a concurrent capture
+            // (from another request on the scheduler thread) must not evict it mid-decode.
+            if (out.seq >= 0) {
+                lease_guard.registry = &registry;
+                lease_guard.id_slot  = slot->id;
+                registry.lease(slot->id);
+            }
+            return out;
+        };
+        // Generic front-end: a JSON schema or compact typed fields compiled into engine-facing
+        // field inputs and scored by the same engine the Jev readout uses. The evidence source
+        // (state, contexts, session) is orthogonal to the front-end.
+        if (shape == llama_decision::request_shape::generic) {
+            llama_decision::generic_request greq = llama_decision::parse_generic_request(body);
+            const session_resolution          sess = resolve_session(greq.session);
+            if (sess.slot != nullptr && !greq.evidence.contexts.empty()) {
+                throw std::invalid_argument("a session decision scores exactly one context");
+            }
+            // One full-logits engine on the shared context, shared with the Jev path.
+            if (!decision.decision_letter_engine) {
+                decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
+                    ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
+            }
+            llama_decision::options gopt;
+            gopt.mode        = greq.mode;
+            gopt.tree_max    = greq.tree_max;
+            gopt.allow_cache = greq.allow_cache;
+            if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
+                gopt.fork = fork;
+            }
+            if (cancel_flag) {
+                gopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
+            }
+            gopt.yield = []() { std::this_thread::yield(); };
+            if (sess.slot != nullptr && !decision.decision_letter_engine->session_fork_supported(gopt.fork)) {
+                throw std::invalid_argument(
+                    "a session decision needs an exact fork on this model; fork \"" + gopt.fork +
+                    "\" would not reproduce the slot state");
+            }
+
+            llama_decision::compiled_schema cs = llama_decision::compile_schema(greq.schema, greq.instructions);
+            llama_decision::batch_result    b;
+            queue_tasks.yield_to_queue([&]() {
+                decision_scope_adapters(sess.slot);
+                if (sess.slot != nullptr) {
+                    // a live-session generic answer appends the schema as a fresh user turn
+                    const auto turn = llama_decision::split_user_turn(chat_params.tmpls.get(), chat_params.use_jinja);
+                    const auto sinputs = llama_decision::session_field_inputs(cs, turn.first, turn.second);
+                    llama_decision::options so = gopt;
+                    so.cache_tag = llama_decision::make_prefix_tag(cs.system_text, turn.second,
+                                                                   llama_decision::GENERIC_PROMPT_VERSION);
+                    const auto plan = decision.decision_letter_engine->compile_fields(sinputs, so);
+                    b = decision.decision_letter_engine->decide_batch_from_seq(sess.seq, sess.pos, plan, so);
+                } else {
+                    // stateless: one rendered evidence per context, or the single state
+                    std::vector<std::string> evidence;
+                    if (!greq.evidence.contexts.empty()) {
+                        for (const auto & c : greq.evidence.contexts) {
+                            evidence.push_back(llama_decision::render_state(c));
+                        }
+                    } else {
+                        evidence.push_back(llama_decision::render_state(greq.evidence.state));
+                    }
+                    std::string shared;
+                    std::vector<std::string> dynamic;
+                    for (const auto & ev : evidence) {
+                        const auto parts = llama_decision::render_schema_prompt(
+                            chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text, ev);
+                        if (dynamic.empty()) {
+                            shared = parts.first;
+                        } else if (parts.first != shared) {
+                            throw std::runtime_error("the chat template renders a different prefix per context");
+                        }
+                        dynamic.push_back(parts.second);
+                    }
+                    gopt.cache_tag = llama_decision::generic_cache_tag(
+                        chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text);
+                    const auto plan = decision.decision_letter_engine->compile_fields(cs.inputs, gopt);
+                    b = decision.decision_letter_engine->decide_batch(plan, shared, dynamic, gopt);
+                }
+            });
+
+            const std::string echo = (greq.model.empty() || greq.model == "jev-latest" || greq.model == "jev-preview")
+                ? model_name : greq.model;
+            size_t context_tokens = 0;
+            json results = json::array();
+            for (const auto & item : b.items) {
+                context_tokens += item.context_tokens;
+                json record = llama_decision::assemble(cs, item);
+                record["usage"] = {
+                    { "context_tokens", (long long) item.context_tokens },
+                    { "scored_rows",    (long long) item.rows },
+                };
+                results.push_back(std::move(record));
+            }
+            json usage = json::object();
+            usage["input_tokens"]    = (long long) (b.shared_tokens + context_tokens);
+            usage["output_tokens"]   = 0;
+            usage["cached_tokens"]   = (long long) (b.cache_hit ? b.shared_tokens : 0);
+            usage["state_cache_hit"] = b.cache_hit;
+            json timings = json::object();
+            timings["prefill_ms"] = b.prefill_ms;
+            timings["scoring_ms"] = b.scoring_ms;
+            timings["total_ms"]   = b.prefill_ms + b.scoring_ms;
+            timings["rounds"]     = b.rounds;
+            timings["rows"]       = b.rows;
+            timings["per_decision_ms"] = b.items.empty()
+                ? 0.0 : (b.prefill_ms + b.scoring_ms) / (double) b.items.size();
+            json out = json::object();
+            out["model"]   = echo;
+            out["results"] = results;
+            out["usage"]   = usage;
+            out["timings"] = timings;
+            return out;
+        }
+        // Decision shape: state + typed questions, scored as one next-token choice over the
+        // verified letter labels, sharing one framed state prefix across all questions.
+        if (shape == llama_decision::request_shape::jev) {
+            llama_decision::decision_request req = llama_decision::parse_decision_request(body);
+            // A deployment may opt in to more order-de-bias passes by default; the request field
+            // always wins, so an explicit value is never overridden. This is a cost/quality knob,
+            // never an answer gate.
+            if (!body.contains("permutations") || body.at("permutations").is_null()) {
+                req.permutations = params_base.n_decision_permutations;
+            }
+            // the additive diagnostics object (contract identity, provenance) is opt-in;
+            // the default envelope must stay the strict Jev shape
+            const bool                              want_diagnostics = req.diagnostics;
+            const session_resolution                  sess = resolve_session(req.session);
+            if (sess.slot != nullptr && !req.contexts.empty()) {
+                throw std::invalid_argument("a session decision scores exactly one context");
+            }
+            const bool adapters_on = decision.adapters_configured(params_base.lora_adapters);
+            // One full-logits engine on the shared context.
+            if (!decision.decision_letter_engine) {
+                decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
+                    ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
+            }
+            llama_decision::readout_sources sources;
+            sources.full = decision.decision_letter_engine.get();
+            llama_decision::session_source session_source;
+            if (sess.slot != nullptr) {
+                session_source.seq      = sess.seq;
+                session_source.base_pos = sess.pos;
+                sources.session         = &session_source;
+            }
+            if (!decision.decision_label_vocab) {
+                decision.decision_label_vocab = llama_decision::make_llama_label_vocab(
+                    llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                try {
+                    const auto parts = llama_decision::render_letter_prompt(
+                        chat_params.tmpls.get(), chat_params.use_jinja, llama_decision::letter_system_text());
+                    const std::string tail = llama_decision::letter_answer_tail(parts.second);
+                    size_t pool_cap = llama_decision::LABEL_POOL_CAP;
+                    if (const char * e = std::getenv("LLAMA_DECISION_POOL_CAP")) {
+                        const long v = std::atol(e);
+                        if (v >= 2) {
+                            pool_cap = (size_t) v;
+                        }
+                    }
+                    decision.decision_labels = llama_decision::build_label_pool(*decision.decision_label_vocab, tail, pool_cap);
+                    llama_decision::verify_label_pool(*decision.decision_label_vocab, decision.decision_labels, tail);
+                    SRV_INF("decision label pool: %zu labels (cap %zu)\n", decision.decision_labels.size(),
+                            llama_decision::LABEL_POOL_CAP);
+                    const std::string template_hash = llama_decision::make_prefix_tag(
+                        parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
+                    decision.decision_contract = llama_decision::decision_contract_hash(
+                        model_name, template_hash, llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
+                    SRV_INF("decision contract: %s\n", decision.decision_contract.c_str());
+                    if (!params_base.decision_contract.empty() && params_base.decision_contract != decision.decision_contract) {
+                        decision.decision_label_error = "decision contract mismatch: expected " + params_base.decision_contract +
+                                               ", running " + decision.decision_contract;
+                    }
+                } catch (const std::exception & e) {
+                    decision.decision_label_error = e.what();
+                }
+            }
+            if (!decision.decision_label_error.empty()) {
+                throw llama_decision::unsupported_error(
+                    "this model cannot serve decision questions: " + decision.decision_label_error);
+            }
+
+            if (!params_base.decision_temperature.empty()) {
+                if (!decision.decision_temp_loaded) {
+                    std::ifstream in(params_base.decision_temperature);
+                    if (!in) {
+                        throw std::runtime_error("cannot read --decision-temperature file: " + params_base.decision_temperature);
+                    }
+                    std::stringstream ss;
+                    ss << in.rdbuf();
+                    decision.decision_temp_profile = llama_decision::parse_temperature_profile(json::parse(ss.str()));
+
+                    const llama_decision::temperature_provenance current =
+                        llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
+                                                                    chat_params.tmpls.get(), chat_params.use_jinja);
+                    try {
+                        llama_decision::validate_temperature_profile(decision.decision_temp_profile, current);
+                    } catch (const llama_decision::semantic_error & e) {
+                        // a stale profile is a server configuration problem, not a client error
+                        throw std::runtime_error(std::string("decision temperature profile: ") + e.what());
+                    }
+                    decision.decision_temp_loaded = true;
+                }
+                if (!req.temperatures.is_object()) {
+                    json temps = json::object();
+                    for (const auto & kv : decision.decision_temp_profile.temperatures) {
+                        temps[kv.first] = kv.second;
+                    }
+                    req.temperatures = temps;
+                }
+            }
+
+            llama_decision::options jopt;
+            if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
+                jopt.fork = fork;
+            }
+            if (cancel_flag) {
+                jopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
+            }
+            jopt.yield = []() { std::this_thread::yield(); };
+            if (sess.slot != nullptr && !decision.decision_letter_engine->session_fork_supported(jopt.fork)) {
+                throw std::invalid_argument(
+                    "a session decision needs an exact fork on this model; fork \"" + jopt.fork +
+                    "\" would not reproduce the slot state");
+            }
+            llama_decision::letter_metrics metrics;
+            std::vector<std::vector<std::vector<float>>> all_probs;
+            // run inside a yield so metrics/slot requests are served while the decision computes
+            queue_tasks.yield_to_queue([&]() {
+                // the readout decodes on the shared context, scoped to the slot's adapters for a
+                // live-session fork and to the base model for a stateless request
+                decision_scope_adapters(sess.slot);
+                all_probs = llama_decision::letter_readout_multi(sources, *decision.decision_label_vocab,
+                                                                 chat_params.tmpls.get(),
+                                                                 chat_params.use_jinja, req, decision.decision_labels, jopt,
+                                                                 &metrics);
+            });
+
+            const bool multi = !req.contexts.empty();
+            json usage = json::object();
+            usage["input_tokens"]    = (long long) (metrics.shared_tokens + metrics.context_tokens);
+            usage["output_tokens"]   = 0;
+            usage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
+            usage["state_cache_hit"] = metrics.cache_hit;
+
+            json timings = json::object();
+            timings["prefill_ms"] = metrics.prefill_ms;
+            timings["scoring_ms"] = metrics.scoring_ms;
+            timings["total_ms"]   = metrics.prefill_ms + metrics.scoring_ms;
+            timings["rounds"]     = metrics.rounds;
+            timings["rows"]       = metrics.rows;
+            timings["per_decision_ms"] = all_probs.empty()
+                ? 0.0 : (metrics.prefill_ms + metrics.scoring_ms) / (double) all_probs.size();
+
+            // The echoed model identity: the Jev aliases resolve to the loaded (chat slot) model; any other
+            // requested id is echoed verbatim; an omitted model defaults to the loaded model.
+            const std::string echo = (req.model.empty() || req.model == "jev-latest" || req.model == "jev-preview")
+                ? model_name : req.model;
+            json decision_diagnostics = json::object();
+            if (want_diagnostics) {
+                // additive diagnostics: the readout contract identity this server is running
+                decision_diagnostics["diagnostics"] = json::object();
+                decision_diagnostics["diagnostics"]["contract_hash"]  = decision.decision_contract;
+                decision_diagnostics["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
+                decision_diagnostics["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
+                decision_diagnostics["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
+                decision_diagnostics["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
+                decision_diagnostics["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
+                decision_diagnostics["diagnostics"]["label_pool_size"]      = (long long) metrics.label_pool_size;
+                decision_diagnostics["diagnostics"]["permutations"]         = req.permutations;
+                decision_diagnostics["diagnostics"]["adapters_configured"] = adapters_on;
+                // a live-session readout reports the scope it actually decoded under; the base
+                // scope keeps the historical "base" label
+                const std::string readout_scope = sess.slot != nullptr ? adapter_scope_of(sess.slot->lora) : std::string();
+                decision_diagnostics["diagnostics"]["adapter_scope"] = readout_scope.empty() ? "base" : readout_scope;
+                const llama_decision::temperature_provenance prov =
+                    llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
+                                                                chat_params.tmpls.get(), chat_params.use_jinja);
+                decision_diagnostics["diagnostics"]["model"]          = prov.model;
+                decision_diagnostics["diagnostics"]["quantization"]   = prov.quantization;
+                decision_diagnostics["diagnostics"]["template_hash"]  = prov.template_hash;
+                decision_diagnostics["diagnostics"]["backend_flags"]  = prov.backend_flags;
+            }
+            // a session answer reports the fork it took so a caller can tell it apart from a
+            // stateless answer; these are additive and never change an answer
+            if (sess.slot != nullptr) {
+                decision_diagnostics["session_fork"] = true;
+                decision_diagnostics["source_slot"]  = sess.slot->id;
+                decision_diagnostics["session_pos"]  = (long long) sess.pos;
+                if (!sess.session_id.empty()) {
+                    decision_diagnostics["session_id"] = sess.session_id;
+                }
+                if (!sess.turn.empty()) {
+                    decision_diagnostics["turn"] = sess.turn;
+                }
+            }
+            const bool emit_diagnostics = want_diagnostics || sess.slot != nullptr;
+            if (!multi) {
+                json out = llama_decision::assemble_decision_response(
+                    req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
+                    echo, usage, emit_diagnostics ? &decision_diagnostics : nullptr);
+                if (emit_diagnostics) {
+                    out["timings"] = timings;
+                }
+                return out;
+            }
+            // Multi-context: answers grouped per context, in request order. The `contexts` key is the
+            // one extension over the Jev single-state envelope, so a single-state client is unchanged.
+            json contexts_resp = json::array();
+            for (size_t ci = 0; ci < all_probs.size(); ++ci) {
+                json cusage = json::object();
+                cusage["input_tokens"] = (long long) (metrics.shared_tokens +
+                    (ci < metrics.per_context_tokens.size() ? metrics.per_context_tokens[ci] : 0));
+                cusage["output_tokens"]   = 0;
+                cusage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
+                cusage["state_cache_hit"] = metrics.cache_hit;
+                json ans = llama_decision::assemble_decision_response(
+                    req, all_probs[ci], echo, cusage, nullptr);
+                contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
+            }
+            json out = json::object();
+            out["model"]    = echo;
+            out["contexts"] = contexts_resp;
+            if (emit_diagnostics) {
+                out["timings"] = timings;
+                for (auto it = decision_diagnostics.begin(); it != decision_diagnostics.end(); ++it) {
+                    out[it.key()] = it.value();
+                }
+            }
+            return out;
+        }
+        // unreachable: select_request_shape rejects every other body at the top
+        throw std::invalid_argument("request must be a decision request: schema, or questions with state/contexts");
+    }
+
+    // POST/GET/DELETE/PATCH /v1/session: thin adapters over the session registry. Runs on the
+    // scheduler thread so the slot KV and the registry are only touched there.
+    json handle_session(const server_task::session_action & action) {
+        json out;
+        switch (action.action) {
+            case server_task::session_action::create:
+                {
+                    if (params_base.n_seq_decision < 3) {
+                        throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
+                    }
+                    const json & body = action.body;
+                    const int id_slot = body.value("id_slot", -1);
+                    if (id_slot < 0 || id_slot >= (int) slots.size()) {
+                        throw std::invalid_argument("id_slot " + std::to_string(id_slot) + " is out of range [0, " +
+                                                    std::to_string(slots.size()) + ")");
+                    }
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        throw std::invalid_argument("id_slot " + std::to_string(id_slot) + " does not exist");
+                    }
+                    if (slot->is_processing()) {
+                        throw llama_decision::semantic_error(
+                            "id_slot " + std::to_string(id_slot) + " is still processing; a session needs a completed turn");
+                    }
+                    llama_decision::session_registry & registry = decision_registry();
+                    llama_decision::session_create_request req;
+                    req.id_slot       = id_slot;
+                    req.prefix        = slot->prompt.tokens.get_tokens();
+                    req.adapter_scope = adapter_scope_of(slot->lora);
+                    req.turn          = body.value("turn", std::string());
+                    auto backend_of = [](const std::string & b) -> llama_decision::session_backend {
+                        if (b == "host") {
+                            return llama_decision::session_backend::host;
+                        }
+                        if (b == "clone") {
+                            return llama_decision::session_backend::clone;
+                        }
+                        if (b == "file") {
+                            return llama_decision::session_backend::file;
+                        }
+                        throw llama_decision::semantic_error("unknown session backend: " + b);
+                    };
+                    if (body.contains("policy") && body.at("policy").is_object()) {
+                        const json & p = body.at("policy");
+                        // an explicit request backend wins; otherwise the server default applies
+                        if (p.contains("backend")) {
+                            req.policy.backend = backend_of(p.at("backend").get<std::string>());
+                        } else if (!params_base.decision_session_backend.empty()) {
+                            req.policy.backend = backend_of(params_base.decision_session_backend);
+                        }
+                        if (p.contains("capture_on_turn_complete")) {
+                            req.policy.capture_on_turn_complete = p.at("capture_on_turn_complete").get<bool>();
+                        }
+                        if (p.contains("pinned")) {
+                            req.policy.pinned = p.at("pinned").get<bool>();
+                        }
+                        if (p.contains("ttl_ms")) {
+                            req.policy.ttl_ms = p.at("ttl_ms").get<int64_t>();
+                        } else {
+                            req.policy.ttl_ms = params_base.decision_session_ttl_ms;
+                        }
+                        if (p.contains("max_turns")) {
+                            req.policy.max_turns = (size_t) p.at("max_turns").get<long long>();
+                        }
+                    } else {
+                        if (!params_base.decision_session_backend.empty()) {
+                            req.policy.backend = backend_of(params_base.decision_session_backend);
+                        }
+                        req.policy.ttl_ms = params_base.decision_session_ttl_ms;
+                    }
+                    const std::string sid = registry.create(req);
+                    out["session_id"] = sid;
+                    out["id_slot"]    = id_slot;
+                    out["turn"]       = req.turn;
+                    out["backend"]    = session_backend_name(req.policy.backend);
+                    out["captured"]   = registry.find(sid) != nullptr && registry.find(sid)->captured;
+                } break;
+            case server_task::session_action::get:
+                {
+                    if (!decision.decision_sessions) {
+                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                    }
+                    llama_decision::session_registry & registry = *decision.decision_sessions;
+                    const llama_decision::decision_session * sess = registry.find(action.session_id);
+                    if (sess == nullptr) {
+                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                    }
+                    out["session_id"]   = action.session_id;
+                    out["id_slot"]      = sess->id_slot;
+                    out["turn"]         = sess->turn;
+                    out["backend"]      = session_backend_name(sess->policy.backend);
+                    out["pinned"]       = sess->policy.pinned;
+                    out["ttl_ms"]       = (long long) sess->policy.ttl_ms;
+                    out["captured"]     = sess->captured;
+                    out["bytes"]        = (long long) sess->capture.n_bytes;
+                    out["created_ms"]   = (long long) sess->created_ms;
+                    out["last_used_ms"] = (long long) sess->last_used_ms;
+                    out["counters"]     = {
+                        { "n_snapshots", registry.n_snapshots() },
+                        { "n_reuses",    registry.n_reuses() },
+                        { "n_releases",  registry.n_releases() },
+                        { "n_evictions", registry.n_evictions() },
+                        { "n_ttl_reaps", registry.n_ttl_reaps() },
+                        { "n_sessions",  (long long) registry.n_sessions() },
+                        { "bytes_total", (long long) registry.bytes() },
+                        // how many reserved sequences are materialized right now: a non-resident
+                        // backend returns to 0 between decisions
+                        { "arena_used",     (long long) registry.arena_used() },
+                        { "arena_capacity", (long long) registry.capacity() },
+                    };
+                } break;
+            case server_task::session_action::erase:
+                {
+                    const bool erased = decision.decision_sessions != nullptr &&
+                                        decision.decision_sessions->erase(action.session_id);
+                    if (!erased) {
+                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                    }
+                    out["session_id"] = action.session_id;
+                    out["erased"]     = true;
+                } break;
+            case server_task::session_action::patch:
+                {
+                    if (!decision.decision_sessions) {
+                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                    }
+                    llama_decision::session_registry & registry = *decision.decision_sessions;
+                    const json & body = action.body;
+                    bool set_pinned = false, pinned = false;
+                    bool set_ttl = false;
+                    int64_t ttl_ms = 0;
+                    if (body.contains("pinned")) {
+                        set_pinned = true;
+                        pinned     = body.at("pinned").get<bool>();
+                    }
+                    if (body.contains("ttl_ms")) {
+                        set_ttl = true;
+                        ttl_ms  = body.at("ttl_ms").get<int64_t>();
+                        if (ttl_ms < 0) {
+                            throw llama_decision::semantic_error("ttl_ms must be >= 0");
+                        }
+                    }
+                    if (!set_pinned && !set_ttl) {
+                        throw llama_decision::semantic_error("patch needs a pinned or ttl_ms field");
+                    }
+                    if (!registry.patch(action.session_id, set_pinned, pinned, set_ttl, ttl_ms)) {
+                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                    }
+                    const llama_decision::decision_session * sess = registry.find(action.session_id);
+                    out["session_id"] = action.session_id;
+                    out["pinned"]     = sess != nullptr && sess->policy.pinned;
+                    out["ttl_ms"]     = (long long) (sess != nullptr ? sess->policy.ttl_ms : 0);
+                } break;
+        }
+        return out;
+    }
+
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
@@ -2612,6 +3292,56 @@ private:
                 {
                     // do nothing
                 } break;
+            case SERVER_TASK_TYPE_DECISION:
+                {
+                    try {
+                        auto res  = std::make_unique<server_task_result_decision>();
+                        res->id   = task.id;
+                        res->data = handle_decision(task.decision_request, task.decision_cancel);
+                        queue_results.send(std::move(res));
+                    } catch (const llama_decision::unsupported_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_NOT_SUPPORTED);
+                    } catch (const llama_decision::cancelled_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_CLIENT_CLOSED);
+                    } catch (const llama_decision::stale_error & e) {
+                        // a stale session reference is a conflict with the current memory epoch, never
+                        // a semantic (422) error: "stale" and "invalid request" are different outcomes
+                        send_error(task, e.what(), ERROR_TYPE_CONFLICT);
+                    } catch (const llama_decision::capacity_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    } catch (const llama_decision::semantic_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const common_json_error & e) {
+                        send_error(task, std::string("invalid decision request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task, e.what(), ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SESSION:
+                {
+                    try {
+                        auto res  = std::make_unique<server_task_result_session>();
+                        res->id   = task.id;
+                        res->data = handle_session(task.session);
+                        queue_results.send(std::move(res));
+                    } catch (const llama_decision::unsupported_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_NOT_SUPPORTED);
+                    } catch (const llama_decision::stale_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_CONFLICT);
+                    } catch (const llama_decision::capacity_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    } catch (const llama_decision::semantic_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const common_json_error & e) {
+                        send_error(task, std::string("invalid session request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task, e.what(), ERROR_TYPE_SERVER);
+                    }
+                } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
                     int n_processing_slots = 0;
@@ -2693,6 +3423,29 @@ private:
                         break;
                     }
 
+                    // A retained session for this slot is persisted as a manifest sidecar next to
+                    // the slot file. The manifest is bound to the slot file's bytes by their content
+                    // hash, so a later restore can rebind it or refuse it, never answer a different
+                    // window. The slot file format is unchanged.
+                    if (decision.decision_sessions) {
+                        const llama_decision::decision_session * sess = decision.decision_sessions->find_by_slot(id_slot);
+                        if (sess != nullptr) {
+                            std::string blob;
+                            if (server_read_file(filepath, blob)) {
+                                const std::string bound_hash = llama_decision::session_registry::blob_hash_of(blob);
+                                const llama_decision::session_manifest_data md =
+                                    decision.decision_sessions->serialize(id_slot, bound_hash);
+                                if (!md.manifest.empty()) {
+                                    server_write_file(filepath + ".manifest", md.manifest);
+                                    if (!md.state.empty()) {
+                                        server_write_file(filepath + ".sblob",
+                                                          std::string(md.state.begin(), md.state.end()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2758,6 +3511,37 @@ private:
                         break;
                     }
 
+                    // A restored slot rebinds or drops its retained session through the manifest
+                    // sidecar that SLOT_SAVE co-wrote. A matching manifest rebinds the session to the
+                    // restored window; a mismatched or foreign one is unresolvable (dropped, never
+                    // served); a slot restored without a sidecar has no session to carry over, so
+                    // any retained capture is dropped - the previous asymmetry (restore leaving a
+                    // stale retained turn) is closed. Only a decision-enabled server can have
+                    // written a session or a manifest.
+                    if (decision.decision_sessions || params_base.n_seq_decision >= 3) {
+                        llama_decision::session_registry & registry = decision_registry();
+                        const std::string manifest_path = filepath + ".manifest";
+                        std::string       manifest;
+                        if (server_read_file(manifest_path, manifest)) {
+                            llama_decision::session_manifest_data md;
+                            md.manifest = manifest;
+                            std::string state;
+                            if (server_read_file(filepath + ".sblob", state)) {
+                                md.state.assign(state.begin(), state.end());
+                            }
+                            std::string blob;
+                            const std::string bound_hash = server_read_file(filepath, blob)
+                                ? llama_decision::session_registry::blob_hash_of(blob) : std::string();
+                            const llama_decision::session_restore_status st = registry.deserialize(
+                                id_slot, md, slot->prompt.tokens.get_tokens(), bound_hash);
+                            if (st != llama_decision::session_restore_status::restored) {
+                                SRV_DBG("slot %d restore: retained session is unresolvable or absent, dropped\n", id_slot);
+                            }
+                        } else {
+                            registry.on_slot_release(id_slot);
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -2790,6 +3574,12 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+
+                    // an erased slot is released: discard its retained session so a later session
+                    // decision is refused instead of answering a turn the client dropped
+                    if (decision.decision_sessions) {
+                        decision.decision_sessions->on_slot_release(id_slot);
+                    }
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -4387,6 +5177,10 @@ bool server_context::load_model(common_params & params, llama_model * shared_mod
     return impl->load_model(params, shared_model);
 }
 
+void server_context::on_memory_invalidated() {
+    impl->decision.on_memory_invalidated();
+}
+
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -5494,6 +6288,199 @@ void server_routes::init_routes() {
 
     this->post_embeddings_oai = [this](const server_http_req & req) {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+    };
+
+    this->post_decision = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        size_t max_body = decision_max_body;
+        int    max_queue = decision_max_queue;
+        if (const char * e = std::getenv("LLAMA_DECISION_MAX_BODY")) {
+            const long v = std::atol(e);
+            if (v > 0) {
+                max_body = (size_t) v;
+            }
+        }
+        if (const char * e = std::getenv("LLAMA_DECISION_MAX_QUEUE")) {
+            const int v = std::atoi(e);
+            if (v > 0) {
+                max_queue = v;
+            }
+        }
+        if (req.body.size() > max_body) {
+            res->error(format_error_response("decision request body exceeds the configured cap", ERROR_TYPE_PAYLOAD_TOO_LARGE));
+            return res;
+        }
+
+        // admission: bound concurrent decision requests; unlike chat, a decision cannot be
+        // interleaved on the same context, so an unbounded burst would only queue up
+        const int inflight = ++decision_inflight;
+        struct inflight_guard {
+            std::atomic<int> & counter;
+            ~inflight_guard() { --counter; }
+        } guard{decision_inflight};
+        if (inflight > 2 * max_queue) {
+            res->headers["Retry-After"] = "1";
+            res->error(format_error_response("server overloaded", ERROR_TYPE_OVERLOADED));
+            return res;
+        }
+        if (inflight > max_queue) {
+            res->headers["Retry-After"] = "1";
+            res->error(format_error_response("decision queue is full", ERROR_TYPE_RATE_LIMIT));
+            return res;
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const common_json_error & e) {
+            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
+        server_task task(SERVER_TASK_TYPE_DECISION);
+        task.id               = res->rd.get_new_id();
+        task.decision_request = body;
+        task.decision_cancel  = cancel_flag;
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next([&] {
+            if (req.should_stop()) {
+                cancel_flag->store(true);
+                return true;
+            }
+            return false;
+        });
+        if (!result) {
+            // the client went away or the server stopped: never report a partial answer
+            res->error(format_error_response("the decision was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // POST /v1/session: create a first-class session for a slot's completed turn.
+    this->post_session = [this](const server_http_req & req) {
+        auto res = create_response();
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const common_json_error & e) {
+            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.is_object() || !body.contains("id_slot")) {
+            res->error(format_error_response("a session create needs an id_slot", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_SESSION);
+        task.id = res->rd.get_new_id();
+        task.session.action = server_task::session_action::create;
+        task.session.body   = body;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            res->error(format_error_response("the session request was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // GET /v1/session/{id}: the status and counters of a first-class session.
+    this->get_session = [this](const server_http_req & req) {
+        auto res = create_response();
+        const std::string sid = req.get_param("session_id");
+        if (sid.empty()) {
+            res->error(format_error_response("missing session_id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_SESSION);
+        task.id = res->rd.get_new_id();
+        task.session.action = server_task::session_action::get;
+        task.session.session_id = sid;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            res->error(format_error_response("the session request was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // DELETE /v1/session/{id}: erase a first-class session and release its reference.
+    this->delete_session = [this](const server_http_req & req) {
+        auto res = create_response();
+        const std::string sid = req.get_param("session_id");
+        if (sid.empty()) {
+            res->error(format_error_response("missing session_id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_SESSION);
+        task.id = res->rd.get_new_id();
+        task.session.action = server_task::session_action::erase;
+        task.session.session_id = sid;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            res->error(format_error_response("the session request was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // PATCH /v1/session/{id}: update a first-class session's pin or TTL.
+    this->patch_session = [this](const server_http_req & req) {
+        auto res = create_response();
+        const std::string sid = req.get_param("session_id");
+        if (sid.empty()) {
+            res->error(format_error_response("missing session_id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const common_json_error & e) {
+            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_SESSION);
+        task.id = res->rd.get_new_id();
+        task.session.action = server_task::session_action::patch;
+        task.session.session_id = sid;
+        task.session.body   = body;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            res->error(format_error_response("the session request was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
     };
 
     this->post_rerank = [this](const server_http_req & req) {

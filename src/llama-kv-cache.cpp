@@ -2318,14 +2318,25 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             // Write GQA embedding size
             io.write(&n_embd_v_gqa, sizeof(n_embd_v_gqa));
 
-            // For each row, we get the element values of each cell
-            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                // Read each range of cells of v_size_el length and write out
-                for (const auto & range : cr.data) {
-                    const size_t range_size = range.second - range.first;
-                    const size_t src_offset = (range.first + j * kv_size) * v_size_el;
-                    const size_t buf_size = range_size * v_size_el;
-                    io.write_tensor(v, src_offset, buf_size);
+            if (cr.data.size() == 1) {
+                // One contiguous range: one bulk transfer walks the embedding rows with the cache
+                // stride. It emits the same rows in the same order as the per-element loop, so the
+                // serialized bytes do not change.
+                const auto & range = cr.data[0];
+                const size_t range_size = range.second - range.first;
+                io.write_tensor_strided(v,
+                        (size_t) range.first * v_size_el,
+                        range_size * v_size_el,
+                        n_embd_v_gqa,
+                        (size_t) kv_size * v_size_el);
+            } else {
+                // A fragmented save keeps the per-embedding order the reader expects.
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    for (const auto & range : cr.data) {
+                        const size_t range_size = range.second - range.first;
+                        const size_t src_offset = (range.first + j * kv_size) * v_size_el;
+                        io.write_tensor(v, src_offset, range_size * v_size_el);
+                    }
                 }
             }
         }
@@ -2649,10 +2660,21 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                for (const auto & r : runs) {
-                    const size_t dst_offset = ((size_t) r.from + j * cells.size()) * v_size_el;
-                    io.read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
+            if (runs.size() == 1) {
+                // A single contiguous destination run is one bulk transfer; it consumes the same
+                // per-embedding rows as the per-element loop.
+                const auto & r = runs[0];
+                io.read_tensor_strided(v,
+                        (size_t) r.from * v_size_el,
+                        (size_t) (r.to - r.from) * v_size_el,
+                        n_embd_v_gqa,
+                        (size_t) cells.size() * v_size_el);
+            } else {
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    for (const auto & r : runs) {
+                        const size_t dst_offset = ((size_t) r.from + j * cells.size()) * v_size_el;
+                        io.read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
+                    }
                 }
             }
         }

@@ -22,6 +22,8 @@ struct testing {
     int unnamed = 0;
     int exceptions = 0;
     int skipped = 0;
+    int expected_failures = 0;
+    int unexpected_passes = 0;
 
     // set by skip(), read by the innermost test()
     bool skip_current = false;
@@ -88,7 +90,7 @@ struct testing {
         skip_reason  = reason;
     }
 
-    void print_result(const std::string &label, int new_failures, int new_assertions, const std::string &extra = "", bool was_skipped = false) const {
+    void print_result(const std::string &label, int new_failures, int new_assertions, const std::string &extra = "", bool was_skipped = false, const char * status_override = nullptr) const {
         std::string line = indent() + label;
 
         std::string details;
@@ -111,7 +113,8 @@ struct testing {
             line += " (" + details + ")";
         }
 
-        std::string status = new_failures != 0 ? "[FAIL]" : (was_skipped ? "[SKIP]" : "[PASS]");
+        const std::string status = status_override != nullptr ? status_override
+            : (new_failures != 0 ? "[FAIL]" : (was_skipped ? "[SKIP]" : "[PASS]"));
 
         if (line.size() + 1 < status_column) {
             line.append(status_column - line.size(), ' ');
@@ -163,6 +166,55 @@ struct testing {
     template <typename F>
     void test(F f) {
         test("test #" + std::to_string(++unnamed), f);
+    }
+
+    // A subtest that is known to fail on the current code. It stays green while the expected
+    // failure is present, and turns red when it passes, so the marker is removed once fixed.
+    // An unexpected pass (XPASS) is a hard failure, not a silent success. xfail marks
+    // producer-certainty (bit-stability) properties only; it must never absorb a task-value
+    // failure such as a winner or outcome disagreement.
+    template <typename F>
+    void xfail(const std::string & name, F f) {
+        stack.push_back(name);
+        if (!should_run()) {
+            stack.pop_back();
+            return;
+        }
+
+        ++tests;
+        out << indent() << name << "\n";
+
+        int before_failures   = failures;
+        int before_assertions = assertions;
+
+        bool        outer_skip        = skip_current;
+        std::string outer_skip_reason = skip_reason;
+        skip_current = false;
+        skip_reason.clear();
+
+        run_with_exceptions([&] { f(*this); }, "test");
+
+        int new_failures   = failures   - before_failures;
+        int new_assertions = assertions - before_assertions;
+
+        if (skip_current && new_failures == 0) {
+            ++skipped;
+            print_result(name, 0, new_assertions, skip_reason, true);
+        } else if (new_failures > 0) {
+            // the known failure is present: drop it so the suite stays green
+            failures = before_failures;
+            ++expected_failures;
+            print_result(name, 0, new_assertions, "known failure, not counted", false, "[XFAIL]");
+        } else {
+            ++unexpected_passes;
+            ++failures;
+            print_result(name, 1, new_assertions, "passed unexpectedly; remove the expected-failure marker", false, "[XPASS]");
+        }
+
+        skip_current = outer_skip;
+        skip_reason  = outer_skip_reason;
+
+        stack.pop_back();
     }
 
     template <typename F>
@@ -263,6 +315,10 @@ struct testing {
         out << "failures   : " << failures << "\n";
         out << "exceptions : " << exceptions << "\n";
         out << "skipped    : " << skipped << "\n";
+        if (expected_failures > 0 || unexpected_passes > 0) {
+            out << "xfail      : " << expected_failures << "\n";
+            out << "xpass      : " << unexpected_passes << "\n";
+        }
         return failures == 0 ? 0 : 1;
     }
 };

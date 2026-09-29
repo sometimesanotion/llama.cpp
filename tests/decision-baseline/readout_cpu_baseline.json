@@ -1,0 +1,52 @@
+{
+ "backend": "cpu",
+ "model": "test-models/qwen35-dense.gguf",
+ "readout": {
+  "cache_hit": false,
+  "suffix_tokens": 79,
+  "common_suffix_tokens": 0,
+  "leaf_suffix_tokens": 79,
+  "rows": 79,
+  "rounds": 1,
+  "questions": [
+   {
+    "options": 2,
+    "winner": 0,
+    "probs": [
+     0.5004202127456665,
+     0.4995797872543335
+    ],
+    "confidence": 5.094986386122713e-07,
+    "certainty": 0.5004202127456665
+   },
+   {
+    "options": 3,
+    "winner": 0,
+    "probs": [
+     0.33402881026268005,
+     0.3329627215862274,
+     0.33300846815109253
+    ],
+    "confidence": 9.916980886481852e-07,
+    "certainty": 0.33402881026268005
+   },
+   {
+    "options": 3,
+    "winner": 0,
+    "probs": [
+     0.33402881026268005,
+     0.3329627215862274,
+     0.33300846815109253
+    ],
+    "confidence": 9.916980886481852e-07,
+    "certainty": 0.33402881026268005
+   }
+  ],
+  "label_pool_size": 36
+ },
+ "timings": {
+  "prefill_ms": 7.596275,
+  "scoring_ms": 7.579154
+ },
+ "note": "Frozen readout of the committed decision corpus. The deterministic core (probabilities, winners, confidence = 1 - H/log K, certainty = max p, label-pool size) is a contract; the timing block is recorded for context and excluded from the byte diff."
+}

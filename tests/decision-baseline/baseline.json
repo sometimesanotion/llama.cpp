@@ -1,0 +1,283 @@
+{
+ "note": "Frozen baseline facts for the decision endpoint. Values here are contracts, not tunables. Update only with a matching code change and a re-measured gate.",
+ "partition": {
+  "slots_first": 0,
+  "slots_last_exclusive": 2,
+  "decision_first": 2,
+  "decision_count": 8,
+  "n_seq_max": 10,
+  "rule": "n_seq_max = n_parallel + n_seq_decision; decisions never share sequence ids with slots"
+ },
+ "routes": {
+  "canonical": "/v1/decision",
+  "deprecated_alias": "/decision",
+  "sizing_flag": "--decision-seqs",
+  "env_flag": "LLAMA_ARG_DECISION_SEQS"
+ },
+ "backend_flags": {
+  "kv_unified": true,
+  "swa_full_default": true,
+  "flash_attn": "on (production preset)",
+  "cache_type_k": "q8_0 (production preset)",
+  "cache_type_v": "q8_0 (production preset)"
+ },
+ "fixtures": [
+  "decision_basic.golden.json",
+  "decision_basic.shape.json",
+  "decision_letter.golden.json"
+ ],
+ "reference": {
+  "note": "Reference /v1/decision request -> response pairs recorded on the reference model with a bit-reproducible flag set (flash attention off) and a fixed --alias so the contract hash is machine-independent. Values are the frozen oracle for byte-identity proofs: a refactor must not change these answers, and the template/contract hashes must not drift. Run-to-run timing fields are excluded.",
+  "model": "lfm2.5-350m-gguf/latest.gguf",
+  "recorded": "2026-09-24",
+  "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512",
+  "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
+  "template_hash": "decision-prefix-v1:bb675157f48a4c9f",
+  "prompt_version": "letter-v2",
+  "quantization": "2",
+  "responses": {
+   "letter": {
+    "model": "test",
+    "answers": {
+     "dept": {
+      "type": "choice",
+      "confidence": 0.7664031981650385,
+      "certainty": 0.9618817567825317,
+      "choice": "technical",
+      "probabilities": {
+       "billing": 0.03811822459101677,
+       "technical": 0.9618817567825317
+      },
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
+      "prompt_version": "letter-v2",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       28.857860565185547,
+       32.0860595703125
+      ]
+     },
+     "refund": {
+      "type": "noul",
+      "noul": 0.9927088022232056,
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
+      "prompt_version": "letter-v2",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       28.218446731567383,
+       33.1322135925293
+      ]
+     },
+     "urgency": {
+      "type": "score",
+      "confidence": 0.37944785813159665,
+      "certainty": 0.6233733892440796,
+      "score": 1.3698404431343079,
+      "probabilities": {
+       "0": 0.003393118968233466,
+       "1": 0.6233733892440796,
+       "2": 0.37323352694511414
+      },
+      "legend": {
+       "0": "calm",
+       "1": "upset",
+       "2": "furious"
+      },
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "09757a4f8227f0ee55c7ec257554a9fa4bab5b7620440e5719d2137574ab08f8",
+      "prompt_version": "letter-v2",
+      "answer_token_ids": [
+       542,
+       543,
+       544
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       26.464126586914063,
+       31.677522659301758,
+       31.164581298828125
+      ]
+     }
+    },
+    "usage": {
+     "input_tokens": 54,
+     "output_tokens": 0,
+     "cached_tokens": 0,
+     "state_cache_hit": false
+    },
+    "diagnostics": {
+     "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
+     "prompt_version": "letter-v2",
+     "suffix_tokens": 111,
+     "common_suffix_tokens": 0,
+     "adapters_configured": false,
+     "adapter_scope": "base",
+     "model": "lfm2.5-350m-gguf/latest.gguf",
+     "quantization": "2",
+     "template_hash": "decision-prefix-v1:bb675157f48a4c9f",
+     "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512"
+    }
+   },
+   "letter2": {
+    "model": "test",
+    "answers": {
+     "dept": {
+      "type": "choice",
+      "confidence": 0.9987962070750634,
+      "certainty": 0.9999200105667114,
+      "choice": "technical",
+      "probabilities": {
+       "billing": 7.996925705811009e-05,
+       "technical": 0.9999200105667114
+      },
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "f046fd14c4a78b7967f57028ad939debbb5d0154b3628649dbcf55b06783ddbe",
+      "prompt_version": "letter-v2",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       22.96686553955078,
+       32.40065383911133
+      ]
+     },
+     "refund": {
+      "type": "noul",
+      "noul": 0.9996981620788574,
+      "probability_status": "conditional option score over quantized weights; uncalibrated as decision confidence",
+      "prompt_sha256": "f046fd14c4a78b7967f57028ad939debbb5d0154b3628649dbcf55b06783ddbe",
+      "prompt_version": "letter-v2",
+      "answer_token_ids": [
+       542,
+       543
+      ],
+      "allowed_token_mass": 1.0,
+      "full_vocab_argmax_id": -1,
+      "option_logits": [
+       25.52118492126465,
+       33.6264762878418
+      ]
+     }
+    },
+    "usage": {
+     "input_tokens": 56,
+     "output_tokens": 0,
+     "cached_tokens": 42,
+     "state_cache_hit": true
+    },
+    "diagnostics": {
+     "contract_hash": "e8764284f0387e50c7f5b30b41ba7840891789b263e54be8bf5d21eda008d3e3",
+     "prompt_version": "letter-v2",
+     "suffix_tokens": 68,
+     "common_suffix_tokens": 0,
+     "adapters_configured": false,
+     "adapter_scope": "base",
+     "model": "lfm2.5-350m-gguf/latest.gguf",
+     "quantization": "2",
+     "template_hash": "decision-prefix-v1:bb675157f48a4c9f",
+     "backend_flags": "fa=0,k=1,v=1,unified=1,swa=0,ubatch=512"
+    }
+   },
+   "legacy": {
+    "object": "decision",
+    "results": [
+     {
+      "decision": {
+       "category": "billing",
+       "urgent": true
+      },
+      "fields": {
+       "category": {
+        "value": "billing",
+        "probability": 0.9573745131492615,
+        "scored_nodes": 1,
+        "tree": true
+       },
+       "urgent": {
+        "value": true,
+        "probability": 0.9856088757514954,
+        "scored_nodes": 1,
+        "tree": true
+       }
+      },
+      "usage": {
+       "context_tokens": 16,
+       "scored_rows": 10
+      }
+     }
+    ],
+    "model": "lfm2.5-350m-gguf/latest.gguf",
+    "usage": {
+     "prompt_tokens": 91,
+     "cached_tokens": 0,
+     "context_tokens": 16,
+     "scored_rows": 10
+    }
+   }
+}
+  },
+  "cpu_oracle": {
+  "model": "test-models/qwen35-dense.gguf",
+  "pool": {
+   "count": 36,
+   "token_a": 65
+  },
+  "full": {
+   "cache_hit": false,
+   "suffix_tokens": 79,
+   "common_suffix_tokens": 0,
+   "leaf_suffix_tokens": 79,
+   "rows": 79,
+   "rounds": 1,
+   "questions": [
+    {
+     "options": 2,
+     "winner": 0,
+     "probs": [
+      0.5004202127456665,
+      0.4995797872543335
+     ],
+     "confidence": 5.094986386122713e-07,
+     "certainty": 0.5004202127456665
+    },
+    {
+     "options": 3,
+     "winner": 0,
+     "probs": [
+      0.33402881026268005,
+      0.3329627215862274,
+      0.33300846815109253
+     ],
+     "confidence": 9.916980886481852e-07,
+     "certainty": 0.33402881026268005
+    },
+    {
+     "options": 3,
+     "winner": 0,
+     "probs": [
+      0.33402881026268005,
+      0.3329627215862274,
+      0.33300846815109253
+     ],
+     "confidence": 9.916980886481852e-07,
+     "certainty": 0.33402881026268005
+    }
+   ]
+  }
+ }
+}

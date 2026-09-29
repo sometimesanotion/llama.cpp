@@ -217,6 +217,23 @@ bool server_instances::load(const common_params & params) {
                 cfg.is_default ? ", default" : "");
     }
 
+    // --decision-instance must name an exact instance: the point is a dedicated context, and
+    // group routing would pick a shared member instead, defeating the isolation.
+    if (!params.decision_instance.empty()) {
+        bool found = false;
+        for (const auto & inst : instances) {
+            if (inst->cfg.name == params.decision_instance) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            IST_ERR("--decision-instance '%s' does not match any configured instance\n", params.decision_instance.c_str());
+            return false;
+        }
+        IST_INF("stateless decisions default to instance '%s'\n", params.decision_instance.c_str());
+    }
+
     // legacy drop-in: with no instances configured the single default instance is built
     // eagerly, preserving stock single-context startup behavior (exactly one window).
     if (legacy_default) {
@@ -425,6 +442,11 @@ std::optional<size_t> server_instances::pick_best_available(const std::string & 
 //
 
 server_http_res_ptr server_instances::dispatch(const server_http_req & req, const forward_fn & forward) {
+    return dispatch(req, forward, dispatch_options{});
+}
+
+server_http_res_ptr server_instances::dispatch(const server_http_req & req, const forward_fn & forward,
+                                               const dispatch_options & opt) {
     std::string model_id;
     std::string instance_field;
     std::string snapshot;
@@ -461,12 +483,22 @@ server_http_res_ptr server_instances::dispatch(const server_http_req & req, cons
         }
     }
 
+    // A stateless request that names no target may be pinned to a declared decision
+    // instance; a session-pinned request must name the owning instance instead.
+    if (!opt.require_instance && model_id.empty() && instance_field.empty() && !opt.implicit_instance.empty()) {
+        instance_field = opt.implicit_instance;
+    }
+
     std::string          error;
     const resolve_target target = resolve(model_id, instance_field, error);
     switch (target.kind) {
         case target_kind::INSTANCE:
             return dispatch_instance(req, target.inst, snapshot, id_slot, forward);
         case target_kind::GROUP:
+            if (opt.require_instance) {
+                return make_error("this request addresses one instance's slot; route it with the "
+                                  "'instance' or 'model' field, not a group", ERROR_TYPE_INVALID_REQUEST);
+            }
             return dispatch_group(req, target.group, snapshot, id_slot, forward);
         case target_kind::NONE:
             return make_error(error, ERROR_TYPE_INVALID_REQUEST);
@@ -2213,6 +2245,88 @@ server_http_res_ptr server_instances::handle_post_embeddings_oai(const server_ht
 
 server_http_res_ptr server_instances::handle_post_rerank(const server_http_req & req) {
     return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.post_rerank(req); });
+}
+
+// A decision request that carries a live-session reference must be pinned to the instance that
+// owns the slot: the retained turn lives in one context and is not portable to another. Only a
+// body/query slot or session handle marks a request as session-pinned; a malformed body is
+// reported by the owning instance's handler, never here.
+static bool decision_request_is_session_pinned(const server_http_req & req) {
+    try {
+        const json body = json::parse(req.body);
+        if (body.is_object()) {
+            if (!json_value(body, "session_id", std::string()).empty()) {
+                return true;
+            }
+            if (json_value(body, "id_slot", -1) >= 0) {
+                return true;
+            }
+        }
+    } catch (const std::exception &) {
+        // not session-pinned here: the instance handler reports the parse error
+    }
+    if (!req.get_param("session_id").empty()) {
+        return true;
+    }
+    const std::string & id_slot = req.get_param("id_slot");
+    if (!id_slot.empty()) {
+        try {
+            return std::stoi(id_slot) >= 0;
+        } catch (const std::exception &) {
+        }
+    }
+    return false;
+}
+
+server_http_res_ptr server_instances::handle_post_decision(const server_http_req & req) {
+    // stateless decisions may be pinned to a declared decision instance; a live-session
+    // decision must name the instance that owns the slot instead
+    dispatch_options opt;
+    opt.require_instance  = decision_request_is_session_pinned(req);
+    opt.implicit_instance = params.decision_instance;
+
+    // The decision contract requires a model id, but in a pool the model field is a routing
+    // target. When the client names only the instance (or nothing at all, or a Jev alias), fill
+    // the pool id in so the request routes here and the parser still sees a model. The response
+    // echoes it.
+    server_http_req routed = req;
+    try {
+        json              body        = json::parse(req.body);
+        const std::string model_field = body.is_object() ? json_value(body, "model", std::string()) : std::string();
+        if (body.is_object() &&
+            (model_field.empty() || model_field == "jev-latest" || model_field == "jev-preview")) {
+            body["model"] = base_name;
+            routed.body   = body.dump();
+        }
+    } catch (const std::exception &) {
+        // a malformed body is reported by the owning instance's handler
+    }
+
+    return dispatch(routed, [](server_routes & routes, const server_http_req & req) { return routes.post_decision(req); }, opt);
+}
+
+server_http_res_ptr server_instances::handle_post_session(const server_http_req & req) {
+    dispatch_options opt;
+    opt.require_instance = true;
+    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.post_session(req); }, opt);
+}
+
+server_http_res_ptr server_instances::handle_get_session(const server_http_req & req) {
+    dispatch_options opt;
+    opt.require_instance = true;
+    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.get_session(req); }, opt);
+}
+
+server_http_res_ptr server_instances::handle_delete_session(const server_http_req & req) {
+    dispatch_options opt;
+    opt.require_instance = true;
+    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.delete_session(req); }, opt);
+}
+
+server_http_res_ptr server_instances::handle_patch_session(const server_http_req & req) {
+    dispatch_options opt;
+    opt.require_instance = true;
+    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.patch_session(req); }, opt);
 }
 
 server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http_req & req) {

@@ -1,0 +1,57 @@
+{
+ "request": {
+  "model": "string (required, routing/echo only; the external router selects the model)",
+  "state": "string|object|array (required, non-empty, treated as data)",
+  "questions": {
+   "<qid>": {
+    "type": "noul|choice|score (bool and scale accepted as input aliases)",
+    "instructions": "string|object|array (required)",
+    "criteria": "noul: {true,false}?; choice: {key: desc|null} 2-255; score: [desc] 2-10 low->high"
+   }
+  },
+  "temperature": "number? default 1.0",
+  "temperatures": "object? {noul,choice,score}",
+  "permutations": "integer? default 1, 1-8",
+  "diagnostics": "boolean? default false"
+ },
+ "response": {
+  "model": "string (echo)",
+  "answers": {
+   "<qid>": "one of answer_shapes"
+  },
+  "usage": {
+   "input_tokens": "integer",
+   "output_tokens": 0,
+   "cached_tokens": "integer?",
+   "state_cache_hit": "boolean?"
+  }
+ },
+ "answer_shapes": {
+  "noul": {
+   "type": "noul",
+   "noul": "number in [0,1] = P(true); no confidence field"
+  },
+  "choice": {
+   "type": "choice",
+   "choice": "option key (argmax)",
+   "probabilities": "object keyed by option key, sums to 1",
+   "confidence": "number = (N*p_max-1)/(N-1), Jev default; opt-in 1 - H/log(K) via confidence_profile",
+   "certainty": "number = max(p) (diagnostics only)"
+  },
+  "score": {
+   "type": "score",
+   "score": "number = sum(i*p_i), zero-based expected level",
+   "probabilities": "object with string keys \"0\"..\"K-1\"",
+   "legend": "object mapping level index string to description, in order",
+   "confidence": "number = (N*p_max-1)/(N-1), Jev default; opt-in 1 - H/log(K) via confidence_profile",
+   "certainty": "number = max(p) (diagnostics only)",
+   "median": "number = median level index (diagnostics only)",
+   "interval_p10_p90": "array [p10, p90] level indices (diagnostics only)"
+  }
+ },
+ "limits": {
+  "questions": "1-256",
+  "choice options": "2-255 per question (realized pool is model-dependent: the tokenizer must resolve each label as a single token)",
+  "score levels": "2-10 per question"
+ }
+}

@@ -1,0 +1,73 @@
+{
+ "backend": "cpu",
+ "model": "test-models/qwen35-dense.gguf",
+ "session_golden": {
+  "model": "m",
+  "answers": {
+   "refund": {
+    "type": "noul",
+    "noul": 0.4995797872543335
+   },
+   "dept": {
+    "type": "choice",
+    "confidence": 0.0010432153940200806,
+    "choice": "billing",
+    "probabilities": {
+     "billing": 0.33402881026268005,
+     "technical": 0.3329627215862274,
+     "cancellation": 0.33300846815109253
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "confidence": 0.0010432153940200806,
+    "score": 0.9989796578884125,
+    "probabilities": {
+     "0": 0.33402881026268005,
+     "1": 0.3329627215862274,
+     "2": 0.33300846815109253
+    },
+    "legend": {
+     "0": {
+      "level": 1,
+      "label": "calm"
+     },
+     "1": "upset",
+     "2": "furious"
+    }
+   }
+  },
+  "usage": {
+   "input_tokens": 44,
+   "output_tokens": 0
+  }
+ },
+ "cost_counters": [
+  {
+   "action": "create",
+   "n_snapshots": 1,
+   "n_reuses": 0,
+   "n_releases": 0
+  },
+  {
+   "action": "query",
+   "n_snapshots": 1,
+   "n_reuses": 1,
+   "n_releases": 0
+  },
+  {
+   "action": "advance-release",
+   "n_snapshots": 1,
+   "n_reuses": 1,
+   "n_releases": 1
+  }
+ ],
+ "window_restore": {
+  "slot_pos_max_before": 43,
+  "retained_before": true,
+  "slot_pos_max_after": 43,
+  "retained_after": true,
+  "retained_is_current": true
+ },
+ "note": "Frozen session-substrate reference. session_golden is the byte-level id_slot session response for the fixed request set (additive diagnostics excluded); cost_counters are the exact session-arena trigger counters for a scripted create/query/advance sequence; window_restore is the whole-context save/restore behavior for one slot."
+}

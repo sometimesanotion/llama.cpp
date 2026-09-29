@@ -1,0 +1,44 @@
+{
+  "decision": {
+    "active": true,
+    "severity": "medium",
+    "count": 3,
+    "amount": 0.0
+  },
+  "fields": {
+    "active": {
+      "value": true,
+      "probability": 0.699999988079071,
+      "scored_nodes": 2,
+      "tree": true
+    },
+    "severity": {
+      "value": "medium",
+      "probability": 0.5,
+      "scored_nodes": 4,
+      "tree": true
+    },
+    "count": {
+      "interval_p10_p90": [
+        1,
+        2.857142865353701
+      ],
+      "aggregate": 3,
+      "value": 3,
+      "probability": 0.699999988079071,
+      "scored_nodes": 3,
+      "tree": true
+    },
+    "amount": {
+      "interval_p10_p90": [
+        0,
+        0.4999999403953576
+      ],
+      "aggregate": 0.2500000074505806,
+      "value": 0.0,
+      "probability": 0.6000000238418579,
+      "scored_nodes": 3,
+      "tree": true
+    }
+  }
+}

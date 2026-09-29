@@ -2,6 +2,9 @@
 !*.*
 !snapshots/
 !fusion/
+!decision-baseline/
+!fixtures/
+!fixtures/**
 *.o
 ggml-common.h
 **/*.swp

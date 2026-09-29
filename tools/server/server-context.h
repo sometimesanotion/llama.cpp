@@ -6,6 +6,7 @@
 
 #include "json.h"
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -93,6 +94,13 @@ struct server_context {
     // when `shared_model` is non-null, weights are borrowed (owned externally); only this
     // instance's context + compute buffers are created
     bool load_model(common_params & params, llama_model * shared_model = nullptr);
+
+    // The whole context was replaced or loaded (model reload, whole-context state load/clear):
+    // bump the decision memory epoch so every retained session reference from the previous
+    // generation is refused as stale (HTTP 409) instead of answered from old state. Called by the
+    // server on any whole-context replace/load; session references re-created after the call start
+    // at the current epoch.
+    void on_memory_invalidated();
 
     // this function will block main thread until termination
     void start_loop();
@@ -226,6 +234,11 @@ struct server_routes {
     server_http_context::handler_t post_embeddings;
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;
+    server_http_context::handler_t post_decision;
+    server_http_context::handler_t post_session;
+    server_http_context::handler_t get_session;
+    server_http_context::handler_t delete_session;
+    server_http_context::handler_t patch_session;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
 
@@ -254,6 +267,11 @@ private:
     server_queue & queue_tasks;
     server_result_queue<server_task_result_ptr> & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // decision admission: bound concurrent decision requests so a burst cannot pile up work
+    std::atomic<int> decision_inflight{0};
+    size_t           decision_max_body  = 2u * 1024u * 1024u;
+    int              decision_max_queue = 4;
 
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;

@@ -1,0 +1,572 @@
+{
+  "note": "Calibration sign-off for the decision heuristics. Values are measurements, not tunables. Every row carries production_gate:false; confidence rows may never gate admission, caching, routing or persistence. Update only with a matching code change and a re-measured gate.",
+  "rows": {
+    "prefix_hoist": {
+      "trigger": "prefix hoist length (>=32 shared tokens)",
+      "axis": "task-value",
+      "may_gate": [
+        "prefix reuse decision"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission"
+      ],
+      "production_gate": false,
+      "verdict": "hoist only on an exact shared token head of at least 32 tokens; near misses never hoist; prefix-reuse prefill delta recorded",
+      "measurements": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "false_positives": 0,
+        "false_negatives": 0,
+        "pairs": 520,
+        "outcome_tv_bound": 0.15,
+        "outcome_argmax_agree": true
+      },
+      "control_group": {
+        "cases": [
+          {
+            "input": "shared head at the hoist budget",
+            "expect": "hoist"
+          },
+          {
+            "input": "shared head below the hoist minimum",
+            "expect": "no hoist"
+          },
+          {
+            "input": "near-miss head",
+            "expect": "no hoist"
+          }
+        ],
+        "hoist_min_tokens": 4,
+        "hoist_budget": 32
+      }
+    },
+    "question_dedup": {
+      "trigger": "question dedup on byte-identical suffix",
+      "axis": "task-value",
+      "may_gate": [
+        "dedup of identical suffixes"
+      ],
+      "may_not_gate": [
+        "near-duplicate collapse",
+        "caching across states"
+      ],
+      "production_gate": false,
+      "verdict": "dedup only on exact suffix equality; near duplicates never collapse",
+      "measurements": {
+        "exact_equal": 250,
+        "near_equal": 0,
+        "pair_suite": 250
+      }
+    },
+    "confidence_diagnostics": {
+      "trigger": "allowed_token_mass / full-vocab argmax diagnostics",
+      "axis": "confidence",
+      "may_gate": [],
+      "may_not_gate": [
+        "admission",
+        "caching",
+        "routing",
+        "persistence",
+        "answer validity"
+      ],
+      "production_gate": false,
+      "verdict": "advisory-only; dashboard threshold, never a production gate",
+      "measurements": {
+        "auc": 1.0,
+        "verdict": "advisory-only"
+      }
+    },
+    "tree_vs_greedy": {
+      "trigger": "tree vs greedy exactness and cost",
+      "axis": "task-value",
+      "may_gate": [
+        "exact-vs-greedy mode choice"
+      ],
+      "may_not_gate": [
+        "correctness claims",
+        "caching"
+      ],
+      "production_gate": false,
+      "verdict": "measured on the test model; model_measurements carry the numbers"
+    },
+    "single_question_bypass": {
+      "trigger": "single-question fork bypass",
+      "axis": "task-value",
+      "may_gate": [
+        "which scoring path runs"
+      ],
+      "may_not_gate": [
+        "correctness",
+        "admission"
+      ],
+      "production_gate": false,
+      "verdict": "copy-fork only; bypass stays on by default and never runs on multi-question rounds or restore-fork memory; measured speedup recorded in model_measurements"
+    },
+    "auto_mode_boundary": {
+      "trigger": "tree_max auto switch",
+      "axis": "task-value",
+      "may_gate": [
+        "mode selection at the boundary"
+      ],
+      "may_not_gate": [
+        "correctness claims"
+      ],
+      "production_gate": false,
+      "verdict": "auto uses tree up to tree_max and greedy above; default pinned at 128",
+      "control_group": {
+        "cases": [
+          {
+            "input": "value count at tree_max default",
+            "expect": "tree"
+          },
+          {
+            "input": "value count above tree_max default",
+            "expect": "greedy"
+          },
+          {
+            "input": "explicit tree mode",
+            "expect": "tree"
+          },
+          {
+            "input": "explicit greedy mode",
+            "expect": "greedy"
+          }
+        ],
+        "tree_max_default": 128
+      }
+    },
+    "temperature_profile": {
+      "trigger": "calibrated temperature",
+      "axis": "confidence",
+      "may_gate": [
+        "probability/confidence values only"
+      ],
+      "may_not_gate": [
+        "admission",
+        "caching",
+        "routing",
+        "persistence",
+        "answer key"
+      ],
+      "production_gate": false,
+      "verdict": "T=1.0 default; non-default needs matching provenance; stale profile refused",
+      "measurements": {
+        "match_accepted": 1,
+        "mismatch_refused": 4,
+        "mismatch_cases": 4
+      }
+    },
+    "admission_control": {
+      "trigger": "single decision request at max_queue defaults",
+      "axis": "resource",
+      "may_gate": [
+        "how many concurrent decisions run"
+      ],
+      "may_not_gate": [
+        "single-request rejection",
+        "answer validity"
+      ],
+      "production_gate": false,
+      "verdict": "a single small request is always admitted at the configured queue depth; only a saturated burst may be refused (429/529); measured by test_decision_admission.py",
+      "control_group": {
+        "cases": [
+          {
+            "input": "single small request",
+            "expect": "admitted"
+          },
+          {
+            "input": "burst above the queue depth",
+            "expect": "429 or 529 with Retry-After"
+          }
+        ],
+        "queue_cap_default": 4,
+        "queue_cap_env": "LLAMA_DECISION_MAX_QUEUE"
+      }
+    },
+    "prefix_lru_capacity": {
+      "trigger": "prefix state LRU capacity (restore-mode cache)",
+      "axis": "operational",
+      "may_gate": [
+        "state-cache eviction cost"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission",
+        "routing"
+      ],
+      "production_gate": false,
+      "verdict": "the restore-mode prefix state cache keeps the most recent entries and evicts the least recent; a hit changes cost only, never an answer",
+      "control_group": {
+        "cases": [
+          {
+            "input": "revisit within the capacity",
+            "expect": "hit"
+          },
+          {
+            "input": "revisit past the capacity",
+            "expect": "miss"
+          },
+          {
+            "input": "a re-prefilled evicted entry",
+            "expect": "same answer"
+          }
+        ],
+        "capacity": 4
+      }
+    },
+    "permutations_cap": {
+      "trigger": "permutations cap (order de-bias passes)",
+      "axis": "task-value",
+      "may_gate": [
+        "how many order passes run"
+      ],
+      "may_not_gate": [
+        "the winner when the default is used",
+        "answers"
+      ],
+      "production_gate": false,
+      "verdict": "the pass count is accepted and capped at 8, one pass is the default, and zero passes is refused; more passes only add cost",
+      "control_group": {
+        "cases": [
+          {
+            "input": "two passes",
+            "expect": "accepted"
+          },
+          {
+            "input": "value above the cap",
+            "expect": "accepted and capped at 8"
+          },
+          {
+            "input": "zero passes",
+            "expect": "rejected"
+          },
+          {
+            "input": "no permutations field",
+            "expect": "default one pass"
+          }
+        ],
+        "cap": 8,
+        "default": 1
+      }
+    },
+    "choice_option_limits": {
+      "trigger": "choice option count limits",
+      "axis": "task-value",
+      "may_gate": [
+        "option count validation before scoring"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission"
+      ],
+      "production_gate": false,
+      "verdict": "a choice keeps 2 to 64 options; over-limit is rejected before decode, never truncated",
+      "control_group": {
+        "cases": [
+          {
+            "input": "one option",
+            "expect": "rejected"
+          },
+          {
+            "input": "two options",
+            "expect": "accepted"
+          },
+          {
+            "input": "64 options",
+            "expect": "accepted"
+          },
+          {
+            "input": "65 options",
+            "expect": "rejected"
+          }
+        ],
+        "min_options": 2,
+        "max_options": 64
+      }
+    },
+    "label_pool_capacity": {
+      "trigger": "realized answer-label pool size",
+      "axis": "task-value",
+      "may_gate": [
+        "whether a question's option set can be represented"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission",
+        "caching"
+      ],
+      "production_gate": false,
+      "verdict": "the protocol cap is 64 (LABEL_POOL_CAP, equal to DECISION_MAX_CHOICE_OPTIONS); the realized pool is model-dependent and may be smaller; a request whose widest question needs more labels than the realized pool is a 422",
+      "control_group": {
+        "cases": [
+          {
+            "input": "a question at the realized pool size",
+            "expect": "accepted"
+          },
+          {
+            "input": "a question one above the realized pool",
+            "expect": "422"
+          },
+          {
+            "input": "a double-letter vocabulary at the cap",
+            "expect": "realized pool reaches 64"
+          }
+        ],
+        "protocol_cap": 64,
+        "realized_source": "diagnostics.label_pool_size; recorded per model in model_measurements"
+      }
+    },
+    "score_level_limits": {
+      "trigger": "score level count limits",
+      "axis": "task-value",
+      "may_gate": [
+        "level count validation before scoring"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission"
+      ],
+      "production_gate": false,
+      "verdict": "a score keeps 2 to 10 levels; over-limit is rejected before decode, never truncated",
+      "control_group": {
+        "cases": [
+          {
+            "input": "one level",
+            "expect": "rejected"
+          },
+          {
+            "input": "two levels",
+            "expect": "accepted"
+          },
+          {
+            "input": "ten levels",
+            "expect": "accepted"
+          },
+          {
+            "input": "eleven levels",
+            "expect": "rejected"
+          }
+        ],
+        "min_levels": 2,
+        "max_levels": 10
+      }
+    },
+    "question_count_limit": {
+      "trigger": "question count limits",
+      "axis": "task-value",
+      "may_gate": [
+        "question count validation before scoring"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission"
+      ],
+      "production_gate": false,
+      "verdict": "a request carries 1 to 256 questions; over-limit is rejected before decode, never truncated",
+      "control_group": {
+        "cases": [
+          {
+            "input": "zero questions",
+            "expect": "rejected"
+          },
+          {
+            "input": "one question",
+            "expect": "accepted"
+          },
+          {
+            "input": "256 questions",
+            "expect": "accepted"
+          },
+          {
+            "input": "257 questions",
+            "expect": "rejected"
+          }
+        ],
+        "min_questions": 1,
+        "max_questions": 256
+      }
+    },
+    "body_cap": {
+      "trigger": "request body cap",
+      "axis": "resource",
+      "may_gate": [
+        "request admission by body size"
+      ],
+      "may_not_gate": [
+        "answers",
+        "single-request validity"
+      ],
+      "production_gate": false,
+      "verdict": "the decision body cap is rejected with 413 before decode and never truncated; the cap is overridable per deployment",
+      "control_group": {
+        "cases": [
+          {
+            "input": "body under the cap",
+            "expect": "accepted"
+          },
+          {
+            "input": "body over the cap",
+            "expect": "413 before decode"
+          }
+        ],
+        "body_cap_bytes": 2097152,
+        "body_cap_env": "LLAMA_DECISION_MAX_BODY"
+      }
+    },
+    "output_row_capacity": {
+      "trigger": "output-row budget (max of chat and decision, not the sum)",
+      "axis": "task-value",
+      "may_gate": [
+        "logits buffer size for the shared context"
+      ],
+      "may_not_gate": [
+        "answers",
+        "admission",
+        "caching"
+      ],
+      "production_gate": false,
+      "verdict": "chat and decision decodes are serialized, so the shared budget is the larger need; it always covers n_parallel + n_seq_decision and never exceeds the sum",
+      "measurements": {
+        "cases": 54,
+        "covered": 54,
+        "not_summed": 54,
+        "max_rows_saved": 8,
+        "production_gate": false
+      },
+      "control_group": {
+        "cases": [
+          {
+            "input": "decision sequences on a draft-free context",
+            "expect": "every sequence covered"
+          },
+          {
+            "input": "draft sequences on the context",
+            "expect": "budget not above the sum"
+          }
+        ],
+        "serialization": "chat and decision never decode at the same time"
+      }
+    },
+    "readout_compatibility": {
+      "trigger": "opt-in confidence profile and order-de-bias pass profile",
+      "axis": "task-value",
+      "may_gate": [
+        "which confidence value is reported",
+        "how many order-de-bias passes run"
+      ],
+      "may_not_gate": [
+        "admission",
+        "caching",
+        "routing",
+        "persistence",
+        "answer key"
+      ],
+      "production_gate": false,
+      "verdict": "the certainty-based Jev confidence (N*p_max-1)/(N-1) and permutations=1 stay the defaults; the local 1-H/logK confidence profile and a higher default pass count are opt-in per request or per server flag and change only the reported concentration and the cost, never the winner gate; the corpus harness records winner agreement, Brier and ECE",
+      "control_group": {
+        "cases": [
+          {
+            "input": "no confidence_profile field",
+            "expect": "certainty-based Jev (N*p_max-1)/(N-1), unchanged answer"
+          },
+          {
+            "input": "confidence_profile=local",
+            "expect": "1-H/logK, same probabilities"
+          },
+          {
+            "input": "no permutations field at the default server",
+            "expect": "one pass"
+          },
+          {
+            "input": "server default permutations=2",
+            "expect": "two passes unless the request says otherwise"
+          }
+        ],
+        "metrics": [
+          "winner_agreement",
+          "brier",
+          "ece"
+        ],
+        "corpus": "accuracy_corpus.json",
+        "report": "accuracy_report.json"
+      }
+    },
+    "determinism_allowlist": {
+      "trigger": "weak-quant producer-stability allowlist",
+      "axis": "producer-confidence",
+      "may_gate": [
+        "whether a producer-stability assertion is skipped on a model"
+      ],
+      "may_not_gate": [
+        "any task-value assertion",
+        "answers",
+        "admission",
+        "caching",
+        "routing",
+        "persistence"
+      ],
+      "production_gate": false,
+      "verdict": "only a model whose GPU numerics move a winner may be listed; a model that passes the task-value checks is removed, never kept",
+      "measurements": {
+        "entries": [],
+        "count": 0,
+        "non_allowlisted_runs_hard": true,
+        "removed_when_task_value_passes": true,
+        "production_gate": false
+      },
+      "control_group": {
+        "cases": [
+          {
+            "input": "model on the allowlist",
+            "expect": "producer assertion skipped, not xfail"
+          },
+          {
+            "input": "model not on the allowlist",
+            "expect": "producer assertion runs hard"
+          }
+        ]
+      }
+    }
+  },
+  "model_measurements": {
+    "environment": {
+      "model": "qwen3.8-27b-tturbo-fcf-709/latest.gguf",
+      "model_bytes": 12184906464,
+      "quantization": "recorded per run; see model filename",
+      "backend_flags": {
+        "kv_unified": true,
+        "swa_full": false,
+        "n_ctx": 8192,
+        "n_batch": 512,
+        "n_ubatch": 512,
+        "n_seq_max": 10,
+        "gpu_layers": 0
+      }
+    },
+    "values": {
+      "small_tv": 0.0,
+      "small_argmax_agree": true,
+      "wide_tree_is_tree": true,
+      "wide_auto_is_tree": false,
+      "wide_tree_rows": 5,
+      "wide_greedy_rows": 7,
+      "bypass_on_ms": 0.0,
+      "bypass_off_ms": 0.0,
+      "bypass_speedup": 1.0,
+      "bypass_applicable": false,
+      "prefill_cached_ms": 201.32059,
+      "prefill_cold_ms": 1083.659324,
+      "auto_at_tree_max_is_tree": true,
+      "auto_above_tree_max_is_tree": false,
+      "label_pool_size": 64,
+      "temperature_nll_t1": 0.06163100717673836,
+      "temperature_nll_t1_3": 0.10004203398274118,
+      "temperature_nll_delta": 0.038411026806002814,
+      "hoist_argmax_agree": true,
+      "hoist_tv": 0.018834382761269808,
+      "hoist_fired": true,
+      "wide_auto_default_is_tree": true
+    }
+  }
+}

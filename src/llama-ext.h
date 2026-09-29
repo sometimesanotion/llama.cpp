@@ -116,6 +116,13 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Test/observability seam for the state save/load bulk-copy path: the number of tensor data
+// transfers staged since the last reset. A transposed cache region is one strided transfer
+// instead of one per embedding, so the count exposes that bulk path. Reset before an operation
+// and read after it; state staging runs on the scheduler thread only.
+LLAMA_API void     llama_state_seq_debug_reset_transfers();
+LLAMA_API uint64_t llama_state_seq_debug_transfer_count();
+
 //
 // model/context data extraction
 //

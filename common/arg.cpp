@@ -893,6 +893,26 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    // the decision endpoint is enabled by --decision-seqs alone; the other decision flags tune it
+    // and have no effect without it
+    if (params.n_seq_decision == 0 &&
+        (!params.decision_temperature.empty() || !params.decision_contract.empty() ||
+         params.n_decision_permutations != 1 || !params.decision_instance.empty())) {
+        throw std::invalid_argument("error: --decision-* flags require --decision-seqs (the decision endpoint is disabled without it)\n");
+    }
+
+    // a decision instance only exists in a pool; naming one without --instance can never resolve
+    if (!params.decision_instance.empty() && params.instances.empty()) {
+        throw std::invalid_argument("error: --decision-instance requires at least one --instance\n");
+    }
+
+    // decision branches fork from the prompt with llama_memory_seq_cp, which needs one unified
+    // KV cache; an explicit --no-kv-unified conflicts with --decision-seqs instead of being overridden
+    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER && params.n_seq_decision > 0 &&
+        params.kv_unified_explicit && !params.kv_unified) {
+        throw std::invalid_argument("error: --decision-seqs requires the unified KV cache; drop --no-kv-unified\n");
+    }
+
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
@@ -1747,6 +1767,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
         [](common_params & params, bool value) {
             params.kv_unified = value;
+            params.kv_unified_explicit = true;
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
@@ -2571,6 +2592,94 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-seqs"}, "N",
+            string_format("sequences reserved for the /decision endpoint, above the slots; enables it (default: %d = disabled, minimum 3)", params.n_seq_decision),
+            [](common_params & params, int value) {
+                if (value != 0 && value < 3) {
+                    throw std::invalid_argument("--decision-seqs needs at least 3 (cached prefix, trunk, one branch)");
+                }
+                params.n_seq_decision = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-arena-seqs"}, "N",
+            string_format("sequences reserved for decision session snapshots, above the decision pool (default: %d = n_parallel when --decision-seqs is set)", params.n_seq_arena),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-arena-seqs needs a non-negative count");
+                }
+                params.n_seq_arena = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_ARENA_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-temperature"}, "FILE",
+            "JSON file with calibrated decision temperatures and provenance; refused if the provenance does not match",
+            [](common_params & params, const std::string & value) {
+                params.decision_temperature = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_TEMPERATURE").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-contract"}, "HASH",
+            "expected decision contract hash (tokenizer + prompt template + label code); refuse the decision path when it does not match",
+            [](common_params & params, const std::string & value) {
+                params.decision_contract = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_CONTRACT").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-permutations"}, "N",
+            string_format("default order-de-bias passes for decision requests that omit \"permutations\" (default: %d); the request field still wins and the pass cap still applies", params.n_decision_permutations),
+            [](common_params & params, int value) {
+                if (value < 1) {
+                    throw std::invalid_argument("--decision-permutations needs at least 1");
+                }
+                params.n_decision_permutations = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_PERMUTATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-backend"}, "NAME",
+            string_format("default retained-turn backend for created sessions: host | clone | file (default: %s; clone is selectable only on dense unified attention or recurrent/hybrid models, file needs a writable --slot-save-path or --decision-session-persist directory)", params.decision_session_backend.empty() ? "host" : params.decision_session_backend.c_str()),
+            [](common_params & params, const std::string & value) {
+                if (value != "host" && value != "clone" && value != "file") {
+                    throw std::invalid_argument("--decision-session-backend needs host, clone or file");
+                }
+                params.decision_session_backend = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_BACKEND").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-ttl"}, "MS",
+            string_format("default time-to-live for created sessions, milliseconds (default: %d = no expiry)", (int) params.decision_session_ttl_ms),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-session-ttl needs a non-negative count");
+                }
+                params.decision_session_ttl_ms = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-budget-mb"}, "N",
+            string_format("byte budget for all retained-turn references, mebibytes (default: %d = unlimited; a capture that would exceed it is refused until the eviction calibration lands)", params.decision_session_budget_mb),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-session-budget-mb needs a non-negative count");
+                }
+                params.decision_session_budget_mb = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-session-persist"}, "DIR",
+            string_format("writable directory for the file retained-turn backend (default: the --slot-save-path directory, when set)"),
+            [](common_params & params, const std::string & value) {
+                params.decision_session_persist = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SESSION_PERSIST").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-instance"}, "NAME",
+            string_format("multi-instance: route stateless decisions to this instance when the request names no instance or model; live-session decisions still require the slot's owning instance"),
+            [](common_params & params, const std::string & value) {
+                params.decision_instance = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_INSTANCE").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

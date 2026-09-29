@@ -316,6 +316,56 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    printf("test-arg-parser: test decision flags\n\n");
+
+    {
+        common_params dec_params;
+
+        // every decision flag without --decision-seqs is a usage error
+        const char * decision_flags[][2] = {
+            {"--decision-temperature", "temps.json"},
+            {"--decision-contract", "abc123"},
+        };
+        for (const auto & flag : decision_flags) {
+            argv = {"binary_name", flag[0], flag[1]};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), dec_params, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // with --decision-seqs they parse and land in params
+        argv = {"binary_name", "--decision-seqs", "8"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dec_params, LLAMA_EXAMPLE_SERVER));
+        assert(dec_params.n_seq_decision == 8);
+
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-temperature", "temps.json", "--decision-contract", "abc123"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dec_params, LLAMA_EXAMPLE_SERVER));
+        assert(dec_params.decision_temperature == "temps.json");
+        assert(dec_params.decision_contract == "abc123");
+
+        // below the minimum is also a usage error
+        argv = {"binary_name", "--decision-seqs", "2"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), dec_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    printf("test-arg-parser: test decision KV-mode contract\n\n");
+
+    {
+        // decision sequences need the unified KV cache: an explicit --no-kv-unified conflicts
+        common_params kv_params;
+        argv = {"binary_name", "--decision-seqs", "8", "--no-kv-unified"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+
+        // an explicit --kv-unified is accepted
+        argv = {"binary_name", "--decision-seqs", "8", "--kv-unified"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), kv_params, LLAMA_EXAMPLE_SERVER));
+        assert(kv_params.kv_unified == true);
+
+        // without an explicit choice, parse succeeds and the server auto-enables the unified cache
+        common_params auto_params;
+        argv = {"binary_name", "--decision-seqs", "8"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), auto_params, LLAMA_EXAMPLE_SERVER));
+        assert(auto_params.kv_unified == false);
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

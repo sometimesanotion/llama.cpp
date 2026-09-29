@@ -158,6 +158,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    // decision branches fork from the prompt with llama_memory_seq_cp; a unified KV cache lets
+    // them share the prompt's cells instead of copying them between per-sequence streams.
+    // An explicit --no-kv-unified is rejected at parse time; this only fills in the default.
+    if (params.n_seq_decision > 0 && !params.kv_unified_explicit && !params.kv_unified) {
+        SRV_INF("--decision-seqs %d: enabling the unified KV cache\n", params.n_seq_decision);
+        params.kv_unified = true;
+    }
+
+    // one retained-turn snapshot per slot by default; an explicit --decision-arena-seqs wins
+    if (params.n_seq_decision > 0 && params.n_seq_arena == 0) {
+        params.n_seq_arena = params.n_parallel;
+    }
+
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
     // or with -c 0 for max context
     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&
@@ -230,6 +243,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_embeddings        = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_embeddings(req); };
         routes.post_embeddings_oai    = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_embeddings_oai(req); };
         routes.post_rerank            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_rerank(req); };
+        routes.post_decision          = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_decision(req); };
+        routes.post_session           = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_session(req); };
+        routes.get_session            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_session(req); };
+        routes.delete_session         = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_delete_session(req); };
+        routes.patch_session          = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_patch_session(req); };
         routes.get_lora_adapters      = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_lora_adapters(req); };
         routes.post_lora_adapters     = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_lora_adapters(req); };
     }
@@ -260,6 +278,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
+        routes.post_decision               = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -314,6 +333,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
+    ctx_http.post("/decision",                 ex_wrapper(routes.post_decision));
+    ctx_http.post("/v1/decision",              ex_wrapper(routes.post_decision));
+    ctx_http.post("/v1/session",               ex_wrapper(routes.post_session));
+    ctx_http.get ("/v1/session/:session_id",   ex_wrapper(routes.get_session));
+    ctx_http.del ("/v1/session/:session_id",   ex_wrapper(routes.delete_session));
+    ctx_http.patch("/v1/session/:session_id",  ex_wrapper(routes.patch_session));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

@@ -208,7 +208,19 @@ struct server_instances {
     // route a request that carries model / instance / snapshot fields (body and/or query)
     // to the owning instance. `forward` runs on the chosen instance's server_routes.
     using forward_fn = std::function<server_http_res_ptr(server_routes &, const server_http_req &)>;
+
+    // placement contract for a routed request. A session-pinned request (decision on a live
+    // slot, or any /v1/session call) addresses state that lives in exactly one instance's
+    // context, so group routing (which picks any free member) is refused. `implicit_instance`
+    // is used only for requests that name no target and are not session-pinned; it is how
+    // --decision-instance gives stateless decisions their own context.
+    struct dispatch_options {
+        bool        require_instance  = false;
+        std::string implicit_instance;
+    };
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward);
+    server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward,
+                                 const dispatch_options & opt);
 
     // --- management API ---
     server_http_res_ptr handle_get_instances(const server_http_req & req);
@@ -249,6 +261,11 @@ struct server_instances {
     server_http_res_ptr handle_post_embeddings(const server_http_req & req);
     server_http_res_ptr handle_post_embeddings_oai(const server_http_req & req);
     server_http_res_ptr handle_post_rerank(const server_http_req & req);
+    server_http_res_ptr handle_post_decision(const server_http_req & req);
+    server_http_res_ptr handle_post_session(const server_http_req & req);
+    server_http_res_ptr handle_get_session(const server_http_req & req);
+    server_http_res_ptr handle_delete_session(const server_http_req & req);
+    server_http_res_ptr handle_patch_session(const server_http_req & req);
     server_http_res_ptr handle_get_lora_adapters(const server_http_req & req);
     server_http_res_ptr handle_post_lora_adapters(const server_http_req & req);
 

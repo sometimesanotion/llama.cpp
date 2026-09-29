@@ -1,0 +1,13 @@
+{
+  "note": "Pre-registered responsiveness and fairness bound for the decision endpoint, measured by tools/server/tests/test_decision_admission.py. The bound is fixed before measurement; changing it requires a matching code change and a re-measured gate.",
+  "bound": {
+    "slots_during_decision_ms": 250,
+    "chat_latency_factor": 2.0,
+    "chat_latency_margin_ms": 500
+  },
+  "rationale": {
+    "slots_during_decision_ms": "a cooperative yield between decision waves must let the scheduler answer /slots well under one wave, even while a multi-second decision runs",
+    "chat_latency_factor": "chat shares the one context, so a chat request fired during a decision is serialized behind it; its latency bound is the decision time plus a small multiple of a warm decision",
+    "chat_latency_margin_ms": "fixed slack for queueing and scheduling jitter"
+  }
+}

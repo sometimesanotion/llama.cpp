@@ -207,7 +207,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         test-llama-archs
         NAME test-generate-models
         LABEL main
-        ARGS -o "${MODEL_DIR}"
+        ARGS -s 1234 -o "${MODEL_DIR}"
     )
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models
@@ -265,6 +265,47 @@ llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)
+# decision engine: pure schema/assemble tests plus an env-gated scoring harness.
+# the engine source is compiled here because tests/ is configured before tools/.
+llama_build(test-decision-engine.cpp)
+target_include_directories(test-decision-engine PRIVATE ${PROJECT_SOURCE_DIR}/tools/parallel-decision)
+target_sources(test-decision-engine PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/decision-engine.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/decision-protocol.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/generic_frontend.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/labels.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/letter_readout.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/session-registry.cpp
+    ${PROJECT_SOURCE_DIR}/tools/parallel-decision/session-store.cpp)
+target_compile_definitions(test-decision-engine PRIVATE
+    DECISION_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/decision"
+    DECISION_TEST_BASELINE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/decision-baseline"
+    DECISION_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}/tools/parallel-decision"
+    DECISION_TEST_GENERATED_MODEL_DIR="${CMAKE_CURRENT_BINARY_DIR}/test-models"
+    DECISION_TEST_SPM_MODEL="${CMAKE_BINARY_DIR}/tinyllamas/stories15M-q4_0.gguf")
+llama_test(test-decision-engine LABEL decision)
+# the host-runnable sections of the decision test must run in the standard CPU CI lane, so the
+# binary also carries the main label; the GPU/model-gated tests inside it skip on a CPU build
+set_tests_properties(test-decision-engine PROPERTIES LABELS "decision;main")
+# CPU-only cases in the decision test load a generated dummy model from the generate-models fixture
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    set_tests_properties(test-decision-engine PROPERTIES FIXTURES_REQUIRED generate-models)
+endif()
+# filter-specific entries are gate-addressable by name and by label; each runs only its subset
+add_test(NAME test-decision-calibration COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*calibration.*)?")
+set_tests_properties(test-decision-calibration PROPERTIES LABELS "calibration")
+add_test(NAME test-decision-fork COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*fork.*)?")
+set_tests_properties(test-decision-fork PROPERTIES LABELS "fork")
+add_test(NAME test-decision-permut COMMAND $<TARGET_FILE:test-decision-engine> "decision engine harness(\\..*permut.*)?")
+set_tests_properties(test-decision-permut PROPERTIES LABELS "permut")
+# the temperature driver runs the same binary and checks the temperature/confidence subset
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-decision-temperature COMMAND ${CMAKE_COMMAND} -E env
+        LLAMA_DECISION_TEST_BIN=$<TARGET_FILE:test-decision-engine>
+        ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/parallel-decision/tests/test_temperature.py)
+    set_tests_properties(test-decision-temperature PROPERTIES LABELS "temperature")
+endif()
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)

@@ -287,8 +287,6 @@ static void test_instances_envelope_shape() {
 // ordering over routing candidates: fewest busy wins, then least recently used,
 // then registration order. full or slot-less members are never picked.
 static void test_pick_best_candidate() {
-    using cand = server_instances::route_candidate;
-
     // busy-first: the idle member wins over a busier one regardless of stamps
     assert(server_instances::pick_best_candidate({
         { 0, 1, 1, 100 },

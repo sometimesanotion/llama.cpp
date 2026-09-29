@@ -1,0 +1,41 @@
+{
+  "model": "m",
+  "answers": {
+    "refund": {
+      "type": "noul",
+      "noul": 0.75
+    },
+    "dept": {
+      "type": "choice",
+      "confidence": 0.40000003576278687,
+      "choice": "billing",
+      "probabilities": {
+        "billing": 0.6000000238418579,
+        "technical": 0.30000001192092896,
+        "cancellation": 0.10000000149011612
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "confidence": 0.25,
+      "score": 1.300000011920929,
+      "probabilities": {
+        "0": 0.20000000298023224,
+        "1": 0.30000001192092896,
+        "2": 0.5
+      },
+      "legend": {
+        "0": {
+          "level": 1,
+          "label": "calm"
+        },
+        "1": "upset",
+        "2": "furious"
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 0
+  }
+}
