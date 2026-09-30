@@ -221,12 +221,14 @@ bool server_instances::load(const common_params & params) {
 
     std::vector<common_instance> inst_cfgs = params.instances;
     if (inst_cfgs.empty()) {
-        // legacy drop-in: a single default instance. the pool is never left empty, so
-        // a bare <base> request always has a target.
+        // single default instance, so a bare <base> request always has a target. it takes the
+        // global --parallel/-c, preserving stock single-context startup behavior, because
+        // common_instance_params never falls back to the base values for a declared instance.
         common_instance inst;
         inst.name       = "default";
         inst.group      = "default";
         inst.is_default = true;
+        inst.parallel   = params.n_parallel;
         inst_cfgs.push_back(std::move(inst));
     }
 
@@ -266,23 +268,6 @@ bool server_instances::load(const common_params & params) {
                 cfg.is_default ? ", default" : "");
     }
 
-    // --decision-instance must name an exact instance: the point is a dedicated context, and
-    // group routing would pick a shared member instead, defeating the isolation.
-    if (!params.decision_instance.empty()) {
-        bool found = false;
-        for (const auto & inst : instances) {
-            if (inst->cfg.name == params.decision_instance) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            IST_ERR("--decision-instance '%s' does not match any configured instance\n", params.decision_instance.c_str());
-            return false;
-        }
-        IST_INF("stateless decisions default to instance '%s'\n", params.decision_instance.c_str());
-    }
-
     // --decision-sidecar: an internal, undeletable executor instance with its own context
     // and scheduler thread. lazy built on the first decision that routes to it. sized to
     // --decision-sidecar-ctx, else the largest configured window, so the longest turn a
@@ -294,8 +279,11 @@ bool server_instances::load(const common_params & params) {
         sidecar.group    = decision_sidecar_name();
         sidecar.ctx_size = params.decision_sidecar_ctx;
         if (sidecar.ctx_size == 0) {
+            // the effective window, so an instance that inherits -c still bounds the sidecar.
+            // A compiled plan is sized by the request (questions x branch depth), which is not
+            // known here, so any fixed default refuses requests a larger window would answer.
             for (const auto & cfg : inst_cfgs) {
-                sidecar.ctx_size = std::max(sidecar.ctx_size, cfg.ctx_size);
+                sidecar.ctx_size = std::max(sidecar.ctx_size, common_instance_params(params, cfg).n_ctx);
             }
         }
         sidecar.parallel = 1;
@@ -579,15 +567,6 @@ server_http_res_ptr server_instances::dispatch(const server_http_req & req, cons
             } catch (const std::exception &) {
             }
         }
-    }
-
-    // A stateless decision that names no target may be pinned to the declared decision
-    // instance; a session-pinned request must name the owning instance instead. target_specified
-    // is computed from the ORIGINAL request before stamping: a bare pool id or Jev alias is
-    // echo-only and never decides placement, so it is not a target.
-    if (opt.decision_default && !opt.require_instance && !opt.target_specified && instance_field.empty() &&
-        !params.decision_instance.empty()) {
-        instance_field = params.decision_instance;
     }
 
     std::string          error;
@@ -2470,47 +2449,7 @@ static bool decision_request_is_session_pinned(const server_http_req & req) {
 server_http_res_ptr server_instances::handle_post_decision(const server_http_req & req) {
     // the sidecar executor owns every decision, stateless and session; the pool resolves a token
     // snapshot for a session decision before routing it there (see handle_post_decision_sidecar)
-    if (params.decision_sidecar) {
-        return handle_post_decision_sidecar(req);
-    }
-    // the strict-Jev route is the same dispatch with the Jev contract pinned on the body
-    server_http_req jev_req = req;
-    if (req.path == DECISION_JEV_PATH) {
-        try {
-            json body = json::parse(req.body);
-            if (body.is_object()) {
-                body[DECISION_JEV_ONLY_KEY] = true;
-                jev_req.body                  = body.dump();
-            }
-        } catch (const std::exception &) {
-            // a malformed body is reported by the owning instance's handler
-        }
-    }
-    // stateless decisions may be pinned to a declared decision instance (--decision-instance);
-    // a live-session decision must name the instance that owns the slot instead
-    dispatch_options opt;
-    opt.require_instance  = decision_request_is_session_pinned(req);
-    opt.decision_default  = true;
-    opt.target_specified  = decision_request_target_specified(req, base_name);
-
-    // The decision contract requires a model id, but in a pool the model field is a routing
-    // target. When the client names only the instance (or nothing at all, or a Jev alias), fill
-    // the pool id in so the request routes here and the parser still sees a model. The response
-    // echoes it.
-    server_http_req routed = jev_req;
-    try {
-        json              body        = json::parse(routed.body);
-        const std::string model_field = body.is_object() ? json_value(body, "model", std::string()) : std::string();
-        if (body.is_object() &&
-            (model_field.empty() || model_field == "jev-latest" || model_field == "jev-preview")) {
-            body["model"] = base_name;
-            routed.body   = body.dump();
-        }
-    } catch (const std::exception &) {
-        // a malformed body is reported by the owning instance's handler
-    }
-
-    return dispatch(routed, [](server_routes & routes, const server_http_req & req) { return routes.post_decision(req); }, opt);
+    return handle_post_decision_sidecar(req);
 }
 
 // sidecar executor mode: every decision runs on the internal executor instance. the model field

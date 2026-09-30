@@ -12,6 +12,13 @@ normative contracts live in:
 
 If this overview disagrees with `API.md` or `LLAMA_INSTANCES.md`, those win.
 
+> **Status: the in-context decision lane has been removed.** Decisions now always
+> run on the internal `__decision__` sidecar executor, on a single-context server
+> as well as a pool, so a decision never shares a context with chat. The
+> `--decision-instance` flag is gone with it. Sections describing the legacy
+> shared-context lane (3.2, and the legacy-lane notes elsewhere) are kept below
+> only as design history; they no longer describe the server.
+
 ---
 
 ## 1. The combined goal
@@ -111,9 +118,8 @@ decision cannot stall or write a chat window.
 - The sidecar keeps its own resident-prefix warm tier
   (`--decision-warm-budget-mb`), so repeat decisions on a turn fork a kept
   prefix instead of re-prefilling.
-- Setting `--decision-instance NAME` disables the sidecar and runs decisions on
-  the legacy shared-context executor instead (section 3.2); it does not create a
-  second sidecar.
+- The sidecar is the only executor. `--decision-instance NAME`, which used to
+  disable it in favour of the shared-context executor, has been removed.
 
 Measured shape (4 agents, 4 stateless workers, 1 session worker, 2 churn
 workers, all three target models):
@@ -125,15 +131,19 @@ workers, all three target models):
 - Larger model (gemma-4-e4b): device-bound; sidecar gives little chat benefit
   and slows decisions. Four contexts contending for one GPU is the bottleneck.
 
-### 3.2 Legacy shared context
+### 3.2 Legacy shared context (removed)
 
-When there is no pool (single-context server) or `--decision-instance NAME` is
-set, decisions run on the same context as chat via the engine's reserved
-sequence ranges and the decision yield. `NAME` must match a configured instance
-(groups are rejected at startup); decisions then run on that instance's context
-and chat on it stalls for the decision. This lane is kept green for the
-single-context default; it is slated for removal when the pool-level decode
-re-home lands.
+This lane ran decisions on the same context as chat via the engine's reserved
+sequence ranges and the decision yield, so chat on that context stalled for the
+decision duration and any concurrent decode could perturb a chat token through
+batch geometry. It is removed: the sidecar is the only executor, and
+`--decision-instance` is gone. A single-context server now gets a sidecar
+instance of its own.
+
+The retained-turn registry, the host/clone/file session backends, and the arena
+(`--decision-arena-seqs`) only ever served this lane. They are no longer
+reachable from any request path, but they are still present in the tree and
+should be removed in a follow-up.
 
 ### 3.3 Session decisions
 
@@ -211,9 +221,8 @@ Measured, legacy shared-context lane (chat already streaming):
 | gemma-4-e4b | 1005 ms | 1008.3 ms | unaffected |
 
 The stall equals the decision duration and applies only to a decision running on
-a chat context (the legacy lane). With the sidecar executor there is no such
-stall; plan agentic workloads with the sidecar default, or a dedicated
-`--decision-instance` executor.
+a chat context (the removed legacy lane). The sidecar executor is the only one
+left, so no decision ever stalls chat.
 
 Not guaranteed:
 
@@ -234,18 +243,17 @@ pool id echoed into a decision body is echo-only and never selects a target.
 
 | request target | result |
 | --- | --- |
-| stateless decision (no placement) | the decision sidecar executor (`--decision-instance` if set, else the internal `__decision__`) |
+| stateless decision (no placement) | the decision sidecar executor (the internal `__decision__`) |
 | `instance: "X"` | instance X |
 | `model: "base:X"` | instance X |
 | `model: "base:latest:X"` | instance X |
 | `model: "base"` / no target (stateless decision) | the sidecar executor |
 | `model: "base:GROUP"` (group) | any free member; refused for session-pinned requests (400) |
 | `session_id` or `id_slot` | the owning instance's slot (the decision then runs on the sidecar from an owned token snapshot); cross-instance is refused |
-| unknown `model` (stateless) | answered on the sidecar (echo-only); on the legacy `--decision-instance` executor a 400 |
+| unknown `model` (stateless) | answered on the sidecar (echo-only) |
 
-Note: on the legacy shared-context executor only, the `model`/`instance` fields
-place the request and an unknown model is a 400. On the sidecar executor a
-stateless `model` is echo-only. See `API.md` section 2.6.
+On the sidecar executor a stateless `model` is echo-only and never places the
+request. See `API.md` section 2.6.
 
 ---
 
@@ -255,9 +263,7 @@ stateless `model` is echo-only. See `API.md` section 2.6.
 - Decisions: `--decision-seqs N` (N >= 3) with a pool selects the sidecar
   executor; it forces `kv_unified` on the sidecar context only, never on chat
   instances.
-- Sidecar executor: `--decision-sidecar-ctx N`, `--decision-sidecar-prebuild`,
-  `--decision-instance NAME` (names the executor for decisions that name no
-  target).
+- Sidecar executor: `--decision-sidecar-ctx N`, `--decision-sidecar-prebuild`.
 - Sidecar admission/timeout: `--decision-timeout-ms N`,
   `--decision-max-queue N`.
 - Sidecar warm tier: `--decision-warm-budget-mb N` (KV budget for the resident
@@ -390,13 +396,12 @@ eagerly, and sessions run on the sidecar as token snapshots.
 - Instance / context window: a named, independently sized KV + compute context
   built from shared weights, with its own scheduler thread.
 - Sidecar: the decision executor - the internal `__decision__` pool instance
-  with its own context and scheduler thread. It owns every decision and is never
-  written or stalled by chat. Setting `--decision-instance` disables it and
-  selects the legacy shared-context executor instead.
-- Shared context / legacy lane: decisions run on the same context as chat, so
-  chat stalls for the decision. Used only when there is no pool (single-context
-  server) or a `--decision-instance` executor; slated for removal with the
-  pool-level decode re-home.
+  with its own context and scheduler thread. It owns every decision, on a
+  single-context server as well as a pool, and is never written or stalled by
+  chat.
+- Shared context / legacy lane: removed. Decisions ran on the same context as
+  chat, so chat stalled for the decision and a concurrent decode could perturb a
+  chat token through batch geometry.
 - Engine pool: reserved decision sequences inside a context, above the chat
   slots (legacy shared lane, and the sidecar's own context).
 - Session arena: reserved sequences used to materialize a retained-turn

@@ -197,7 +197,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // multi-instance mode: many named contexts sharing one weight load
     server_instances instances_mgr;
-    const bool use_instances = !params.instances.empty();
+    // decisions need the pool: the sidecar executor is a pool instance, so a server that only
+    // runs decisions must go through the manager too (it gets a single default instance plus the
+    // internal sidecar). a chat-only server keeps the plain single-context path.
+    const bool use_instances = !params.instances.empty() || params.n_seq_decision > 0;
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {

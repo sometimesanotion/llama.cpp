@@ -221,17 +221,11 @@ struct server_instances {
     // to the owning instance. `forward` runs on the chosen instance's server_routes.
     using forward_fn = std::function<server_http_res_ptr(server_routes &, const server_http_req &)>;
 
-    // placement contract for a routed request. A session-pinned request (decision on a live
-    // slot, or any /v1/session call) addresses state that lives in exactly one instance's
-    // context, so group routing (which picks any free member) is refused. `decision_default`
-    // is set only for the stateless decision route: an untargeted request that carries no
-    // placement may fall back to the declared --decision-instance. `target_specified` is
-    // computed from the ORIGINAL request fields before any stamping; a stamped pool id is an
-    // echo and never decides placement, so it is not a target.
+    // placement contract for a routed request. A session-pinned request (any /v1/session call,
+    // or a decision naming a live slot) addresses state that lives in exactly one instance's
+    // context, so group routing (which picks any free member) is refused.
     struct dispatch_options {
         bool require_instance = false; // refuse group routing; address one instance's slot
-        bool decision_default = false; // stateless decision: an untargeted request may use --decision-instance
-        bool target_specified = false; // the original request named a routing target
     };
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward);
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward,

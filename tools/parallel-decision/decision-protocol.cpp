@@ -464,10 +464,6 @@ double question_temperature(const decision_request & req, const decision_questio
     return req.temperature;
 }
 
-bool is_decision_request(const common_json & body) {
-    return body.is_object() && (body.contains("questions") || body.contains("state"));
-}
-
 session_ref parse_session_ref(const common_json & body) {
     session_ref ref;
     if (!body.is_object()) {

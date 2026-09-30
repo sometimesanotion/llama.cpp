@@ -2146,10 +2146,12 @@ Group dispatch picks the member with the fewest busy slots, then the least recen
 waiting up to `--instance-wait` seconds for a free member before returning `503`.
 
 The decision API (`/v1/decision`, `/v1/session`) follows the same routing, with one
-difference: in sidecar mode (the default when `--decision-seqs` is set and a pool exists)
-every decision runs on the internal `__decision__` executor instance, and the `model` /
-`instance` fields are echo-only for a stateless decision - they never select a target. The
-sidecar is sized with `--decision-sidecar-ctx` (default: the largest instance window),
+difference: when `--decision-seqs` is set, every decision runs on the internal
+`__decision__` executor instance - including on a single-context server, which gets a
+sidecar of its own - and the `model` / `instance` fields are echo-only for a stateless
+decision, so they never select a target. A decision therefore never shares a context with
+chat. The sidecar is sized with `--decision-sidecar-ctx` (default: the largest effective
+instance window, because a compiled plan is sized by the request),
 built lazily on the first decision (or eagerly with `--decision-sidecar-prebuild`), bounded
 by `--decision-max-queue` (429 / 529) and `--decision-timeout-ms` (503 + Retry-After). A
 `--decision-warm-budget-mb N` budget (default 0 = off) makes the sidecar keep recent session

@@ -149,13 +149,6 @@ class session_registry {
     // The retained session for a slot, or nullptr when the slot holds none.
     const decision_session * find_by_slot(int id_slot) const;
 
-    // Whether a slot's retained session is still the current turn: true when the session's identity
-    // (content hash + turn + adapter scope) and memory epoch match the slot's current prefix. An
-    // empty prefix (a cleared slot) has no content to compare, so only the epoch is checked. Pure:
-    // reads no slot state.
-    bool is_current(const decision_session * sess, const std::vector<llama_token> & prefix,
-                    const std::string & adapter_scope) const;
-
     // The FNV-1a content hash of a decoded token prefix: the identity of the captured turn, so a
     // clear plus a same-length re-prefill of different content is refused instead of answered.
     static std::string content_hash_of(const std::vector<llama_token> & prefix);

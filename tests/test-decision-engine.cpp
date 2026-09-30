@@ -999,7 +999,8 @@ static void test_decision_values_golden(testing & t) {
 static void test_decision_parse(testing & t) {
     t.test("valid decision request parses with aliases and structured criteria", [](testing & t) {
         const common_json body = common_json::parse(decision_valid_body());
-        t.assert_true("detected as Jev", llama_decision::is_decision_request(body));
+        t.assert_true("detected as Jev",
+                      llama_decision::select_request_shape(body) == llama_decision::request_shape::jev);
 
         const auto req = llama_decision::parse_decision_request(body);
         t.assert_equal("model echoed", std::string("m"), req.model);
@@ -3437,22 +3438,30 @@ static void session_registry_turn_policy_run(testing & t, llama_context * ctx, c
     if (snap_seq < 0) {
         return;
     }
-    const llama_decision::decision_session * snap = reg.find_by_slot(0);
+    t.assert_true(lane + ": the retained turn is addressable by slot", reg.find_by_slot(0) != nullptr);
     const llama_pos pos_max = (llama_pos) t0.size() - 1;
-    t.assert_true(lane + ": the retained turn is current for its own content",
-                  snap != nullptr && reg.is_current(snap, t0, ""));
-    t.assert_true(lane + ": a cleared slot keeps the snapshot current",
-                  snap != nullptr && reg.is_current(snap, {}, ""));
-    const auto t1_diff = common_tokenize(llama_model_get_vocab(model), "a different turn body", false, true);
-    t.assert_true(lane + ": different content of the same turn is stale",
-                  snap != nullptr && !t1_diff.empty() && !reg.is_current(snap, t1_diff, ""));
     const int n_reuse = 3;
     for (int i = 0; i < n_reuse; ++i) {
         const auto r = reg.resolve_slot(0, t0, pos_max, -1, "turn-a", "");
         t.assert_equal(lane + ": the reuse returns the arena sequence", snap_seq, r.seq);
     }
+    // the N-1 reuses are what prove the retained turn is still current for its own content: a
+    // mismatched prefix would never reuse
     t.assert_equal(lane + ": one turn queried N times takes one snapshot", 1, reg.n_snapshots());
     t.assert_equal(lane + ": one turn queried N times takes N-1 reuses", n_reuse, reg.n_reuses());
+
+    // different content of the same turn is stale. a pinned reference is refused rather than
+    // silently re-answered from the new content, so the divergent resolve must throw.
+    const auto t1_diff = common_tokenize(llama_model_get_vocab(model), "a different turn body", false, true);
+    if (!t1_diff.empty()) {
+        bool refused = false;
+        try {
+            reg.resolve_slot(0, t1_diff, (llama_pos) t1_diff.size() - 1, -1, "turn-a", "");
+        } catch (const llama_decision::semantic_error &) {
+            refused = true;
+        }
+        t.assert_true(lane + ": different content of the same turn is refused", refused);
+    }
 
     // turn advance: the slot decoded a new turn, so the retained reference is discarded before the
     // next decision
@@ -5341,8 +5350,8 @@ static void budget_eviction_property_run(testing & t, llama_context * ctx, const
         if (sess == nullptr) {
             continue; // evicted
         }
-        t.assert_true(lane + ": a remaining session is current for its own content",
-                      reg.is_current(sess, transcript, ""));
+        // a remaining session resolves against its own transcript, which is what proves it is
+        // still current; no evicted session is answered
         const auto res = reg.resolve(sid, transcript, "");
         t.assert_true(lane + ": a remaining session resolves to a live sequence", res.seq >= 0);
     }
@@ -9749,6 +9758,21 @@ static std::string session_baseline_path(const std::string & backend) {
     return std::string(DECISION_TEST_BASELINE_DIR) + "/session_" + backend + "_baseline.json";
 }
 
+// Whether a retained reference still describes the transcript it was captured from. The registry's
+// own currency predicate has no production caller, so the report recomputes the part that matters
+// here - the captured content identity. This test never advances the per-slot turn counter, so the
+// turn component is not part of the check.
+static bool retained_matches_transcript(const llama_decision::decision_session * sess,
+                                        const std::vector<llama_token> & transcript) {
+    if (sess == nullptr || transcript.empty()) {
+        return false;
+    }
+    llama_decision::session_identity cur;
+    cur.content_hash  = llama_decision::session_registry::content_hash_of(transcript);
+    cur.adapter_scope = "";
+    return cur.content_hash == sess->identity.content_hash && cur.adapter_scope == sess->identity.adapter_scope;
+}
+
 // Reproduces the server's live-session decision path at the engine level: decode a transcript on
 // slot 0, snapshot it into the arena, fork the arena sequence, run the letter readout with a
 // session source, and assemble the response with the strict Jev envelope (no diagnostics). The
@@ -9864,7 +9888,7 @@ static common_json session_capture(const std::string & path, bool gpu) {
         const llama_pos after = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
         const llama_decision::decision_session * kept = warena.find_by_slot(0);
         const bool retained_after = kept != nullptr;
-        const bool is_current     = warena.is_current(kept, transcript, "");
+        const bool is_current     = retained_matches_transcript(kept, transcript);
         window["slot_pos_max_before"]  = (long long) before;
         window["retained_before"]      = retained_before;
         window["slot_pos_max_after"]   = (long long) after;

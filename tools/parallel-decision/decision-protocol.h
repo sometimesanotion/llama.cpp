@@ -177,9 +177,6 @@ std::string render_text(const common_json & value);
 // Effective softmax temperature for a question: per-type override, else the global value.
 double question_temperature(const decision_request & req, const decision_question & q);
 
-// True when the body carries the decision shape (state and/or questions).
-bool is_decision_request(const common_json & body);
-
 // Reads the optional live-session reference shared by the Jev and generic shapes. Throws
 // semantic_error when a field has the wrong type, when id_slot is negative, or when session_pos
 // is supplied without id_slot.

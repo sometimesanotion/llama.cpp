@@ -351,13 +351,17 @@ static void test(void) {
     {
         common_params sc_params;
 
-        // the sidecar executor needs --decision-seqs and a pool to live in
+        // the sidecar executor needs --decision-seqs
         argv = {"binary_name", "--decision-sidecar"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
         argv = {"binary_name", "--decision-sidecar-ctx", "4096"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+
+        // with the decision endpoint enabled they parse with or without a pool: a single-context
+        // server gets the sidecar too
         argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar"};
-        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        assert(sc_params.decision_sidecar == true);
 
         // with the pool they parse and land in params
         argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar", "--decision-sidecar-ctx", "4096", "--instance", "a:ctx=512"};
@@ -398,29 +402,34 @@ static void test(void) {
     printf("test-arg-parser: test decision sidecar default (M3)\n\n");
 
     {
-        // with a pool present, the sidecar is the default executor when --decision-seqs is set
+        // the sidecar is the only decision executor, with or without a pool
         common_params m3_params;
         argv = {"binary_name", "--decision-seqs", "8", "--instance", "a:ctx=512"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_params, LLAMA_EXAMPLE_SERVER));
         assert(m3_params.decision_sidecar == true);
 
         // M4: the temporary hidden --no-decision-sidecar flag is gone; the sidecar is the only
-        // pool executor, so an unknown flag is rejected rather than keeping the legacy path
+        // executor, so an unknown flag is rejected rather than reviving a legacy path
         common_params m3_off;
         argv = {"binary_name", "--decision-seqs", "8", "--no-decision-sidecar", "--instance", "a:ctx=512"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_off, LLAMA_EXAMPLE_SERVER));
 
-        // a single-context server has no pool to host the sidecar: legacy path stays the default
+        // a single-context server gets the sidecar too, so a decision never shares a chat context
         common_params m3_single;
         argv = {"binary_name", "--decision-seqs", "8"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_single, LLAMA_EXAMPLE_SERVER));
-        assert(m3_single.decision_sidecar == false);
+        assert(m3_single.decision_sidecar == true);
 
-        // a named decision instance also selects the legacy executor, not the sidecar default
+        // the in-context executor selection is gone with it
         common_params m3_named;
         argv = {"binary_name", "--decision-seqs", "8", "--decision-instance", "a", "--instance", "a:ctx=512"};
-        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_named, LLAMA_EXAMPLE_SERVER));
-        assert(m3_named.decision_sidecar == false);
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_named, LLAMA_EXAMPLE_SERVER));
+
+        // decisions off: no sidecar, and a --decision-* flag is a usage error
+        common_params no_dec;
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), no_dec, LLAMA_EXAMPLE_SERVER));
+        assert(no_dec.decision_sidecar == false);
     }
 
     printf("test-arg-parser: test decision KV-mode contract\n\n");

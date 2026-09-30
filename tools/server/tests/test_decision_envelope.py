@@ -343,18 +343,15 @@ def prefill_slot(server, id_slot, system, user):
     check(status == 200, f"slot prefill status {status}: {text[:200]}")
 
 
-def session_server_args(mode):
-    # M3: the sidecar is the default executor when --decision-seqs is set and a pool exists, so
-    # the sidecar lane does not pass --decision-sidecar. The "old" lane is the single-context
-    # legacy path (no pool to host a sidecar).
-    if mode == "sidecar":
-        return ["--instance", "main:ctx=8192:parallel=2:default",
-                "--instance", "other:ctx=512:parallel=1",
-                "--slots", "--jinja"]
-    return ["--parallel", "2", "--slots", "--jinja"]
+def session_server_args():
+    # the sidecar is the only decision executor, so a session is always a token snapshot on the
+    # internal executor and the chat instances never host a decision decode
+    return ["--instance", "main:ctx=8192:parallel=2:default",
+            "--instance", "other:ctx=512:parallel=1",
+            "--slots", "--jinja"]
 
 
-def run_session_checks(model, mode="old"):
+def run_session_checks(model):
     """A decision about a live slot must fork the slot, not re-prefill it, and must not touch it.
 
     The stateless request is the control: same system instruction and same state, so the session
@@ -366,7 +363,7 @@ def run_session_checks(model, mode="old"):
 
     import tempfile
     slot_dir = tempfile.mkdtemp(prefix="decision-session-slots-")
-    server = Server(model, session_server_args(mode) + ["--slot-save-path", slot_dir])
+    server = Server(model, session_server_args() + ["--slot-save-path", slot_dir])
     try:
         server.start()
     except Exception as e:  # noqa: BLE001
@@ -461,11 +458,11 @@ def run_session_checks(model, mode="old"):
         status, text = server.post("/v1/decision", json.dumps(DECISION_VALID))
         check(status == 200, f"stateless after sessions: {status}")
         after = json.loads(text)["answers"]
-        # a sidecar session replay re-prefills on the executor's own context, so a later stateless
+        # a session replay re-prefills on the executor's own context, so a later stateless
         # decision restores its prefix through the engine's host-state warm path; on recurrent
-        # models that restore is exact in the winner but drifts within a small producer bound, so
-        # the sidecar lane allows a wider probability tolerance (winner stays pinned in both).
-        prob_tol = 0.1 if mode == "sidecar" else 5e-2
+        # models that restore is exact in the winner but drifts within a small producer bound
+        # (winner stays pinned).
+        prob_tol = 0.1
         for qid in control:
             if "noul" in control[qid]:
                 check(abs(after[qid]["noul"] - control[qid]["noul"]) <= prob_tol, f"{qid} stateless unchanged by sessions")
@@ -484,12 +481,12 @@ def run_session_checks(model, mode="old"):
     return True
 
 
-def run_session_handle_checks(model, mode="old"):
+def run_session_handle_checks(model):
     """The first-class session handle lifecycle over HTTP: create/query/pin/ttl/erase, the
     session_id decision path, and the session_id + id_slot mutual exclusion."""
     state = DECISION_VALID["state"]
     user = "State:\n" + state + "\n"
-    server = Server(model, session_server_args(mode))
+    server = Server(model, session_server_args())
     try:
         server.start()
     except Exception as e:  # noqa: BLE001
@@ -524,15 +521,10 @@ def run_session_handle_checks(model, mode="old"):
         check(body.get("session_id") == sid, "session get echoes the handle")
         check(body.get("id_slot") == 0, "session get reports the slot")
         check(isinstance(body.get("counters"), dict), "session get reports the registry counters")
-        # M3: the sidecar reports the token-snapshot backend and has no arena counters; the legacy
-        # in-context registry reports the host backend and its arena occupancy.
-        if mode == "sidecar":
-            check(body.get("backend") == "tokens", f"sidecar session backend is tokens: {body.get('backend')}")
-            check("arena_used" not in body["counters"] and "arena_capacity" not in body["counters"],
-                  f"sidecar session has no arena counters: {body['counters']}")
-        else:
-            check(body.get("backend") == "host", f"legacy session backend is host: {body.get('backend')}")
-            check("arena_used" in body["counters"], f"legacy session reports arena_used: {body['counters']}")
+        # the executor holds token snapshots, so there is no arena and no host backend
+        check(body.get("backend") == "tokens", f"session backend is tokens: {body.get('backend')}")
+        check("arena_used" not in body["counters"] and "arena_capacity" not in body["counters"],
+              f"session has no arena counters: {body['counters']}")
 
         # a decision by session_id resolves and reports the handle additively
         status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id=sid, diagnostics=True)))
@@ -573,23 +565,13 @@ def run_session_handle_checks(model, mode="old"):
         status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id=sid2)))
         check(status == 200, f"an eager session resolves by handle: {status} {text[:120]}")
 
-        # the clone backend: selectable on a capable model on the in-context path (a sliding-window
-        # model refuses it with a 501 capability error, never a silent fallback); a 501 capability
-        # refusal on the sidecar executor (token snapshots only)
+        # the executor keeps token snapshots, so the retained-turn backends are a 501 capability
+        # refusal, never a silent fallback
         prefill_slot(server, 0, LETTER_SYSTEM, user)
-        status, text = ses("POST", "/v1/session",
-                           json.dumps({"id_slot": 0, "policy": {"backend": "clone", "capture_on_turn_complete": True}}))
-        if mode == "sidecar" or status == 501:
-            check(status == 501, f"the clone backend is a 501 capability refusal here: {status} {text[:200]}")
-        else:
-            check(status == 200, f"clone session create status {status}: {text}")
-            clone_sid = json.loads(text).get("session_id")
-            check(bool(clone_sid), "a clone session handle is issued")
-            status, text = server.post("/v1/decision", json.dumps(dict(DECISION_VALID, session_id=clone_sid, diagnostics=True)))
-            check(status == 200, f"a clone session decision status {status}: {text[:160]}")
-            clone_resp = json.loads(text)
-            check(clone_resp.get("session_id") == clone_sid, "the clone decision reports the handle")
-            check(clone_resp["answers"]["dept"]["choice"] in ("billing", "technical"), "the clone answer is a real answer")
+        for backend in ("clone", "file"):
+            status, text = ses("POST", "/v1/session",
+                               json.dumps({"id_slot": 0, "policy": {"backend": backend, "capture_on_turn_complete": True}}))
+            check(status == 501, f"the {backend} backend is a 501 capability refusal: {status} {text[:200]}")
 
         # the file backend needs a writable directory; without one it is a capability refusal, 501
         status, text = ses("POST", "/v1/session", json.dumps({"id_slot": 0, "policy": {"backend": "file"}}))
@@ -903,24 +885,14 @@ def run_permutations_profile_checks(model):
 
 
 def run_routing_checks(model):
-    """M5: the routing matrix for an untargeted stateless decision in a pool.
+    """M5: the routing matrix for an untargeted stateless decision.
 
-    Two lanes:
-    - sidecar (default with a pool): the model field is echo-only and never decides placement,
-      so every stateless decision is served by the sidecar (bare pool id, Jev alias, no model,
-      explicit instance, even an unknown model all answer).
-    - legacy executor (--decision-instance): the model/instance field decides placement, so a
-      group is a 400 (no member to pick for a decision) and an unknown model is a 400.
-
-    Exercises the M5.1/M5.2 target_specified rework: placement is decided from the ORIGINAL
-    request fields, not a stamped pool id; the stamped echo never routes.
+    The sidecar is the only decision executor: the model field is echo-only and never decides
+    placement, so every stateless decision is served by the sidecar (bare pool id, Jev alias,
+    unknown model all answer). model is still required by the contract (422 when absent).
     """
-    base_id = os.path.basename(model)
     body = {"state": "routing matrix", "questions": {"q": {"type": "noul", "instructions": "yes?"}}}
     cases = [
-        # sidecar: the model field is echo-only and never decides placement, so a stateless
-        # decision is always served by the sidecar. model is still required by the contract
-        # (422 when absent); a bare pool id / Jev alias / unknown model all answer.
         ("bare pool id", dict(body, model=model), 200),
         ("no model", body, 422),
         ("jev alias", dict(body, model="jev-latest"), 200),
@@ -929,14 +901,13 @@ def run_routing_checks(model):
         ("unknown model", dict(body, model="no-such-model"), 200),
     ]
 
-    # sidecar lane: the default executor when a pool exists; model is echo-only
     server = Server(model, ["--instance", "main:ctx=2048:parallel=1:default",
                             "--instance", "other:ctx=1024:parallel=1:group=g1"])
     try:
         server.start()
     except Exception as e:  # noqa: BLE001
         server.stop()
-        print(f"FAIL: routing matrix (sidecar) server start: {e}")
+        print(f"FAIL: routing matrix server start: {e}")
         return False
     try:
         for name, b, want in cases:
@@ -944,41 +915,9 @@ def run_routing_checks(model):
             check(status == want, f"sidecar {name}: status {status} (want {want}): {text[:120]}")
     except Exception as e:  # noqa: BLE001
         server.stop()
-        print(f"FAIL: routing matrix (sidecar): {e}")
+        print(f"FAIL: routing matrix: {e}")
         return False
     server.stop()
-
-    # legacy executor lane: --decision-instance selects it; the model field places the decision
-    legacy = Server(model, ["--instance", "main:ctx=2048:parallel=1:default",
-                            "--instance", "other:ctx=1024:parallel=1:group=g1",
-                            "--decision-instance", "main"])
-    try:
-        legacy.start()
-    except Exception as e:  # noqa: BLE001
-        legacy.stop()
-        print(f"FAIL: routing matrix (legacy) server start: {e}")
-        return False
-    try:
-        # a bare pool id / no model is not a target, so it falls to the implicit decision instance
-        status, text = legacy.post("/v1/decision", json.dumps(dict(body, model=model)))
-        check(status == 200, f"legacy bare pool id: status {status}: {text[:120]}")
-        status, text = legacy.post("/v1/decision", json.dumps(body))
-        check(status == 200, f"legacy no model: status {status}: {text[:120]}")
-        # an explicit instance is a real target and routes to it
-        status, text = legacy.post("/v1/decision", json.dumps(dict(body, model="%s:main" % model)))
-        check(status == 200, f"legacy explicit instance: status {status}: {text[:120]}")
-        # a stateless decision may route to any free member of a group (OBJECTIVE section 6);
-        # the group refusal applies to a session-pinned request, which must name its owning instance
-        status, text = legacy.post("/v1/decision", json.dumps(dict(body, model="%s:g1" % model)))
-        check(status == 200, f"legacy group model: status {status}: {text[:160]}")
-        # an unknown model is a 400
-        status, text = legacy.post("/v1/decision", json.dumps(dict(body, model="no-such-model")))
-        check(status == 400, f"legacy unknown model: status {status}: {text[:160]}")
-    except Exception as e:  # noqa: BLE001
-        legacy.stop()
-        print(f"FAIL: routing matrix (legacy): {e}")
-        return False
-    legacy.stop()
     print("routing matrix checks passed")
     return True
 
@@ -1020,13 +959,6 @@ def main():
 
         # session handle: the first-class create/query/pin/ttl/erase lifecycle over HTTP
         if not run_session_handle_checks(model):
-            return 1
-
-        # sidecar executor mode: the same session contract with eager token snapshots on the
-        # internal executor (clone/file are 501; the shared-context path is not used)
-        if not run_session_checks(model, "sidecar"):
-            return 1
-        if not run_session_handle_checks(model, "sidecar"):
             return 1
 
         # adapter contract: the decision decode is scoped to the base model while chat keeps

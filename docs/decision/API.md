@@ -123,12 +123,12 @@ Server flag: `--decision-permutations N` (env `LLAMA_ARG_DECISION_PERMUTATIONS`,
 default 1) sets the pass count for requests that omit `permutations`; an explicit
 request field always wins and the pass cap still applies.
 
-Server executor: when `--decision-seqs` is set and a pool exists (`--instance`),
-every decision runs on the decision sidecar executor - an internal, undeletable
-pool instance with its own context and scheduler thread, built on first decision
-demand. Chat contexts are never written, stalled, or resized by decision work.
-The sidecar is the only pool executor. A `--decision-instance NAME` names a user
-executor instead of the internal one.
+Server executor: when `--decision-seqs` is set, every decision runs on the
+decision sidecar executor - an internal, undeletable pool instance with its own
+context and scheduler thread, built on first decision demand. A single-context
+server gets one too, so a decision never runs on a chat context. Chat contexts
+are never written, stalled, or resized by decision work. The sidecar is the only
+executor.
 
 Local-only notes: `model` is required here (the external router selects it) and echoed back
 verbatim, matching Jev. `GET /v1/models` keeps the OpenAI model-list shape
@@ -357,14 +357,12 @@ Schema object with `properties`:
 
 ### 2.6 Multi-instance routing
 
-In multi-instance mode (`--instance`, one shared weight load) every decision
-runs on the decision sidecar executor (the internal `__decision__` instance, or
-a `--decision-instance` executor), so decision traffic never writes, stalls, or
-resizes a chat context. Placement is decided by an explicit `target_specified`
-signal computed from the ORIGINAL request fields, never from a stamped pool id;
-the pool id echoed into a decision body is echo-only and never selects a target.
-The `instance` / `model` fields keep their routing role for the parts that still
-need a target:
+Every decision runs on the decision sidecar executor (the internal
+`__decision__` instance), so decision traffic never writes, stalls, or resizes a
+chat context. Placement is decided from the ORIGINAL request fields, never from
+a stamped pool id; the pool id echoed into a decision body is echo-only and never
+selects a target. The `instance` / `model` fields keep their routing role for the
+parts that still need a target:
 
 * A **stateless** decision carries no placement: the request is dispatched to
   the sidecar executor directly. `model` is echo-only and never selects a
@@ -372,15 +370,6 @@ need a target:
   an unknown model all answer on the sidecar; `model` itself is still REQUIRED by
   the contract (a body without it is a 422). `instance` is likewise echo-only on
   the stateless sidecar path.
-* `--decision-instance NAME` names the executor for stateless decisions that
-  name no target, so an operator can give decisions a named, dedicated context
-  and scheduler (isolation from chat) without changing clients. The name must
-  match a configured instance; groups are rejected at startup because a
-  dedicated context is the point. When it is unset, the internal `__decision__`
-  executor is used. On this legacy executor the `model`/`instance` fields DO
-  place the request: an unknown model is a 400, and a stateless decision may
-  route to any free member of a group (the group refusal applies only to a
-  session-pinned request, which must name its owning instance).
 * A **live-session** decision (`id_slot`/`session_id`) names the instance that
   owns the source slot (never a group, 400). The pool takes an owned token
   snapshot of that slot's completed turn through a read-only op and the decision
@@ -392,7 +381,9 @@ need a target:
 Sidecar executor flags (server side):
 
 * `--decision-sidecar-ctx N` - sidecar context size (default 0 = the largest
-  configured instance window).
+  effective instance window, so the longest turn a chat instance can produce
+  still replays; a compiled plan is sized by the request, so no smaller fixed
+  default is safe).
 * `--decision-sidecar-prebuild` - build the sidecar context eagerly at startup
   instead of lazily on the first decision.
 * `--decision-timeout-ms N` - server-side deadline for a whole decision (default
@@ -720,10 +711,9 @@ Rules:
 - **session manifest**: the sidecar a slot save co-writes, bound to the slot file
   by its content hash, that a slot restore uses to rebind or refuse the retained
   reference - a restore never answers from a stale turn.
-- **decision sidecar executor**: the internal pool instance (or a
-  `--decision-instance` executor) that owns every decision, stateless and
-  session, on its own context and scheduler thread; chat contexts are never
-  written, stalled, or resized by decision work.
+- **decision sidecar executor**: the internal pool instance that owns every
+  decision, stateless and session, on its own context and scheduler thread; chat
+  contexts are never written, stalled, or resized by decision work.
 - **producer confidence vs task value**: two DIFFERENT axes (Section 6). Never
   use a confidence number to gate caching/admission/correctness.
 - **closed-world probabilities**: `probabilities` are conditional on the

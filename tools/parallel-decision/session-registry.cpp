@@ -744,17 +744,6 @@ void session_registry::on_memory_epoch(uint64_t epoch) {
     }
 }
 
-bool session_registry::is_current(const decision_session * sess, const std::vector<llama_token> & prefix,
-                                  const std::string & adapter_scope) const {
-    if (sess == nullptr || sess->capture.epoch != epoch_) {
-        return false;
-    }
-    if (prefix.empty()) {
-        return true; // a cleared slot has no content to compare; it cannot have advanced
-    }
-    return current_turn(sess, prefix, adapter_scope);
-}
-
 const decision_session * session_registry::find_by_slot(int id_slot) const {
     if (id_slot < 0 || id_slot >= n_slots_) {
         return nullptr;

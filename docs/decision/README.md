@@ -111,8 +111,8 @@ is no separate decision context.
 > instead run on the internal `__decision__` sidecar executor - its own context
 > and scheduler thread, forced `kv_unified` only on itself - and chat contexts
 > carry no decision sequences. Sessions are eager token snapshots replayed on
-> the sidecar; the shared-context engine pool, arena, and yield below apply
-> only when the sidecar is off (single-context server or `--decision-instance`).
+> the sidecar, which is the only executor. The shared-context engine pool, arena,
+> and yield below are no longer reachable and should be removed in a follow-up.
 
 ## Is the KV cache updated by decision queries?
 

@@ -476,8 +476,7 @@ struct common_params {
     int64_t decision_session_ttl_ms = 0;   // default ttl for created sessions, ms (0 = no expiry)
     int32_t decision_session_budget_mb = 0;// byte budget for all retained references (0 = unlimited)
     std::string decision_session_persist;  // writable directory for the file backend; else slot_save_path
-    std::string decision_instance;         // multi-instance: route stateless decisions to this instance when the request names none (legacy executor)
-    bool        decision_sidecar    = true;  // multi-instance: the decision sidecar executor instance is the default executor (M3)
+    bool        decision_sidecar    = true;  // the decision sidecar executor instance is the only decision executor
     bool        decision_sidecar_explicit = false; // the user passed --decision-sidecar (distinguishes the default from an explicit choice)
     int32_t     decision_sidecar_ctx = 0;    // sidecar context size (0 = the largest configured instance window)
     bool        decision_sidecar_prebuild = false; // eagerly build the sidecar context at startup instead of on first decision
