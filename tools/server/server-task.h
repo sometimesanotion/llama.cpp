@@ -35,6 +35,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_INSTANCE_OP, // manager-invoked lifecycle op, runs on the scheduler thread
     SERVER_TASK_TYPE_DECISION,
     SERVER_TASK_TYPE_SESSION,
+    SERVER_TASK_TYPE_DECISION_SNAPSHOT, // manager-requested read-only token copy of a completed turn
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -141,6 +142,21 @@ struct task_result_state {
         bool filter_tool_calls = false);
 };
 
+// A token-snapshot session source: the owned copy of a completed chat turn's token prefix and
+// adapter scope, taken read-only from the owning instance and replayed on the sidecar executor.
+// Carries no pointer into the owning instance; the pool owns the store and the adapter refs, so
+// the loras' ptrs stay valid for the lifetime of the snapshot's task.
+struct server_decision_snapshot {
+    std::vector<llama_token> tokens;              // owned copy of the completed turn prefix
+    std::vector<common_adapter_lora_info> loras;  // resolved adapter scope (pool-owned ptrs), empty = base
+    std::string adapter_scope;                    // scope identity ("" = base model)
+    int         source_slot = -1;                 // owning slot id, echo only
+    std::string turn;                             // client turn tag, echo only
+    std::string session_id;                       // first-class session handle, echo only
+    llama_pos   base_pos = -1;                    // = tokens.size(), the continuation position
+    std::string warm_tag;                         // session content hash; resident warm identity ("" = cold replay)
+};
+
 struct server_task {
     int id = -1; // to be filled by server_queue
 
@@ -183,6 +199,8 @@ struct server_task {
     // used by SERVER_TASK_TYPE_DECISION: the request body
     json decision_request;
     std::shared_ptr<std::atomic<bool>> decision_cancel; // set when the HTTP client disconnects
+    // sidecar executor only: an owned token snapshot that replaces the in-context session source
+    std::shared_ptr<server_decision_snapshot> decision_snapshot;
 
     // used by SERVER_TASK_TYPE_SESSION: the session action
     struct session_action {
@@ -539,6 +557,24 @@ struct server_task_result_session : server_task_result {
 
     virtual json to_json() override {
         return data;
+    }
+};
+
+// the result of SERVER_TASK_TYPE_DECISION_SNAPSHOT: an owned token copy of a completed turn plus
+// the slot's enabled adapter scope. carries no pointer, reference, or sequence id out of the
+// owning instance (the lora entries are path + scale only).
+struct server_task_result_decision_snapshot : server_task_result {
+    int                    id_slot = -1;
+    std::vector<llama_token> tokens;
+    std::vector<std::pair<std::string, float>> lora_scope; // adapter path + scale, "" = base
+    llama_pos              base_pos = -1;
+
+    virtual json to_json() override {
+        return json {
+            { "id_slot",  id_slot },
+            { "n_tokens", tokens.size() },
+            { "base_pos", base_pos },
+        };
     }
 };
 

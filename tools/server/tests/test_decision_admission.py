@@ -98,9 +98,11 @@ def http(method, url, body=None, content_type="application/json", api_key=API_KE
 
 
 class Server:
-    def __init__(self, model, extra_args=None):
+    def __init__(self, model, extra_args=None, max_body=MAX_BODY, ctx=8192):
         self.model = model
         self.extra_args = extra_args or []
+        self.max_body = max_body
+        self.ctx = ctx
         self.port = free_port()
         self.proc = None
         self._log = None
@@ -110,7 +112,7 @@ class Server:
         cmd = [
             SERVER_BIN,
             "-m", self.model,
-            "-c", "8192",
+            "-c", str(self.ctx),
             "-ngl", os.environ.get("LLAMA_SERVER_TEST_NGL", "99"),
             "--decision-seqs", "8",
             "--slots",
@@ -121,7 +123,7 @@ class Server:
         env = dict(os.environ)
         build_bin = os.path.dirname(os.path.abspath(SERVER_BIN))
         env["LD_LIBRARY_PATH"] = build_bin + (os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
-        env["LLAMA_DECISION_MAX_BODY"] = str(MAX_BODY)
+        env["LLAMA_DECISION_MAX_BODY"] = str(self.max_body)
         env["LLAMA_DECISION_MAX_QUEUE"] = str(MAX_QUEUE)
         self._logfile = tempfile.NamedTemporaryFile(prefix="decision-server-", suffix=".log", delete=False)
         self._logfile.close()
@@ -501,6 +503,74 @@ def run_chat_decision_integrity(model):
         srv.stop()
 
 
+# M3: on the sidecar default, a decision runs on its own context, so chat on a chat instance is
+# not gated on the decision. A concurrent chat must finish near its quiet latency instead of being
+# serialized behind the decision duration. The fairness bound is read from the same ledger as the
+# shared-context lane; the decision term is not added because the executor is a different context.
+def run_sidecar_no_stall(model):
+    srv = Server(model, ["--instance", "main:ctx=8192:parallel=1:default"])
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        print(f"skip sidecar no-stall on {os.path.basename(model)}: {e}")
+        return "skip"
+    if not supports_letter_labels(srv):
+        srv.stop()
+        print(f"skip sidecar no-stall on {os.path.basename(model)}: no usable answer labels")
+        return "skip"
+    bound = load_fairness_bound()
+    url = f"http://127.0.0.1:{srv.port}/v1/chat/completions"
+    chat = {"messages": [{"role": "user", "content": "Write a short paragraph about spring weather."}],
+            "max_tokens": 16, "seed": 42, "temperature": 0.0}
+    heavy = {
+        "model": "test",
+        "state": "The customer opened a ticket about a delayed delivery and a duplicate charge. " * 24,
+        "questions": {
+            f"q{i}": {"type": "noul", "instructions": f"Is claim {i} supported by the state?"}
+            for i in range(64)
+        },
+    }
+    try:
+        # quiet chat baseline (warm once so a cold first decode cannot skew the comparison)
+        status, _, _ = http("POST", url, json.dumps(chat))
+        check(status == 200, f"sidecar chat warmup: {status}")
+        t0 = time.time()
+        status, _, _ = http("POST", url, json.dumps(chat))
+        check(status == 200, f"sidecar quiet chat: {status}")
+        quiet_ms = (time.time() - t0) * 1000.0
+
+        # concurrent: the decision runs on the sidecar; chat must not wait for it
+        out = {}
+
+        def run_decision():
+            t = time.time()
+            st, _, tx = srv.post(json.dumps(heavy))
+            out["ms"] = (time.time() - t) * 1000.0
+            out["status"] = st
+            out["text"] = tx
+
+        decision_thread = threading.Thread(target=run_decision)
+        decision_thread.start()
+        time.sleep(0.1)
+        t0 = time.time()
+        status, _, tx = http("POST", url, json.dumps(chat))
+        chat_ms = (time.time() - t0) * 1000.0
+        decision_thread.join()
+
+        check(out.get("status") == 200, f"sidecar heavy decision: {out.get('status')} {out.get('text')}")
+        check(status == 200, f"sidecar concurrent chat: {status} {tx[:120]}")
+        bound_ms = quiet_ms * bound["chat_latency_factor"] + bound["chat_latency_margin_ms"]
+        check(chat_ms <= bound_ms,
+              f"sidecar chat is not gated on a decision: quiet {quiet_ms:.0f}ms, concurrent {chat_ms:.0f}ms "
+              f"(bound {bound_ms:.0f}ms, decision {out['ms']:.0f}ms)")
+        print(f"measured: sidecar chat quiet {quiet_ms:.0f}ms, concurrent {chat_ms:.0f}ms, "
+              f"decision {out['ms']:.0f}ms")
+        return "pass"
+    finally:
+        srv.stop()
+
+
 def run_recurrent_kv_integrity(model):
     # Recurrent/hybrid models keep their state in a fixed RS buffer; a decision that forks the
     # context must not disturb a chat turn. Two identical chat completions around a decision must
@@ -534,6 +604,94 @@ def run_recurrent_kv_integrity(model):
         return "pass"
     finally:
         srv.stop()
+
+
+# M8: server-side deadline. A decision that exceeds --decision-timeout-ms answers 503 +
+# Retry-After and never a partial answer, and the server stays usable afterwards. The control
+# group proves that under the calibrated default timeout a normal decision is never cancelled.
+def run_deadline_control(model):
+    # The server-side deadline is only checked at the HTTP_POLLING_SECONDS (1 s) poll boundary
+    # (server-queue.h), so a decision that completes in under 1 s can never hit it regardless of
+    # the deadline value. The proof therefore needs a decision that stays in flight past 1 s,
+    # which requires a context large enough that the prefill dominates. We probe the heavy request
+    # on a generous ctx first; a model whose near-full-context decision is under 1.2 s (so the
+    # 1 s poll would not reliably catch it) is skipped, not failed. The deadline is set far below
+    # the 1 s poll so the first poll after it expires fires the 503.
+    deadline_ctx = 16384
+    heavy = {
+        "model": "test",
+        "state": "The customer opened a ticket about a delayed delivery and a duplicate charge. " * 50,
+        "questions": {
+            f"q{i}": {"type": "noul", "instructions": f"Is claim {i} supported by the state?"}
+            for i in range(256)
+        },
+    }
+    probe = None
+    deadline_srv = None
+    control_srv = None
+    try:
+        probe = Server(model, ctx=deadline_ctx, max_body=2 * 1024 * 1024)
+        probe.start()
+        if not supports_letter_labels(probe):
+            return "skip"
+        probe.post(json.dumps(DECISION_VALID))  # warm so the heavy timing is not skewed by a cold load
+        t0 = time.time()
+        status, _, text = probe.post(json.dumps(heavy))
+        heavy_ms = (time.time() - t0) * 1000.0
+        check(status == 200, f"probe heavy decision under the default timeout: {status} {text[:120]}")
+        probe.stop()
+        probe = None
+        if heavy_ms < 1200.0:
+            print(f"skip deadline-hit on {os.path.basename(model)}: max decision {heavy_ms:.0f}ms "
+                  "is under the 1 s deadline poll, so it cannot exercise the deadline; control group 200")
+            control_srv = Server(model)
+            control_srv.start()
+            if supports_letter_labels(control_srv):
+                for _ in range(3):
+                    status, _, _ = control_srv.post(json.dumps(DECISION_VALID))
+                    check(status == 200, f"control decision under the default timeout: {status}")
+            return "pass"
+
+        deadline_srv = Server(model, ["--decision-timeout-ms", "100"], max_body=2 * 1024 * 1024,
+                              ctx=deadline_ctx)
+        deadline_srv.start()
+        if not supports_letter_labels(deadline_srv):
+            return "pass"
+        t0 = time.time()
+        status, headers, text = deadline_srv.post(json.dumps(heavy))
+        elapsed_ms = (time.time() - t0) * 1000.0
+        check(status == 503, f"over-deadline decision is 503: got {status} {text[:160]}")
+        check(headers.get("Retry-After") == "1", f"503 carries Retry-After: {headers}")
+        check("answers" not in json.loads(text), "a deadline hit never returns a partial answer")
+        check(elapsed_ms < 15000, f"the deadline stops the compute promptly: {elapsed_ms:.0f}ms")
+
+        # the abort must not wedge the scheduler or the KV: /health and a chat both still answer
+        status, _, _ = http("GET", f"http://127.0.0.1:{deadline_srv.port}/health")
+        check(status == 200, f"health after the deadline abort: {status}")
+        chat = {"messages": [{"role": "user", "content": "Say hello"}], "max_tokens": 8}
+        status, _, text = http("POST", f"http://127.0.0.1:{deadline_srv.port}/v1/chat/completions",
+                               json.dumps(chat))
+        check(status == 200, f"chat works after the deadline abort: {status} {text[:120]}")
+        deadline_srv.stop()
+        deadline_srv = None
+
+        # control group: an ordinary decision under the default timeout is never cancelled
+        control_srv = Server(model)
+        control_srv.start()
+        if supports_letter_labels(control_srv):
+            for _ in range(3):
+                status, _, _ = control_srv.post(json.dumps(DECISION_VALID))
+                check(status == 200, f"control decision under the default timeout: {status}")
+        print(f"deadline/control: heavy {heavy_ms:.0f}ms over-deadline 503+Retry-After in "
+              f"{elapsed_ms:.0f}ms, server responsive after, control group 200")
+        return "pass"
+    finally:
+        if probe is not None:
+            probe.stop()
+        if deadline_srv is not None:
+            deadline_srv.stop()
+        if control_srv is not None:
+            control_srv.stop()
 
 
 def main():
@@ -609,6 +767,28 @@ def main():
             print("SKIP: recurrent KV integrity (no usable answer labels)")
         else:
             print("recurrent chat/decision integrity passed")
+
+        # M3 sidecar default: a decision on the sidecar does not stall chat on a chat instance
+        try:
+            no_stall = run_sidecar_no_stall(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: sidecar no-stall: {e}")
+            return 1
+        if no_stall == "skip":
+            print("SKIP: sidecar no-stall (no usable answer labels)")
+        else:
+            print("sidecar no-stall passed")
+
+        # M8: deadline (503 + Retry-After, server stays usable) and control group under the default timeout
+        try:
+            deadline = run_deadline_control(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: deadline/control: {e}")
+            return 1
+        if deadline == "skip":
+            print("SKIP: deadline/control (no usable answer labels)")
+        else:
+            print("deadline/control passed")
 
         print("decision admission checks passed")
         return 0

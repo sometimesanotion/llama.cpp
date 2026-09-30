@@ -346,6 +346,83 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), dec_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    printf("test-arg-parser: test decision sidecar flags\n\n");
+
+    {
+        common_params sc_params;
+
+        // the sidecar executor needs --decision-seqs and a pool to live in
+        argv = {"binary_name", "--decision-sidecar"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        argv = {"binary_name", "--decision-sidecar-ctx", "4096"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+
+        // with the pool they parse and land in params
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar", "--decision-sidecar-ctx", "4096", "--instance", "a:ctx=512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        assert(sc_params.decision_sidecar == true);
+        assert(sc_params.decision_sidecar_ctx == 4096);
+
+        // M5.5: the sidecar prebuild, decision timeout and max-queue flags parse and land in params
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar-prebuild",
+                "--decision-timeout-ms", "30000", "--decision-max-queue", "8", "--instance", "sc:ctx=512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        assert(sc_params.decision_sidecar_prebuild == true);
+        assert(sc_params.decision_timeout_ms == 30000);
+        assert(sc_params.decision_max_queue == 8);
+
+        // M7: the resident warm-prefix budget flag parses and lands; a negative budget is rejected
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-warm-budget-mb", "256", "--instance", "w:ctx=512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        assert(sc_params.decision_warm_budget_mb == 256);
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-warm-budget-mb", "-1", "--instance", "w:ctx=512"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+
+        // a negative timeout is rejected; max-queue below 1 is rejected
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-timeout-ms", "-1", "--instance", "sc:ctx=512"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-max-queue", "0", "--instance", "sc:ctx=512"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+
+        // a negative ctx is rejected
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar-ctx", "-1", "--instance", "a:ctx=512"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+
+        // the sidecar and a named decision instance are two placements for the same decisions
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar", "--decision-instance", "a", "--instance", "a:ctx=512"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    printf("test-arg-parser: test decision sidecar default (M3)\n\n");
+
+    {
+        // with a pool present, the sidecar is the default executor when --decision-seqs is set
+        common_params m3_params;
+        argv = {"binary_name", "--decision-seqs", "8", "--instance", "a:ctx=512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_params, LLAMA_EXAMPLE_SERVER));
+        assert(m3_params.decision_sidecar == true);
+
+        // M4: the temporary hidden --no-decision-sidecar flag is gone; the sidecar is the only
+        // pool executor, so an unknown flag is rejected rather than keeping the legacy path
+        common_params m3_off;
+        argv = {"binary_name", "--decision-seqs", "8", "--no-decision-sidecar", "--instance", "a:ctx=512"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_off, LLAMA_EXAMPLE_SERVER));
+
+        // a single-context server has no pool to host the sidecar: legacy path stays the default
+        common_params m3_single;
+        argv = {"binary_name", "--decision-seqs", "8"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_single, LLAMA_EXAMPLE_SERVER));
+        assert(m3_single.decision_sidecar == false);
+
+        // a named decision instance also selects the legacy executor, not the sidecar default
+        common_params m3_named;
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-instance", "a", "--instance", "a:ctx=512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_named, LLAMA_EXAMPLE_SERVER));
+        assert(m3_named.decision_sidecar == false);
+    }
+
     printf("test-arg-parser: test decision KV-mode contract\n\n");
 
     {

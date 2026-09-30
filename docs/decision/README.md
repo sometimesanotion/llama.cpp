@@ -106,6 +106,14 @@ The decision sequences live above the chat slots (ids `n_parallel` ..
 `n_parallel + n_seq_decision`), on the same shared context chat uses.  There
 is no separate decision context.
 
+> Sidecar note (roadmap M0-M9): this shared-context description is the legacy
+> single-context lane. With a pool present and `--decision-seqs` set, decisions
+> instead run on the internal `__decision__` sidecar executor - its own context
+> and scheduler thread, forced `kv_unified` only on itself - and chat contexts
+> carry no decision sequences. Sessions are eager token snapshots replayed on
+> the sidecar; the shared-context engine pool, arena, and yield below apply
+> only when the sidecar is off (single-context server or `--decision-instance`).
+
 ## Is the KV cache updated by decision queries?
 
 Yes — decisions are real decodes and they do write to the KV cache.  The
@@ -121,10 +129,12 @@ about whose cache it touches and what survives:
     (llama_memory_seq_rm), reclaiming their cells.  Only the snapshot
     sequence's prefix survives, so the next matching query can reuse it.
 
-  - A session decision forks the slot's owned reference (`host`/`clone`/`file`
-    backends; the reference lives in the reserved `--decision-arena-seqs`
-    sequences or on disk), never the live slot: the source slot's KV is
-    never read for scoring and never written.
+  - A session decision forks the slot's owned token snapshot (the sidecar's
+    `tokens` backend: the owned token list plus adapter scope, replayed into the
+    sidecar context on demand; `clone`/`file` are a 501 capability refusal),
+    never the live slot: the source slot's KV is never read for scoring and
+    never written. The legacy single-context lane still uses the `host`/`clone`/
+    `file` registry and the reserved `--decision-arena-seqs` sequences.
 
   - A preflight check estimates peak KV use and returns 422 rather than ever
     partially overwriting the cache, and a cancelled request leaves the pool

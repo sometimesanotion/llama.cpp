@@ -1,5 +1,8 @@
 #include "server-instances.h"
 
+#include "decision-protocol.h"
+#include "session-store.h"
+
 #include "common.h"
 #include "log.h"
 
@@ -15,6 +18,38 @@
 #define IST_INF(fmt, ...) LOG_INF("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define IST_WRN(fmt, ...) LOG_WRN("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define IST_ERR(fmt, ...) LOG_ERR("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+
+// wall-clock ms for the decision session store's created/last-used stamps
+static int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// The number of resident warm-prefix slots for the decision sidecar, derived from
+// --decision-warm-budget-mb. Each slot reserves one sequence of `n_ctx` cells (so it costs roughly
+// budget/n_slots bytes of KV), and each holds one session turn's decoded token list resident so a
+// follow-up decision forks it instead of re-prefilling. 0 disables the warm tier (cold replay, always
+// correct). The budget is a rough VRAM cap, not an exact accounting: per-cell bytes are estimated
+// from the model dims and the KV cache types, and a single-slot minimum keeps the tier usable.
+static int decision_warm_slots(const llama_model * model, const common_params & params) {
+    if (params.decision_warm_budget_mb <= 0 || params.n_ctx == 0) {
+        return 0;
+    }
+    const int  n_layer = llama_model_n_layer(model);
+    const int  n_embd  = llama_model_n_embd(model);
+    const int  n_head  = llama_model_n_head(model);
+    const int  n_kv    = llama_model_n_head_kv(model);
+    const float ratio  = n_kv > 0 ? (float) n_kv / (float) n_head : 1.0f;
+    const size_t per_cell = (size_t) ((double) n_layer * n_embd * ratio *
+                                      (ggml_type_size(params.cache_type_k) + ggml_type_size(params.cache_type_v)));
+    if (per_cell == 0) {
+        return 0;
+    }
+    const size_t budget_cells = (size_t) ((double) params.decision_warm_budget_mb * 1024.0 * 1024.0 / (double) per_cell);
+    const size_t slots        = budget_cells / (size_t) params.n_ctx;
+    const size_t capped       = std::clamp<size_t>(slots, 1, 8);
+    return (int) capped;
+}
 
 // size the per-slot snapshot locks: one heap-allocated mutex per slot so the vector
 // survives resize() (std::mutex is not movable) and switching different slots of one
@@ -139,6 +174,20 @@ bool server_instances::load(const common_params & params) {
         IST_ERR("invalid instance configuration: %s\n", e.what());
         return false;
     }
+    // the sidecar executor name is reserved for the pool itself; a user instance
+    // claiming it would shadow the routing target
+    for (const auto & cfg : params.instances) {
+        if (cfg.name == decision_sidecar_name()) {
+            IST_ERR("instance name '%s' is reserved for the decision sidecar executor\n", decision_sidecar_name());
+            return false;
+        }
+    }
+
+    // the internal sidecar executor needs a decision engine to justify its context
+    if (params.decision_sidecar && params.n_seq_decision < 3) {
+        IST_ERR("%s", "--decision-sidecar requires --decision-seqs N (N >= 3)\n");
+        return false;
+    }
 
     // each instance inherits the base sleep value into its own scheduler loop
     // with no manager visibility (no sleeping state, no countdown), so refuse
@@ -234,6 +283,42 @@ bool server_instances::load(const common_params & params) {
         IST_INF("stateless decisions default to instance '%s'\n", params.decision_instance.c_str());
     }
 
+    // --decision-sidecar: an internal, undeletable executor instance with its own context
+    // and scheduler thread. lazy built on the first decision that routes to it. sized to
+    // --decision-sidecar-ctx, else the largest configured window, so the longest turn a
+    // chat instance can produce still replays on the sidecar. never the default, never in
+    // any user group, so chat never lands on it.
+    if (params.decision_sidecar) {
+        common_instance sidecar;
+        sidecar.name     = decision_sidecar_name();
+        sidecar.group    = decision_sidecar_name();
+        sidecar.ctx_size = params.decision_sidecar_ctx;
+        if (sidecar.ctx_size == 0) {
+            for (const auto & cfg : inst_cfgs) {
+                sidecar.ctx_size = std::max(sidecar.ctx_size, cfg.ctx_size);
+            }
+        }
+        sidecar.parallel = 1;
+
+        auto inst       = std::make_shared<server_instance>();
+        inst->cfg       = sidecar;
+        inst->internal  = true;
+        inst->effective = common_instance_params(params, sidecar);
+        inst->n_ctx_effective.store(inst->effective.n_ctx, std::memory_order_relaxed);
+        inst->n_parallel_effective.store(1, std::memory_order_relaxed);
+        instances.push_back(std::move(inst));
+        IST_INF("decision sidecar '%s' (ctx = %d, parallel = 1, decision-seqs = %d) registered, builds on the first stateless decision\n",
+                decision_sidecar_name(), instances.back()->effective.n_ctx, params.n_seq_decision);
+        // --decision-sidecar-prebuild: materialize the sidecar window now instead of on the first
+        // decision, so a decision-heavy deployment pays the build cost once at startup
+        if (params.decision_sidecar_prebuild) {
+            if (auto err = ensure_built_instance(instances.back())) {
+                IST_ERR("failed to prebuild decision sidecar '%s'\n", decision_sidecar_name());
+                return false;
+            }
+        }
+    }
+
     // legacy drop-in: with no instances configured the single default instance is built
     // eagerly, preserving stock single-context startup behavior (exactly one window).
     if (legacy_default) {
@@ -289,9 +374,22 @@ server_instances::resolve_target server_instances::resolve(const std::string & m
                 return true;
             }
         }
-        if (instances.size() == 1) {
+        // an internal window (the decision sidecar) is never a default target: a bare pool id
+        // must keep resolving to the sole configured instance even when the sidecar is present
+        std::shared_ptr<server_instance> sole;
+        for (const auto & inst : instances) {
+            if (inst->internal) {
+                continue;
+            }
+            if (sole) {
+                sole = nullptr;
+                break;
+            }
+            sole = inst;
+        }
+        if (sole) {
             res.kind = target_kind::INSTANCE;
-            res.inst = instances.front();
+            res.inst = sole;
             return true;
         }
         return false;
@@ -483,12 +581,13 @@ server_http_res_ptr server_instances::dispatch(const server_http_req & req, cons
         }
     }
 
-    // A stateless request that names no target may be pinned to a declared decision
-    // instance; a session-pinned request must name the owning instance instead. A bare
-    // pool id is not a target: handle_post_decision stamps it onto an untargeted body.
-    if (!opt.require_instance && (model_id.empty() || model_id == base_name) && instance_field.empty() &&
-        !opt.implicit_instance.empty()) {
-        instance_field = opt.implicit_instance;
+    // A stateless decision that names no target may be pinned to the declared decision
+    // instance; a session-pinned request must name the owning instance instead. target_specified
+    // is computed from the ORIGINAL request before stamping: a bare pool id or Jev alias is
+    // echo-only and never decides placement, so it is not a target.
+    if (opt.decision_default && !opt.require_instance && !opt.target_specified && instance_field.empty() &&
+        !params.decision_instance.empty()) {
+        instance_field = params.decision_instance;
     }
 
     std::string          error;
@@ -1021,6 +1120,7 @@ json server_instances::instance_to_json(const server_instance & inst,
         { "parallel", inst.n_parallel_effective.load(std::memory_order_relaxed) },
         { "pinned", inst.cfg.pinned },
         { "is_default", inst.cfg.is_default },
+        { "internal", inst.internal },
         // unbuilt = registered but never demanded; its window (and bytes) do not exist yet
         { "state", inst.built.load(std::memory_order_acquire) ? "loaded" : "unloaded" },
         // memory breakdown
@@ -1421,11 +1521,20 @@ bool server_instances::build_context_default(server_instance & inst) {
     inst.routes = std::make_unique<server_routes>(inst.effective, *inst.ctx_server);
     inst.routes->update_meta(*inst.ctx_server);
 
-    // wake group waiters on the first 0->capacity transition
-    inst.ctx_server->set_slot_release_callback([this](int) {
+    // wake group waiters on the first 0->capacity transition; a completed turn also advances the
+    // slot's decision turn counter, so a session whose turn is over is marked for removal
+    inst.ctx_server->set_slot_release_callback([this, name = inst.cfg.name](int id_slot) {
+        on_decision_slot_release(name, id_slot);
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         cond_dispatch.notify_all();
     });
+
+    // the internal sidecar executor resolves routed token-snapshot sessions from the pool store
+    if (inst.internal) {
+        inst.ctx_server->set_decision_snapshot_resolver([this](const std::string & key) {
+            return decision_snapshot_by_key(key);
+        });
+    }
 
     return true;
 }
@@ -1444,6 +1553,18 @@ bool server_instances::build_context_into(server_instance & inst) {
         IST_WRN("instance '%s' has no valid n_parallel, defaulting to 1\n", inst.cfg.name.c_str());
         inst.effective.n_parallel = 1;
     }
+
+    // the internal decision sidecar is the one executor that owns a decision engine pool: it
+    // restores the decision sequences and unified KV that chat instances no longer carry (M4),
+    // so its own context is sized for the engine pool while every chat instance is stock. the
+    // resident warm-prefix slots (M7) sit above the pool and hold session prefixes resident.
+    if (inst.internal) {
+        inst.effective.n_seq_decision = params.n_seq_decision;
+        inst.effective.n_seq_arena    = 0;
+        inst.effective.n_seq_warm     = decision_warm_slots(model, inst.effective);
+        inst.effective.kv_unified     = true;
+    }
+
     if (inst.effective.n_ctx == 0) {
         IST_INF("instance '%s' inherits the model's default context size\n", inst.cfg.name.c_str());
     }
@@ -1477,7 +1598,13 @@ void server_instances::teardown_instance_context(server_instance & inst) {
     }
     // never join under mutex_dispatch: a manager thread holding the dispatch
     // lock while the scheduler tears down would deadlock the teardown path
-    if (inst.loop_thread.joinable()) {
+    bool do_join;
+    {
+        std::lock_guard<std::mutex> lock(mutex_dispatch);
+        do_join               = !inst.scheduler_joined;
+        inst.scheduler_joined = true;
+    }
+    if (do_join && inst.loop_thread.joinable()) {
         inst.loop_thread.join();
     }
     inst.ctx_server.reset();
@@ -1625,6 +1752,12 @@ server_http_res_ptr server_instances::create_instance(const common_instance & cf
     // interleave) and the weight reload never races a last-instance unload
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
+    // the sidecar name is reserved for the pool's internal executor
+    if (cfg.name == decision_sidecar_name()) {
+        return make_error(409, "invalid_request_error",
+                          "instance name is reserved: '" + cfg.name + "'");
+    }
+
     // reject duplicates before any expensive weight reload
     {
         std::lock_guard<std::mutex> lock(mutex_dispatch);
@@ -1684,6 +1817,12 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
     // concurrent create/destroy of the same (or any) instance
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
+    // the internal sidecar executor is manager-owned: it exists for the pool's lifetime
+    // and is recreated on demand; a delete would only break the decision routing
+    if (name == decision_sidecar_name()) {
+        return make_error(400, "invalid_request_error", "the decision sidecar executor is internal and cannot be deleted");
+    }
+
     // pinned is advisory in this branch; the force flag is accepted and ignored
     std::shared_ptr<server_instance> inst;
     size_t inst_pos = 0;
@@ -1734,7 +1873,13 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
         {
             instance_drain_guard guard(*this, inst);
             inst->ctx_server->terminate();
-            if (inst->loop_thread.joinable()) {
+            bool do_join;
+            {
+                std::lock_guard<std::mutex> lock(mutex_dispatch);
+                do_join               = !inst->scheduler_joined;
+                inst->scheduler_joined = true;
+            }
+            if (do_join && inst->loop_thread.joinable()) {
                 inst->loop_thread.join();
             }
         }
@@ -1776,6 +1921,11 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
 server_http_res_ptr server_instances::resize_instance(const std::string & name, int32_t new_ctx) {
     if (new_ctx <= 0) {
         return make_error("ctx_size must be positive", ERROR_TYPE_INVALID_REQUEST);
+    }
+    // the sidecar sizes itself from --decision-sidecar-ctx at registration; a runtime
+    // resize would silently change the replay budget for every decision
+    if (name == decision_sidecar_name()) {
+        return make_error(400, "invalid_request_error", "the decision sidecar executor is internal and cannot be resized");
     }
 
     // serialized with the other management ops: a resize and a destroy of the same
@@ -2108,12 +2258,26 @@ server_http_res_ptr server_instances::handle_get_props(const server_http_req & r
         json                        instances_arr = json::array();
         std::lock_guard<std::mutex> lock(mutex_dispatch);
         for (const auto & it : instances) {
-            // the display cache is lock-free; cfg.name/group are immutable after registration
+            // the display cache is lock-free; cfg.name/group are immutable after registration.
+            // memory fields are size accessors on the context (they lock only mutex_mem, an
+            // independent lock, so no lock-order concern under mutex_dispatch). an unbuilt
+            // window owns no buffers yet and reports zero bytes.
+            const bool     is_built      = it->built.load(std::memory_order_acquire);
+            const uint64_t model_bytes   = is_built ? it->ctx_server->get_model_bytes()   : 0;
+            const uint64_t context_bytes = is_built ? it->ctx_server->get_context_bytes() : 0;
+            const uint64_t compute_bytes = is_built ? it->ctx_server->get_compute_bytes() : 0;
             total_slots += it->n_parallel_effective.load(std::memory_order_relaxed);
             instances_arr.push_back({
-                { "name",  it->cfg.name        },
-                { "group", it->cfg.group       },
-                { "n_ctx", displayed_n_ctx(*it) },
+                { "name",          it->cfg.name        },
+                { "group",         it->cfg.group       },
+                { "n_ctx",         displayed_n_ctx(*it) },
+                // per-instance memory, sidecar included; matches the /instances breakdown
+                { "model_bytes",   model_bytes   },
+                { "context_bytes", context_bytes },
+                { "compute_bytes", compute_bytes },
+                { "vram_bytes",    context_bytes + compute_bytes },
+                { "total_bytes",   model_bytes + context_bytes + compute_bytes },
+                { "state",         is_built ? "loaded" : "unloaded" },
             });
         }
         props["total_slots"] = total_slots;
@@ -2253,6 +2417,29 @@ server_http_res_ptr server_instances::handle_post_rerank(const server_http_req &
 // owns the slot: the retained turn lives in one context and is not portable to another. Only a
 // body/query slot or session handle marks a request as session-pinned; a malformed body is
 // reported by the owning instance's handler, never here.
+// does the ORIGINAL request (before handle_post_decision stamps a pool id) name a routing
+// target? a request is targeted when it carries instance / snapshot / session / slot fields, or
+// a model field that is not the bare pool id and not a Jev alias. a bare pool id or a Jev alias
+// is echo-only: it never decides placement, so it is not a target.
+static bool decision_request_target_specified(const server_http_req & req, const std::string & base_name) {
+    auto model_names_target = [&](const std::string & model) {
+        return !model.empty() && model != base_name && model != "jev-latest" && model != "jev-preview";
+    };
+    try {
+        const json body = json::parse(req.body);
+        if (body.is_object()) {
+            if (!json_value(body, "instance", std::string()).empty()) return true;
+            if (!json_value(body, "snapshot", std::string()).empty()) return true;
+            if (model_names_target(json_value(body, "model", std::string()))) return true;
+        }
+    } catch (const std::exception &) {
+        // not targeted here: the instance handler reports the parse error
+    }
+    if (!req.get_param("instance").empty()) return true;
+    if (!req.get_param("snapshot").empty()) return true;
+    return model_names_target(req.get_param("model"));
+}
+
 static bool decision_request_is_session_pinned(const server_http_req & req) {
     try {
         const json body = json::parse(req.body);
@@ -2281,11 +2468,17 @@ static bool decision_request_is_session_pinned(const server_http_req & req) {
 }
 
 server_http_res_ptr server_instances::handle_post_decision(const server_http_req & req) {
-    // stateless decisions may be pinned to a declared decision instance; a live-session
-    // decision must name the instance that owns the slot instead
+    // the sidecar executor owns every decision, stateless and session; the pool resolves a token
+    // snapshot for a session decision before routing it there (see handle_post_decision_sidecar)
+    if (params.decision_sidecar) {
+        return handle_post_decision_sidecar(req);
+    }
+    // stateless decisions may be pinned to a declared decision instance (--decision-instance);
+    // a live-session decision must name the instance that owns the slot instead
     dispatch_options opt;
     opt.require_instance  = decision_request_is_session_pinned(req);
-    opt.implicit_instance = params.decision_instance;
+    opt.decision_default  = true;
+    opt.target_specified  = decision_request_target_specified(req, base_name);
 
     // The decision contract requires a model id, but in a pool the model field is a routing
     // target. When the client names only the instance (or nothing at all, or a Jev alias), fill
@@ -2307,28 +2500,748 @@ server_http_res_ptr server_instances::handle_post_decision(const server_http_req
     return dispatch(routed, [](server_routes & routes, const server_http_req & req) { return routes.post_decision(req); }, opt);
 }
 
+// sidecar executor mode: every decision runs on the internal executor instance. the model field
+// is echo-only (a decision never picks a placement target); a session-pinned request attaches an
+// owned token snapshot captured from the owning instance, then routes to the sidecar.
+server_http_res_ptr server_instances::handle_post_decision_sidecar(const server_http_req & req) {
+    auto sidecar = get_instance(decision_sidecar_name());
+    if (sidecar == nullptr) {
+        return make_error("the decision sidecar executor is not registered", ERROR_TYPE_SERVER);
+    }
+    const auto forward = [](server_routes & routes, const server_http_req & req) { return routes.post_decision(req); };
+
+    server_http_req routed = req;
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception &) {
+        // malformed JSON is reported by the sidecar's own handler
+        return dispatch_instance(routed, sidecar, "", -1, forward);
+    }
+    if (body.is_object() && decision_request_is_session_pinned(req)) {
+        // the session fields may arrive in the query string (as chat routing allows); merge them
+        // into the body so the snapshot resolver and the sidecar parser see one source
+        if (json_value(body, "session_id", std::string()).empty()) {
+            const std::string qsid = req.get_param("session_id");
+            if (!qsid.empty()) {
+                body["session_id"] = qsid;
+            }
+        }
+        if (json_value(body, "id_slot", -1) < 0) {
+            const std::string qslot = req.get_param("id_slot");
+            if (!qslot.empty()) {
+                try {
+                    body["id_slot"] = std::stoi(qslot);
+                } catch (const std::exception &) {
+                }
+            }
+        }
+        std::pair<std::string, int> lease_key;
+        if (server_http_res_ptr err = attach_decision_snapshot(body, routed, lease_key)) {
+            return err;
+        }
+        // dispatch, then release the store lease once the (possibly cancelled) task is done
+        auto res = dispatch_instance(routed, sidecar, "", -1, forward);
+        std::string snap_key;
+        try {
+            const json rb = json::parse(routed.body);
+            snap_key = rb.value("__decision_snapshot_key", std::string());
+        } catch (const std::exception &) {
+        }
+        release_decision_snapshot_after_dispatch(snap_key, lease_key);
+        return res;
+    }
+    // stateless: the model field is echo-only and the sidecar parser validates it; the executor
+    // is reached directly, so nothing needs to be rewritten for routing
+    return dispatch_instance(routed, sidecar, "", -1, forward);
+}
+
 server_http_res_ptr server_instances::handle_post_session(const server_http_req & req) {
+    if (params.decision_sidecar) {
+        return handle_post_session_sidecar(req);
+    }
     dispatch_options opt;
     opt.require_instance = true;
     return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.post_session(req); }, opt);
 }
 
 server_http_res_ptr server_instances::handle_get_session(const server_http_req & req) {
+    if (params.decision_sidecar) {
+        return handle_get_session_sidecar(req);
+    }
     dispatch_options opt;
     opt.require_instance = true;
     return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.get_session(req); }, opt);
 }
 
 server_http_res_ptr server_instances::handle_delete_session(const server_http_req & req) {
+    if (params.decision_sidecar) {
+        return handle_delete_session_sidecar(req);
+    }
     dispatch_options opt;
     opt.require_instance = true;
     return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.delete_session(req); }, opt);
 }
 
 server_http_res_ptr server_instances::handle_patch_session(const server_http_req & req) {
+    if (params.decision_sidecar) {
+        return handle_patch_session_sidecar(req);
+    }
     dispatch_options opt;
     opt.require_instance = true;
     return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.patch_session(req); }, opt);
+}
+
+// --- sidecar executor session handlers (token-snapshot store, pool-level) ---
+
+server_http_res_ptr server_instances::handle_post_session_sidecar(const server_http_req & req) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const common_json_error & e) {
+        return make_error("invalid JSON: " + std::string(e.what()), ERROR_TYPE_INVALID_REQUEST);
+    }
+    if (!body.is_object() || !body.contains("id_slot")) {
+        return make_error("a session create needs an id_slot", ERROR_TYPE_INVALID_REQUEST);
+    }
+    const int id_slot = body.value("id_slot", -1);
+    if (id_slot < 0) {
+        return make_error("id_slot must be non-negative", ERROR_TYPE_INVALID_REQUEST);
+    }
+    // the owning instance must be named (a group is refused: the slot lives in one context)
+    std::shared_ptr<server_instance> inst;
+    std::string error;
+    if (server_http_res_ptr err = decision_owning_instance(
+            body.value("instance", std::string()), body.value("model", std::string()), inst, error)) {
+        return err;
+    }
+
+    // policy: the only backend left is the token snapshot. clone/file were host/recurrent-state
+    // backends of the in-context registry, which the sidecar design removes (501 capability
+    // refusal, never a silent fallback). capture_on_turn_complete is accepted as always true:
+    // every create captures eagerly, so there is no lazy window for cache_idle_slots to clear.
+    llama_decision::session_policy policy;
+    if (body.contains("policy") && body.at("policy").is_object()) {
+        const json & p = body.at("policy");
+        if (p.contains("backend")) {
+            const std::string backend = p.at("backend").get<std::string>();
+            if (backend == "clone" || backend == "file") {
+                return make_error("the '" + backend + "' session backend is not supported by the sidecar "
+                                  "executor; only token snapshots are", ERROR_TYPE_NOT_SUPPORTED);
+            }
+        }
+        if (p.contains("pinned")) {
+            policy.pinned = p.at("pinned").get<bool>();
+        }
+        if (p.contains("ttl_ms")) {
+            policy.ttl_ms = p.at("ttl_ms").get<int64_t>();
+            if (policy.ttl_ms < 0) {
+                return make_error("ttl_ms must be >= 0", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+            }
+        }
+    }
+    // the server default --decision-session-ttl applies when the request omits it (0 = no expiry)
+    if (policy.ttl_ms == 0) {
+        policy.ttl_ms = params.decision_session_ttl_ms;
+    }
+
+    // eager read-only capture on the owning instance's scheduler (no decoded state or a still-
+    // processing slot is refused by the op)
+    std::unique_ptr<server_task_result_decision_snapshot> op_res;
+    if (server_http_res_ptr err = decision_snapshot_op(inst, id_slot, op_res)) {
+        return err;
+    }
+    if (op_res->tokens.empty()) {
+        return make_error("id_slot " + std::to_string(id_slot) + " has no decoded state to capture",
+                          ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+    }
+
+    const std::string scope_str = decision_adapter_scope_of(op_res->lora_scope);
+    std::vector<common_adapter_lora_info> loras;
+    if (!op_res->lora_scope.empty()) {
+        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+        try {
+            loras = resolve_decision_lora_scope(op_res->lora_scope);
+        } catch (const std::exception & e) {
+            return make_error(e.what(), ERROR_TYPE_INVALID_REQUEST);
+        }
+    }
+
+    const std::pair<std::string, int> key = std::make_pair(inst->cfg.name, id_slot);
+    std::string session_id;
+    std::vector<common_adapter_lora_info> stale_loras;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        // creating a session for a slot replaces any reference the slot already holds; its refs
+        // are released after this lock is dropped (never across the store lock)
+        stale_loras = finalize_decision_session_locked(key);
+        // token-snapshot budget: --decision-session-budget-mb caps the total owned token bytes
+        // across all retained references (0 = unlimited). an over-budget create is refused, never
+        // truncated; the LRU eviction tier that frees a reference under pressure is the M7 warm tier.
+        if (params.decision_session_budget_mb > 0) {
+            const size_t budget = (size_t) params.decision_session_budget_mb * 1024u * 1024u;
+            size_t total = op_res->tokens.size() * sizeof(llama_token);
+            for (const auto & kv : decision_sessions_) {
+                if (kv.second.removed) {
+                    continue;
+                }
+                total += kv.second.tokens.size() * sizeof(llama_token);
+            }
+            if (total > budget) {
+                return make_error("creating this session snapshot would exceed the --decision-session-budget-mb "
+                                  "budget (" + std::to_string(total) + " > " + std::to_string(budget) + " bytes); "
+                                  "delete sessions or raise the budget", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+            }
+        }
+        decision_session_entry entry;
+        entry.instance      = inst->cfg.name;
+        entry.id_slot       = id_slot;
+        entry.turn          = body.value("turn", std::string());
+        entry.base_pos      = op_res->base_pos;
+        entry.tokens        = std::move(op_res->tokens);
+        entry.loras         = loras;
+        entry.adapter_scope = scope_str;
+        entry.content_hash  = decision_content_hash_of(entry.tokens, op_res->lora_scope);
+        entry.turn_counter  = decision_slot_turns_[key];
+        entry.created_ms    = now_ms();
+        entry.last_used_ms  = entry.created_ms;
+        entry.pinned        = policy.pinned;
+        entry.ttl_ms        = policy.ttl_ms;
+        session_id = "ses_" + std::to_string(llama_decision::fnv1a64(
+            std::to_string(entry.created_ms) + decision_session_key(inst->cfg.name, id_slot))) ;
+        entry.session_id = session_id;
+        decision_sessions_[key] = std::move(entry);
+        decision_session_index_[session_id] = key;
+    }
+    if (!stale_loras.empty()) {
+        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+        release_adapter_set(stale_loras);
+    }
+
+    json out;
+    out["session_id"] = session_id;
+    out["id_slot"]    = id_slot;
+    out["turn"]       = body.value("turn", std::string());
+    out["backend"]    = "tokens";
+    out["captured"]   = true;
+    return make_ok(out);
+}
+
+server_http_res_ptr server_instances::handle_get_session_sidecar(const server_http_req & req) {
+    const std::string sid = req.get_param("session_id");
+    if (sid.empty()) {
+        return make_error("missing session_id", ERROR_TYPE_INVALID_REQUEST);
+    }
+    json out;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        auto idx = decision_session_index_.find(sid);
+        if (idx == decision_session_index_.end()) {
+            return make_error("session " + sid + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        auto it = decision_sessions_.find(idx->second);
+        if (it == decision_sessions_.end()) {
+            return make_error("session " + sid + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        const decision_session_entry & entry = it->second;
+        out["session_id"]   = sid;
+        out["id_slot"]      = entry.id_slot;
+        out["instance"]     = entry.instance;
+        out["turn"]         = entry.turn;
+        out["backend"]      = "tokens";
+        out["pinned"]       = entry.pinned;
+        out["ttl_ms"]       = (long long) entry.ttl_ms;
+        out["captured"]     = true;
+        out["bytes"]        = (long long) (entry.tokens.size() * sizeof(llama_token));
+        out["created_ms"]   = (long long) entry.created_ms;
+        out["last_used_ms"] = (long long) entry.last_used_ms;
+        out["counters"]     = {
+            { "n_snapshots", (long long) decision_sessions_.size() },
+            { "n_reuses",    0LL },
+            { "n_releases",  0LL },
+            { "n_sessions",  (long long) decision_sessions_.size() },
+            { "bytes_total", (long long) entry.tokens.size() * sizeof(llama_token) },
+        };
+    }
+    return make_ok(out);
+}
+
+server_http_res_ptr server_instances::handle_delete_session_sidecar(const server_http_req & req) {
+    const std::string sid = req.get_param("session_id");
+    if (sid.empty()) {
+        return make_error("missing session_id", ERROR_TYPE_INVALID_REQUEST);
+    }
+    std::pair<std::string, int> key;
+    bool leased = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        auto idx = decision_session_index_.find(sid);
+        if (idx == decision_session_index_.end()) {
+            return make_error("session " + sid + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        key = idx->second;
+        auto it = decision_sessions_.find(key);
+        if (it == decision_sessions_.end()) {
+            return make_error("session " + sid + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        if (it->second.lease_count > 0) {
+            // an in-flight sidecar decision holds the snapshot; drop the handle now and let the
+            // finalize (ref release) happen when the last lease is dropped by the dispatch drain
+            decision_session_index_.erase(sid);
+            it->second.session_id.clear();
+            it->second.removed = true;
+            leased = true;
+        }
+    }
+    if (!leased) {
+        erase_decision_session(key);
+    }
+    json out;
+    out["session_id"] = sid;
+    out["erased"]     = true;
+    return make_ok(out);
+}
+
+server_http_res_ptr server_instances::handle_patch_session_sidecar(const server_http_req & req) {
+    const std::string sid = req.get_param("session_id");
+    if (sid.empty()) {
+        return make_error("missing session_id", ERROR_TYPE_INVALID_REQUEST);
+    }
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const common_json_error & e) {
+        return make_error("invalid JSON: " + std::string(e.what()), ERROR_TYPE_INVALID_REQUEST);
+    }
+    bool set_pinned = false, pinned = false;
+    bool set_ttl = false;
+    int64_t ttl_ms = 0;
+    if (body.contains("pinned")) {
+        set_pinned = true;
+        pinned     = body.at("pinned").get<bool>();
+    }
+    if (body.contains("ttl_ms")) {
+        set_ttl = true;
+        ttl_ms  = body.at("ttl_ms").get<int64_t>();
+        if (ttl_ms < 0) {
+            return make_error("ttl_ms must be >= 0", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+        }
+    }
+    if (!set_pinned && !set_ttl) {
+        return make_error("patch needs a pinned or ttl_ms field", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+    }
+    json out;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        auto idx = decision_session_index_.find(sid);
+        if (idx == decision_session_index_.end()) {
+            return make_error("session " + sid + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        auto it = decision_sessions_.find(idx->second);
+        if (it == decision_sessions_.end()) {
+            return make_error("session " + sid + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        decision_session_entry & entry = it->second;
+        if (set_pinned) {
+            entry.pinned = pinned;
+        }
+        if (set_ttl) {
+            entry.ttl_ms = ttl_ms;
+        }
+        out["session_id"] = sid;
+        out["pinned"]     = entry.pinned;
+        out["ttl_ms"]     = (long long) entry.ttl_ms;
+    }
+    return make_ok(out);
+}
+
+// --- decision session token store (sidecar executor) ---
+
+std::string server_instances::decision_session_key(const std::string & instance, int id_slot) {
+    return instance + ":" + std::to_string(id_slot);
+}
+
+std::string server_instances::decision_adapter_scope_of(const std::vector<std::pair<std::string, float>> & scope) {
+    if (scope.empty()) {
+        return std::string();
+    }
+    std::string s;
+    for (const auto & p : scope) {
+        s += p.first + "@" + std::to_string(p.second) + ";";
+    }
+    return "adapter-scope-v1:" + llama_decision::sha256_hex(s);
+}
+
+std::string server_instances::decision_content_hash_of(const std::vector<llama_token> & tokens,
+                                                       const std::vector<std::pair<std::string, float>> & scope) {
+    std::string bytes;
+    bytes.reserve(tokens.size() * sizeof(llama_token) + 16);
+    for (llama_token tok : tokens) {
+        const uint32_t t = (uint32_t) tok;
+        for (int b = 0; b < 4; ++b) {
+            bytes.push_back((char) ((t >> (8 * b)) & 0xff));
+        }
+    }
+    for (const auto & p : scope) {
+        bytes += p.first;
+        bytes.push_back('@');
+        const uint32_t bits = (uint32_t) p.second;
+        bytes.push_back((char) (bits & 0xff));
+        bytes.push_back((char) ((bits >> 8) & 0xff));
+        bytes.push_back((char) ((bits >> 16) & 0xff));
+        bytes.push_back((char) ((bits >> 24) & 0xff));
+    }
+    return std::string("session-tokens-v1:") + llama_decision::sha256_hex(bytes);
+}
+
+std::vector<common_adapter_lora_info> server_instances::resolve_decision_lora_scope(
+        const std::vector<std::pair<std::string, float>> & scope) {
+    std::vector<common_adapter_lora_info> out;
+    for (const auto & p : scope) {
+        common_adapter_lora_info la;
+        la.path  = p.first;
+        la.scale = p.second;
+        llama_adapter_lora * ptr = ensure_adapter(p.first);
+        if (ptr == nullptr) {
+            release_adapter_set(out);
+            throw std::runtime_error("failed to resolve the session adapter scope: " + p.first);
+        }
+        la.ptr = ptr;
+        out.push_back(std::move(la));
+    }
+    return out;
+}
+
+std::vector<common_adapter_lora_info> server_instances::finalize_decision_session_locked(
+        const std::pair<std::string, int> & key) {
+    auto it = decision_sessions_.find(key);
+    if (it == decision_sessions_.end()) {
+        return {};
+    }
+    decision_session_entry entry = std::move(it->second);
+    decision_sessions_.erase(it);
+    if (!entry.session_id.empty()) {
+        decision_session_index_.erase(entry.session_id);
+    }
+    // the refs are released by the caller AFTER the store lock is dropped: releasing needs
+    // mutex_mgmt, and this store lock may be held on a scheduler thread (a release hook) where a
+    // management op waiting on this scheduler thread also holds mutex_mgmt
+    return entry.loras;
+}
+
+// erase a store entry and release its adapter refs. call only from an HTTP thread (never a
+// scheduler thread), and never while holding mutex_dispatch.
+void server_instances::erase_decision_session(const std::pair<std::string, int> & key) {
+    std::vector<common_adapter_lora_info> loras;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        loras = finalize_decision_session_locked(key);
+    }
+    if (!loras.empty()) {
+        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+        release_adapter_set(loras);
+    }
+}
+
+void server_instances::on_decision_slot_release(const std::string & instance, int id_slot) {
+    const auto key = std::make_pair(instance, id_slot);
+    std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+    ++decision_slot_turns_[key];
+    auto it = decision_sessions_.find(key);
+    if (it == decision_sessions_.end()) {
+        return;
+    }
+    // the session's turn is over: mark it for removal. the actual ref release happens on an HTTP
+    // thread (a later resolve / erase), never on this scheduler thread, because releasing an
+    // adapter ref needs mutex_mgmt which a management op holds while waiting on this very thread.
+    it->second.removed = true;
+}
+
+void server_instances::decision_sessions_clear() {
+    std::vector<common_adapter_lora_info> loras;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        for (auto & kv : decision_sessions_) {
+            auto & entry = kv.second;
+            loras.insert(loras.end(), entry.loras.begin(), entry.loras.end());
+        }
+        decision_sessions_.clear();
+        decision_session_index_.clear();
+        decision_slot_turns_.clear();
+        decision_snapshot_resolve_.clear();
+    }
+    if (!loras.empty()) {
+        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+        release_adapter_set(loras);
+    }
+}
+
+std::shared_ptr<server_decision_snapshot> server_instances::decision_snapshot_by_key(const std::string & key) {
+    std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+    auto it = decision_snapshot_resolve_.find(key);
+    return it != decision_snapshot_resolve_.end() ? it->second : nullptr;
+}
+
+server_http_res_ptr server_instances::decision_owning_instance(const std::string & instance_field,
+                                                               const std::string & model_field,
+                                                               std::shared_ptr<server_instance> & inst_out,
+                                                               std::string & error) const {
+    // an explicit instance wins; otherwise the model id may name one (base:NAME). a group or an
+    // ambiguous target is refused: a session decision addresses one instance's slot. a bare pool
+    // id (or no target) resolves to the default instance, matching stateless routing.
+    std::string target = instance_field;
+    if (target.empty() && !model_field.empty()) {
+        const auto comps = string_split<std::string>(model_field, ':');
+        if (comps.size() >= 2 && comps[0] == base_name) {
+            target = comps.back();
+        }
+    }
+    if (target.empty() || target == "latest") {
+        auto inst = default_instance();
+        if (inst == nullptr) {
+            error = "a session decision must name the owning instance ('instance' or 'model' field)";
+            return make_error(error, ERROR_TYPE_INVALID_REQUEST);
+        }
+        inst_out = inst;
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_dispatch);
+    for (const auto & inst : instances) {
+        if (inst->cfg.name == target) {
+            if (inst->internal) {
+                error = "the decision sidecar executor has no chat slot to snapshot";
+                return make_error(error, ERROR_TYPE_INVALID_REQUEST);
+            }
+            inst_out = inst;
+            return nullptr;
+        }
+        if (inst->cfg.group == target) {
+            error = "this request addresses one instance's slot; route it with the 'instance' or "
+                    "'model' field, not a group";
+            return make_error(error, ERROR_TYPE_INVALID_REQUEST);
+        }
+    }
+    error = "model or instance not found: '" + target + "'";
+    return make_error(error, ERROR_TYPE_INVALID_REQUEST);
+}
+
+server_http_res_ptr server_instances::decision_snapshot_op(const std::shared_ptr<server_instance> & inst, int id_slot,
+                                                           std::unique_ptr<server_task_result_decision_snapshot> & out) {
+    if (auto err = ensure_built_instance(inst)) {
+        return err;
+    }
+    auto res = inst->ctx_server->slot_decision_snapshot(id_slot);
+    if (res == nullptr) {
+        return make_error("the decision snapshot timed out on instance '" + inst->cfg.name + "'", ERROR_TYPE_UNAVAILABLE);
+    }
+    if (res->is_error()) {
+        return make_error(res->to_json());
+    }
+    auto * snap = dynamic_cast<server_task_result_decision_snapshot *>(res.get());
+    if (snap == nullptr) {
+        return make_error("unexpected decision snapshot result", ERROR_TYPE_SERVER);
+    }
+    // take ownership so the caller can read the tokens/lora scope after this function returns
+    out.reset(static_cast<server_task_result_decision_snapshot *>(res.release()));
+    return nullptr;
+}
+
+server_http_res_ptr server_instances::attach_decision_snapshot(const json & body, server_http_req & routed,
+                                                               std::pair<std::string, int> & lease_out) {
+    const std::string session_id = body.value("session_id", std::string());
+    const int         id_slot    = body.value("id_slot", -1);
+    const std::string instance_field = body.value("instance", std::string());
+    const std::string model_field    = body.value("model", std::string());
+
+    std::shared_ptr<server_decision_snapshot> snap = std::make_shared<server_decision_snapshot>();
+    std::pair<std::string, int> key;
+    bool leased = false;
+
+    if (!session_id.empty()) {
+        // first-class session: the pool store is the single owner
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        auto idx = decision_session_index_.find(session_id);
+        if (idx == decision_session_index_.end()) {
+            return make_error("session " + session_id + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        key = idx->second;
+        auto it = decision_sessions_.find(key);
+        if (it == decision_sessions_.end()) {
+            return make_error("session " + session_id + " does not exist", ERROR_TYPE_NOT_FOUND);
+        }
+        decision_session_entry & entry = it->second;
+        if (entry.removed || decision_slot_turns_[key] != entry.turn_counter) {
+            // the slot advanced past the captured turn: never answer from an old turn
+            return make_error("session " + session_id + " is stale: the source slot's turn ended; "
+                              "create a new session", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+        }
+        if (!instance_field.empty() && instance_field != entry.instance) {
+            return make_error("session " + session_id + " belongs to instance '" + entry.instance +
+                              "', not '" + instance_field + "'", ERROR_TYPE_INVALID_REQUEST);
+        }
+        if (!model_field.empty() && model_field != base_name) {
+            const auto comps = string_split<std::string>(model_field, ':');
+            if (comps.size() >= 2 && comps[0] == base_name && comps.back() != entry.instance) {
+                return make_error("session " + session_id + " belongs to instance '" + entry.instance +
+                                  "', not '" + comps.back() + "'", ERROR_TYPE_INVALID_REQUEST);
+            }
+        }
+        snap->tokens        = entry.tokens;
+        snap->loras         = entry.loras;
+        snap->adapter_scope = entry.adapter_scope;
+        snap->source_slot   = entry.id_slot;
+        snap->turn          = entry.turn;
+        snap->session_id    = session_id;
+        snap->base_pos      = entry.base_pos;
+        snap->warm_tag      = entry.content_hash;
+        entry.last_used_ms  = now_ms();
+        ++entry.lease_count;
+        leased = true;
+    } else {
+        // implicit id_slot session: eager capture through a read-only op on the owning instance
+        std::shared_ptr<server_instance> inst;
+        std::string error;
+        if (server_http_res_ptr err = decision_owning_instance(instance_field, model_field, inst, error)) {
+            return err;
+        }
+        key = std::make_pair(inst->cfg.name, id_slot);
+
+        // reuse the eager snapshot for the current turn; otherwise capture now (no lazy window)
+        std::unique_ptr<server_task_result_decision_snapshot> op_res;
+        {
+            std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+            auto it = decision_sessions_.find(key);
+            if (it != decision_sessions_.end() && !it->second.removed &&
+                decision_slot_turns_[key] == it->second.turn_counter) {
+                decision_session_entry & entry = it->second;
+                snap->tokens        = entry.tokens;
+                snap->loras         = entry.loras;
+                snap->adapter_scope = entry.adapter_scope;
+                snap->source_slot   = id_slot;
+                snap->turn          = entry.turn;
+                snap->base_pos      = entry.base_pos;
+                snap->warm_tag      = entry.content_hash;
+                entry.last_used_ms  = now_ms();
+                ++entry.lease_count;
+                leased = true;
+            }
+        }
+        if (!leased) {
+            // the store mutex is never held across an instance_op
+            if (server_http_res_ptr err = decision_snapshot_op(inst, id_slot, op_res)) {
+                return err;
+            }
+            if (op_res->tokens.empty()) {
+                return make_error("id_slot " + std::to_string(id_slot) + " has no decoded state to snapshot",
+                                  ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+            }
+            const std::string scope_str = decision_adapter_scope_of(op_res->lora_scope);
+            std::vector<common_adapter_lora_info> loras;
+            if (!op_res->lora_scope.empty()) {
+                std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+                try {
+                    loras = resolve_decision_lora_scope(op_res->lora_scope);
+                } catch (const std::exception & e) {
+                    return make_error(e.what(), ERROR_TYPE_INVALID_REQUEST);
+                }
+            }
+            std::vector<common_adapter_lora_info> stale_loras_out;
+            {
+                std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+                // a slot release may have advanced the turn while the op ran; drop the stale entry
+                // (its refs are released after this lock is dropped, never across the store lock)
+                std::vector<common_adapter_lora_info> stale_loras;
+                auto it = decision_sessions_.find(key);
+                if (it != decision_sessions_.end() && it->second.removed) {
+                    stale_loras = finalize_decision_session_locked(key);
+                }
+                decision_session_entry entry;
+                entry.instance       = inst->cfg.name;
+                entry.id_slot        = id_slot;
+                entry.base_pos       = op_res->base_pos;
+                entry.tokens         = std::move(op_res->tokens);
+                entry.loras          = loras;
+                entry.adapter_scope  = scope_str;
+                entry.content_hash   = decision_content_hash_of(entry.tokens, op_res->lora_scope);
+                entry.turn_counter   = decision_slot_turns_[key];
+                entry.created_ms     = now_ms();
+                entry.last_used_ms   = entry.created_ms;
+                decision_sessions_[key] = std::move(entry);
+                decision_session_entry & stored = decision_sessions_[key];
+                snap->tokens        = stored.tokens;
+                snap->loras         = stored.loras;
+                snap->adapter_scope = stored.adapter_scope;
+                snap->source_slot   = id_slot;
+                snap->base_pos      = stored.base_pos;
+                snap->warm_tag      = stored.content_hash;
+                ++stored.lease_count;
+                leased = true;
+                if (!stale_loras.empty()) {
+                    stale_loras_out = std::move(stale_loras);
+                }
+            }
+            if (!stale_loras_out.empty()) {
+                std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+                release_adapter_set(stale_loras_out);
+            }
+        }
+    }
+    if (!leased) {
+        return make_error("the decision session could not be resolved", ERROR_TYPE_SERVER);
+    }
+
+    // embed a transient resolve key so the sidecar route can fetch the owned snapshot; the pool
+    // holds the lease (and the adapter refs) until release_decision_snapshot_after_dispatch
+    char keybuf[32];
+    std::snprintf(keybuf, sizeof(keybuf), "snp_%08llx", (unsigned long long) (llama_decision::fnv1a64(
+        std::to_string(now_ms()) + decision_session_key(key.first, key.second))));
+    const std::string snap_key = keybuf;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        decision_snapshot_resolve_[snap_key] = snap;
+    }
+    lease_out = key;
+    json rb = body;
+    // the decision runs on the sidecar executor whatever instance the client named: the source
+    // instance has no resolver and must not decode the snapshot. the model field is echo-only and
+    // stays untouched, so the sidecar's contract parser (which requires a model) and its echo both
+    // see the caller's value.
+    rb["instance"] = decision_sidecar_name();
+    rb["__decision_snapshot_key"] = snap_key;
+    routed.body = rb.dump();
+    return nullptr;
+}
+
+// After a sidecar dispatch: wait for the sidecar's scheduler to fully finish the (possibly
+// cancelled) decision task, then drop the lease on the store entry so its adapter refs can be
+// released. The FIFO sync op runs after the decision task, so its return proves the task is done
+// even when the HTTP side returned early on a client cancel.
+void server_instances::release_decision_snapshot_after_dispatch(const std::string & snap_key,
+                                                                const std::pair<std::string, int> & entry_key) {
+    auto sidecar = get_instance(decision_sidecar_name());
+    if (sidecar != nullptr && sidecar->built.load(std::memory_order_acquire)) {
+        sidecar->ctx_server->instance_op([]() { return json{{"drain", true}}; });
+    }
+    std::vector<common_adapter_lora_info> removed_loras;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        decision_snapshot_resolve_.erase(snap_key);
+        auto it = decision_sessions_.find(entry_key);
+        if (it == decision_sessions_.end()) {
+            return;
+        }
+        decision_session_entry & entry = it->second;
+        if (entry.lease_count > 0) {
+            --entry.lease_count;
+        }
+        if (entry.removed && entry.lease_count == 0) {
+            removed_loras = finalize_decision_session_locked(entry_key);
+        }
+    }
+    if (!removed_loras.empty()) {
+        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
+        release_adapter_set(removed_loras);
+    }
 }
 
 server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http_req & req) {
@@ -2339,7 +3252,9 @@ server_http_res_ptr server_instances::handle_post_lora_adapters(const server_htt
     // the legacy writer commits to the scheduler through the stock handler (its
     // body grammar and zero-for-unlisted scale semantics stay the only
     // implementation). the manager mirror is then refreshed from the scheduler,
-    // so the next attach does not re-apply a stale scale.
+    // so the next attach does not re-apply a stale scale. the drain is exclusive:
+    // no dispatch may read the effective list (apply_snapshot fingerprint) while
+    // the refresh below rewrites it, so the write is never torn.
     std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
 
     auto inst = default_instance();
@@ -2351,10 +3266,9 @@ server_http_res_ptr server_instances::handle_post_lora_adapters(const server_htt
     if (!inst->built.load(std::memory_order_acquire)) {
         return make_error("instance '" + inst->cfg.name + "' has no loaded context", ERROR_TYPE_NOT_FOUND);
     }
-    active_route_guard guard(*this, *inst);
-    if (!guard.acquired) {
-        return make_error("instance '" + inst->cfg.name + "' is being reconfigured", ERROR_TYPE_UNAVAILABLE);
-    }
+    // like swap_adapter_set: management ops are serialized by mutex_mgmt, so no
+    // two drains contend; the scheduler posts run while removing (direct queue)
+    instance_drain_guard guard(*this, inst);
     auto res = inst->routes->post_lora_adapters(req);
     if (res->status != 200) {
         return res;
@@ -2960,6 +3874,8 @@ void server_instances::start_loops() {
 }
 
 server_instances::~server_instances() {
+    // release the decision session store's adapter refs before the shared model is freed
+    decision_sessions_clear();
     // last-resort shutdown on any exit path (e.g. an exception after start_loops): joins
     // every scheduler thread so no joinable thread survives pool destruction (a joinable
     // std::thread destructor would std::terminate the process). a no-op after a normal
@@ -2995,7 +3911,13 @@ void server_instances::terminate() {
         }
     }
     for (const auto & inst : live) {
-        if (inst->loop_thread.joinable()) {
+        bool do_join;
+        {
+            std::lock_guard<std::mutex> lock(mutex_dispatch);
+            do_join               = !inst->scheduler_joined;
+            inst->scheduler_joined = true;
+        }
+        if (do_join && inst->loop_thread.joinable()) {
             inst->loop_thread.join();
         }
     }

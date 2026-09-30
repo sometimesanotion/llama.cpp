@@ -66,6 +66,9 @@ struct server_instance {
     bool removing          = false;
     bool running           = true;
     int  n_active_dispatch = 0;
+    // set true exactly once, under mutex_dispatch, before loop_thread.join runs so
+    // destroy / resize / pool-terminate never join the same scheduler thread twice
+    bool scheduler_joined  = false;
     // the synchronization barrier for the whole window: a release-store of true
     // happens after ctx_server/routes/effective are fully written; an acquire-load
     // of true therefore makes every one of those writes visible. the stores stay
@@ -86,6 +89,11 @@ struct server_instance {
     // for allocation failure (caller maps to 507). set only by
     // build_context_default; injected test builders leave it false.
     bool adapter_failed    = false;
+
+    // manager-internal window (the decision sidecar executor): reserved name,
+    // never deletable, never resized, never picked as the default. chat is
+    // never routed to it; stateless decisions are, via --decision-sidecar.
+    bool internal          = false;
 };
 
 // manages the pool: one shared model load, many named contexts (instances).
@@ -97,6 +105,10 @@ struct server_instances {
     // real; tests may inject a stub to drive build-failure paths. runs on the
     // calling thread with no manager lock held.
     using context_builder_fn = std::function<bool(server_instance &)>;
+
+    // the reserved name of the internal decision sidecar executor. no user
+    // instance may claim it and it can never be created, deleted or resized.
+    static const char * decision_sidecar_name() { return "__decision__"; }
 
     explicit server_instances(context_builder_fn builder = nullptr);
 
@@ -211,12 +223,15 @@ struct server_instances {
 
     // placement contract for a routed request. A session-pinned request (decision on a live
     // slot, or any /v1/session call) addresses state that lives in exactly one instance's
-    // context, so group routing (which picks any free member) is refused. `implicit_instance`
-    // is used only for requests that name no target and are not session-pinned; it is how
-    // --decision-instance gives stateless decisions their own context.
+    // context, so group routing (which picks any free member) is refused. `decision_default`
+    // is set only for the stateless decision route: an untargeted request that carries no
+    // placement may fall back to the declared --decision-instance. `target_specified` is
+    // computed from the ORIGINAL request fields before any stamping; a stamped pool id is an
+    // echo and never decides placement, so it is not a target.
     struct dispatch_options {
-        bool        require_instance  = false;
-        std::string implicit_instance;
+        bool require_instance = false; // refuse group routing; address one instance's slot
+        bool decision_default = false; // stateless decision: an untargeted request may use --decision-instance
+        bool target_specified = false; // the original request named a routing target
     };
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward);
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward,
@@ -559,4 +574,85 @@ struct server_instances {
     std::condition_variable cond_switch;
     size_t                  n_active_switches       = 0;
     static constexpr size_t max_concurrent_switches = 2;
+
+    // --- decision session token store (pool-level, sidecar executor) ---
+    // A session is an owned token snapshot of a completed chat turn plus its adapter scope. The
+    // pool captures it with a read-only scheduler op on the owning instance and replays it on the
+    // sidecar, so chat contexts are never written or stalled by a session decision. Guarded by
+    // mutex_decision_sessions; that mutex is never held across an instance_op.
+    struct decision_session_entry {
+        std::string session_id;                 // first-class handle; "" for an implicit slot-keyed session
+        std::string instance;                   // owning instance name
+        int         id_slot = -1;
+        std::string turn;                       // client turn tag
+        llama_pos   base_pos = -1;              // = tokens.size()
+        std::vector<llama_token> tokens;        // owned copy of the completed turn prefix
+        std::vector<common_adapter_lora_info> loras; // resolved adapter scope (pool-owned ptrs); empty = base
+        std::string adapter_scope;              // scope identity ("" = base model)
+        std::string content_hash;               // strong hash of tokens + adapter scope
+        uint64_t    turn_counter = 0;           // owning slot's turn counter at capture
+        int64_t     created_ms = 0;
+        int64_t     last_used_ms = 0;
+        bool        pinned = false;
+        int64_t     ttl_ms = 0;
+        int         lease_count = 0;            // >0: held by an in-flight sidecar decision
+        bool        removed = false;            // turn advanced / erased; finalize when the lease drops
+    };
+    static std::string decision_session_key(const std::string & instance, int id_slot);
+    // per-slot monotonic turn counters and the session store, keyed by (instance, id_slot)
+    std::map<std::pair<std::string, int>, uint64_t> decision_slot_turns_;
+    std::map<std::pair<std::string, int>, decision_session_entry> decision_sessions_;
+    std::map<std::string, std::pair<std::string, int>> decision_session_index_; // session_id -> key
+    // transient per-request resolution map: snapshot key -> owned snapshot for the in-flight sidecar
+    // decision. filled by attach_decision_snapshot, read by decision_snapshot_by_key on the sidecar
+    // route thread, erased after the dispatch (and the adapter drain) returns.
+    std::map<std::string, std::shared_ptr<server_decision_snapshot>> decision_snapshot_resolve_;
+    mutable std::mutex mutex_decision_sessions;
+
+    // --- decision session token store helpers (sidecar executor) ---
+    static std::string decision_adapter_scope_of(const std::vector<std::pair<std::string, float>> & scope);
+    static std::string decision_content_hash_of(const std::vector<llama_token> & tokens,
+                                                const std::vector<std::pair<std::string, float>> & scope);
+    // ensure one pool-owned ref per path in `scope`, returning the resolved (ptr-bearing) list;
+    // caller holds mutex_mgmt. the caller owns the refs until release_adapter_set.
+    std::vector<common_adapter_lora_info> resolve_decision_lora_scope(const std::vector<std::pair<std::string, float>> & scope);
+    // release the refs of a store entry and erase it from every map; the returned refs must be
+    // released by the caller AFTER dropping the store lock. called only from HTTP threads.
+    std::vector<common_adapter_lora_info> finalize_decision_session_locked(const std::pair<std::string, int> & key);
+    // erase a store entry and release its adapter refs (store lock is never held across the mgmt
+    // lock); HTTP threads only.
+    void erase_decision_session(const std::pair<std::string, int> & key);
+    // bump the owning slot's turn counter on the scheduler thread; sessions whose turn is over are
+    // marked for removal (never finalized here: ref release needs mutex_mgmt, which a management op
+    // holds while waiting on this very scheduler thread).
+    void on_decision_slot_release(const std::string & instance, int id_slot);
+    // drop refs of every store entry; pool teardown only.
+    void decision_sessions_clear();
+    std::shared_ptr<server_decision_snapshot> decision_snapshot_by_key(const std::string & key);
+    // resolve the owning instance for an id_slot / session decision target. returns nullptr on
+    // success (inst_out filled) or an error result; a group or unknown target is refused.
+    server_http_res_ptr decision_owning_instance(const std::string & instance_field,
+                                                 const std::string & model_field,
+                                                 std::shared_ptr<server_instance> & inst_out,
+                                                 std::string & error) const;
+    // run the read-only snapshot op on the owning instance and map its error result; returns the
+    // owned task result (non-null) or an error response. the store mutex is NOT held here.
+    server_http_res_ptr decision_snapshot_op(const std::shared_ptr<server_instance> & inst, int id_slot,
+                                             std::unique_ptr<server_task_result_decision_snapshot> & out);
+    // capture (or reuse) the eager token snapshot for a session decision and attach it to the
+    // routed body; also leases the store entry for the dispatch. `lease_out` receives the entry
+    // key when a lease was taken (the caller must unlease it after the dispatch). returns nullptr
+    // on success.
+    server_http_res_ptr attach_decision_snapshot(const json & body, server_http_req & routed,
+                                                 std::pair<std::string, int> & lease_out);
+    // after a sidecar dispatch: drain the sidecar queue so a cancelled decision is guaranteed done
+    // before the store entry (and its adapter refs) is released, then unlease the entry.
+    void release_decision_snapshot_after_dispatch(const std::string & snap_key,
+                                                  const std::pair<std::string, int> & entry_key);
+    // sidecar executor routing for /v1/decision and /v1/session (--decision-sidecar)
+    server_http_res_ptr handle_post_decision_sidecar(const server_http_req & req);
+    server_http_res_ptr handle_post_session_sidecar(const server_http_req & req);
+    server_http_res_ptr handle_get_session_sidecar(const server_http_req & req);
+    server_http_res_ptr handle_delete_session_sidecar(const server_http_req & req);
+    server_http_res_ptr handle_patch_session_sidecar(const server_http_req & req);
 };

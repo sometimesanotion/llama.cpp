@@ -85,6 +85,12 @@ struct unsupported_error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A referenced object (for example an unknown or already-deleted session id) does not exist. The
+// server maps this to HTTP 404, the not-found family, distinct from a 422 semantic error.
+struct not_found_error : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // One allowed answer of a question.
 struct decision_option {
     std::string key;         // choice key, level index string, or "true"/"false"

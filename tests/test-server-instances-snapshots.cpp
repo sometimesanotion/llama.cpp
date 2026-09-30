@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -258,7 +259,7 @@ static void test_instances_envelope_shape() {
     const json row = body["instances"][0];
     assert(row.is_object());
     const std::vector<std::string> keys = {
-        "id", "aliases", "group", "n_ctx", "parallel", "pinned", "is_default",
+        "id", "aliases", "group", "n_ctx", "parallel", "pinned", "is_default", "internal",
         "state", "model_bytes", "context_bytes", "compute_bytes", "adapter_bytes", "total_bytes",
         "vram_bytes", "last_used", "last_used_epoch",
     };
@@ -273,6 +274,7 @@ static void test_instances_envelope_shape() {
     assert(row["parallel"].is_number());
     assert(row["pinned"].is_boolean());
     assert(row["is_default"].is_boolean());
+    assert(row["internal"].is_boolean());
     assert(row["state"].is_string());
     assert(row["model_bytes"].is_number_integer());
     assert(row["context_bytes"].is_number_integer());
@@ -633,7 +635,128 @@ static void test_envelope_snapshot_row_shape() {
     fs::remove_all(root, ec);
 }
 
-int main() {    test_layout_paths();
+// the internal decision sidecar executor: reserved name, internal marker in the envelope,
+// undeletable, unresizable, not createable, and VRAM reported like any other window.
+static void test_sidecar_registration_and_guards() {
+    server_instances mgr;
+    mgr.base_name = "m";
+    mgr.params.slot_save_path = "";
+
+    auto sidecar = std::make_shared<server_instance>();
+    sidecar->cfg.name  = server_instances::decision_sidecar_name();
+    sidecar->cfg.group = server_instances::decision_sidecar_name();
+    sidecar->internal  = true;
+    sidecar->effective.n_ctx      = 512;
+    sidecar->effective.n_parallel = 1;
+    mgr.instances.push_back(sidecar);
+
+    static const std::function<bool()> no_stop = []() { return false; };
+
+    // the envelope reports the sidecar with its internal marker; unbuilt it owns zero bytes
+    server_http_req inst_req { {}, {}, "/instances", "", "", {}, no_stop };
+    auto res = mgr.handle_get_instances(inst_req);
+    assert(res->status == 200);
+    const json body = json::parse(res->data);
+    assert(body["instances"].is_array() && body["instances"].size() == 1);
+    const json row = body["instances"][0];
+    assert(row["internal"] == true);
+    assert(row["id"] == "m:__decision__");
+    assert(row.contains("context_bytes") && row.contains("compute_bytes") && row.contains("vram_bytes"));
+    // VRAM reporting follows the shared rule: context + compute, like every other window
+    assert(row["vram_bytes"] == row["context_bytes"].get<uint64_t>() + row["compute_bytes"].get<uint64_t>());
+    assert(row["context_bytes"] == 0 && row["compute_bytes"] == 0);
+
+    // the executor is manager-owned: delete, resize and a same-name create are all refused
+    server_http_req del_req { {}, {}, "/instances/__decision__", "", "", {}, no_stop };
+    del_req.params["name"] = server_instances::decision_sidecar_name();
+    assert(mgr.handle_delete_instance(del_req)->status == 400);
+
+    server_http_req resize_req { {}, {}, "/instances/__decision__/resize", "", "", {}, no_stop };
+    resize_req.params["name"] = server_instances::decision_sidecar_name();
+    resize_req.body           = "{\"ctx_size\": 1024}";
+    assert(mgr.handle_post_instance_resize(resize_req)->status == 400);
+
+    server_http_req create_req { {}, {}, "/instances", "", "", {}, no_stop };
+    create_req.body = "{\"name\": \"__decision__\", \"group\": \"g\"}";
+    assert(mgr.handle_post_instances(create_req)->status == 409);
+}
+
+// concurrent first demands for one window collapse onto exactly one build:
+// ensure_built_instance serializes on mutex_mgmt, so 8 racing /props calls share
+// one context allocation. needs a real model to allocate a window; skips without one.
+static void test_sidecar_build_once_concurrent(const std::string & model_path) {
+    if (model_path.empty()) {
+        printf("test-sidecar-build-once: no model file; skip (set LLAMA_DECISION_TEST_MODEL or pass -m)\n");
+        return;
+    }
+    common_params params;
+    params.model.path = model_path;
+    params.n_ctx      = 256;
+    params.n_parallel = 1;
+    params.warmup     = false;
+    params.cpuparams.n_threads       = 4; // hermetic: -1 segfaults in some container toolchains
+    params.cpuparams_batch.n_threads = 4;
+    params.n_seq_decision   = 8;
+    params.decision_sidecar = true;
+
+    common_instance chat;
+    chat.name       = "chat";
+    chat.group      = "chat";
+    chat.ctx_size   = 256;
+    chat.parallel   = 1;
+    chat.is_default = true;
+    params.instances.push_back(chat);
+
+    int builds = 0;
+    server_instances mgr;
+    mgr.set_context_builder([&builds, &mgr](server_instance & inst) {
+        ++builds;
+        return mgr.build_context_default(inst);
+    });
+    assert(mgr.load(params));
+
+    // the sidecar is registered lazily: reserved name, internal, unbuilt, parallel 1
+    assert(mgr.instances.size() == 2);
+    const auto & sidecar = mgr.instances[1];
+    assert(sidecar->cfg.name == server_instances::decision_sidecar_name());
+    assert(sidecar->internal);
+    assert(!sidecar->built.load(std::memory_order_acquire));
+    assert(sidecar->effective.n_parallel == 1);
+
+    // 8 racing first requests on the default window collapse to one build
+    static const std::function<bool()> no_stop = []() { return false; };
+    server_http_req props_req { {}, {}, "/props", "", "", {}, no_stop };
+    std::atomic<int> ok{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&]() {
+            if (mgr.handle_get_props(props_req)->status == 200) {
+                ok.fetch_add(1);
+            }
+        });
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+    assert(ok.load() == 8);
+    assert(builds == 1);
+    assert(mgr.instances[0]->built.load(std::memory_order_acquire));
+
+    mgr.terminate();
+}
+
+int main(int argc, char ** argv) {
+    std::string model_path;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "-m") {
+            model_path = argv[i + 1];
+        }
+    }
+    if (model_path.empty() && std::getenv("LLAMA_DECISION_TEST_MODEL") != nullptr) {
+        model_path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+    }
+
+    test_layout_paths();
     test_merge();
     test_merge_tolerates_shape_drift();
     test_merge_saturates();
@@ -653,5 +776,7 @@ int main() {    test_layout_paths();
     test_envelope_canonical_stable();
     test_merge_exact_shape();
     test_envelope_snapshot_row_shape();
+    test_sidecar_registration_and_guards();
+    test_sidecar_build_once_concurrent(model_path);
     return 0;
 }

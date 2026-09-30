@@ -119,6 +119,7 @@ struct result {
 struct batch_result {
     std::vector<result> items;
     bool   cache_hit     = false;
+    bool   warm_hit      = false; // a resident warm prefix was forked instead of a cold prefill
     size_t shared_tokens = 0;
     int    rows          = 0;
     int    rounds        = 0;
@@ -134,7 +135,7 @@ struct batch_result {
 // flight, then branches. The context needs a unified KV cache so branches share the trunk's cells.
 class engine {
   public:
-    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs);
+    engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, int n_warm = 0);
 
     // The single constructor for the flags a save writes and a load uses. Pure: it reads only the
     // requested format and scope, never the engine capability, so a capability downgrade can only
@@ -178,6 +179,16 @@ class engine {
                               const std::vector<std::string> & contexts,
                               const options &                  opt);
 
+    // Scores a plan against pre-tokenized contexts: the token-replay entry a sidecar uses for a
+    // token snapshot, where the caller owns the token lists. `shared` and `contexts` are the exact
+    // token lists the text entry would produce (shared with special tokens on, contexts with
+    // special tokens off when `shared` is non-empty), so both entries are bit-identical for the
+    // same inputs. A null plan is a caller error.
+    batch_result decide_batch_tokens(const tokens_t &              shared,
+                                     const std::vector<tokens_t> & contexts,
+                                     const compiled_fields &       plan,
+                                     const options &               opt);
+
     // Scores a plan against a sequence that is already decoded (`src`), so a caller answers about a
     // live session without re-prefilling its transcript. One trunk is forked from `src` and decodes
     // only the plan's shared suffix head, prefixed by `tail_before_common`; the branches then start
@@ -186,6 +197,15 @@ class engine {
     // wrong caller cannot score at shifted positions.
     batch_result decide_batch_from_seq(llama_seq_id src, llama_pos base_pos, const compiled_fields & plan,
                                        const options & opt, const std::string & tail_before_common = "");
+
+    // Token-replay entry with a resident warm prefix (the sidecar's session warm cache). The first
+    // call for a `warm_tag` cold-prefills `tokens` into a reserved resident sequence and keeps it;
+    // a later call for the same `warm_tag` forks that resident prefix instead of re-prefilling, so
+    // repeated decisions on one turn cost only the suffix decode. A miss and a hit are bit-identical
+    // (both fork a prefix that holds exactly `tokens`). When the warm tier is off (no resident slots,
+    // `warm_tag` empty, or caching disabled) it falls back to a cold `decide_batch_tokens` replay.
+    batch_result decide_warm(const tokens_t & tokens, const compiled_fields & plan, const options & opt,
+                             const std::string & warm_tag);
 
     // Remove every cell of `count` sequences starting at `first` in this engine's memory.
     void clear_seqs(llama_seq_id first, int count);
@@ -243,6 +263,19 @@ class engine {
     tokens_t            cached;
     std::string         cached_tag;
 
+    // Resident warm prefixes (sidecar session warm cache): a bounded set of sequences above the
+    // engine pool, each holding one session turn's token list decoded and kept resident. Only the
+    // owner's scheduler thread touches them. Touched only through decide_warm.
+    int n_warm_ = 0;
+    struct warm_slot {
+        std::string tag;      // warm identity (session content hash); empty = free
+        llama_pos   pos = -1; // = tokens.size() when filled
+        int64_t     last_used = 0;
+    };
+    std::vector<warm_slot> warm_slots_;
+    int64_t warm_clock_ = 0;
+    static constexpr int WARM_MAX_SLOTS = 8;
+
     mutable std::unordered_map<std::string, tokens_t> token_cache_;
     static constexpr size_t                           token_cache_limit_ = 1024;
 
@@ -279,6 +312,13 @@ class engine {
     void     check_cancel() const;
     void     decode_parts(const std::vector<prompt_part> & parts);
     bool     prepare_prefix(const tokens_t & shared, bool allow_cache, const std::string & tag);
+
+    // resident warm prefix helpers: keep `tokens` decoded on a reserved warm sequence, and pick a
+    // slot (free first, else least-recently-used) for a new warm identity
+    void decode_keep(llama_seq_id seq, const tokens_t & tokens);
+    int  warm_slot_for(const std::string & tag) const;
+    int  alloc_warm_slot();
+    void touch_warm(int idx);
 
     saved_state save_seq(llama_seq_id seq, bool prefer_device, bool partial = false) const;
     void        load_seq(const saved_state & state, llama_seq_id seq) const;

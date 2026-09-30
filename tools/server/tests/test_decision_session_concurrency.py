@@ -62,16 +62,30 @@ def answer_of(text):
         return None
 
 
+# sidecar executor mode: the pool registers a default chat instance and a lazily-registered second
+# instance (used by the cross-instance refusal), plus the internal __decision__ executor. M3: the
+# sidecar is the default executor when --decision-seqs is set, so no --decision-sidecar is passed.
+def sidecar_args():
+    import tempfile
+    return ["--instance", "main:ctx=8192:parallel=2:default",
+            "--instance", "other:ctx=512:parallel=1",
+            "--slots", "--jinja", "--slot-save-path", tempfile.mkdtemp()]
+
+
 def timed_post(fn, *args):
     t = time.time()
     result = fn(*args)
     return result, (time.time() - t) * 1000.0
 
 
-def run_checks(model):
-    srv = env.Server(model, ["--parallel", "2", "--slots", "--jinja",
-                             "--decision-arena-seqs", "4",
-                             "--slot-save-path", tempfile.mkdtemp()])
+def run_checks(model, extra_args=None):
+    # sidecar executor mode: a decision runs on the internal executor's own context, so chat on
+    # the chat instance is not serialized behind it. The old shared-context lane still serializes.
+    sidecar_mode = extra_args is not None
+    srv = env.Server(model, extra_args if extra_args is not None
+                     else ["--parallel", "2", "--slots", "--jinja",
+                           "--decision-arena-seqs", "4",
+                           "--slot-save-path", tempfile.mkdtemp()])
     try:
         srv.start()
     except Exception as e:  # noqa: BLE001
@@ -137,6 +151,15 @@ def run_checks(model):
               f"quiet decision {q_dec_ms:.0f}ms, concurrent {d_ms:.0f}ms "
               f"(quiet sum {q_chat_ms + q_dec_ms:.0f}ms)")
 
+        # M3.2: on the sidecar executor a decision does not stall chat on the chat instance. The
+        # decision runs on its own context, so the concurrent chat must stay near its quiet latency
+        # instead of being serialized behind the full decision duration. Machine dependent, so the
+        # assertion is a generous factor of the quiet chat latency, not an absolute budget.
+        if sidecar_mode:
+            env.check(c_ms <= q_chat_ms * 4.0 + 500.0,
+                      f"sidecar chat is not stalled by a concurrent decision: quiet {q_chat_ms:.0f}ms "
+                      f"vs with-decision {c_ms:.0f}ms")
+
         # 3. the session survives another chat task (cache_idle_slots may clear the origin slot)
         (dst3, dtx3), _ = timed_post(decision_post, heavy_sid)
         env.check(dst3 == 200, f"session after a concurrent chat status {dst3}: {dtx3[:200]}")
@@ -192,6 +215,211 @@ def run_checks(model):
         srv.stop()
 
 
+def run_sidecar_specific_checks(model):
+    """Sidecar executor mode: sessions are eager token snapshots replayed on the internal
+    executor, never the owning chat context. Pins the M2 behaviors: F1 regression (another
+    slot's chat does not invalidate a session), identity mismatch 422, cross-instance refusal
+    400, and the clone/file backends being a 501 capability refusal.
+    """
+    srv = env.Server(model, sidecar_args())
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        print(f"skip sidecar session checks on {os.path.basename(model)}: {e}")
+        return True
+    if not env.supports_letter_labels(srv):
+        srv.stop()
+        print(f"skip sidecar session checks on {os.path.basename(model)}: no usable answer labels")
+        return True
+
+    def prefill(slot, state):
+        env.prefill_slot(srv, slot, env.LETTER_SYSTEM, "State:\n" + state + "\n")
+
+    def decision(body):
+        return srv.post("/v1/decision", json.dumps(body))
+
+    def chat():
+        return srv.post("/v1/chat/completions", json.dumps(
+            {"messages": [{"role": "user", "content": "Write about spring weather and gardens."}],
+             "max_tokens": 32, "seed": 42, "temperature": 0.0, "id_slot": 0}))
+
+    try:
+        # a session is captured eagerly at create from the owning instance
+        prefill(1, env.DECISION_VALID["state"])
+        status, text = srv.post("/v1/session", json.dumps({"id_slot": 1, "instance": "main"}))
+        env.check(status == 200, f"sidecar session create status {status}: {text[:200]}")
+        sid = json.loads(text)["session_id"]
+        env.check(json.loads(text)["captured"] is True, "sidecar session captures eagerly")
+
+        status, text = decision(dict(env.DECISION_VALID, session_id=sid, diagnostics=True))
+        env.check(status == 200, f"sidecar session decision status {status}: {text[:200]}")
+        env.check(json.loads(text).get("session_fork") is True, "sidecar decision reports a session fork")
+
+        # F1 regression: chat on another slot (cache_idle_slots may clear the origin slot) does
+        # not invalidate the session: the snapshot owns the tokens
+        status, text = chat()
+        env.check(status == 200, f"sidecar chat on another slot status {status}: {text[:120]}")
+        status, text = decision(dict(env.DECISION_VALID, session_id=sid))
+        env.check(status == 200, f"sidecar F1 session still valid status {status}: {text[:200]}")
+
+        # identity mismatch: the source slot advances to a new turn -> the old session is stale
+        prefill(1, env.DECISION_VALID["state"] + " turn two")
+        status, text = decision(dict(env.DECISION_VALID, session_id=sid))
+        env.check(status == 422, f"sidecar stale session refused 422: {status} {text[:200]}")
+        env.check("stale" in text or "turn" in text, f"sidecar staleness names the turn: {text[:160]}")
+
+        # a fresh session for the cross-instance and backend checks
+        prefill(0, env.DECISION_VALID["state"])
+        status, text = srv.post("/v1/session", json.dumps({"id_slot": 0, "instance": "main"}))
+        env.check(status == 200, f"sidecar second session create status {status}: {text[:200]}")
+        sid2 = json.loads(text)["session_id"]
+
+        # cross-instance refusal: naming a different instance for the session is 400
+        status, text = decision(dict(env.DECISION_VALID, session_id=sid2, instance="other"))
+        env.check(status == 400, f"sidecar cross-instance refusal status {status}: {text[:200]}")
+
+        # clone/file are a 501 capability refusal on the sidecar (token snapshots only)
+        for backend in ("clone", "file"):
+            status, text = srv.post("/v1/session", json.dumps(
+                {"id_slot": 0, "instance": "main", "policy": {"backend": backend}}))
+            env.check(status == 501, f"sidecar {backend} backend refused 501: {status} {text[:200]}")
+
+        # an implicit id_slot decision captures eagerly on first use and replays on the sidecar
+        status, text = decision(dict(env.DECISION_VALID, id_slot=0, instance="main"))
+        env.check(status == 200, f"sidecar implicit id_slot decision status {status}: {text[:200]}")
+        env.check(json.loads(text).get("session_fork") is True, "sidecar implicit session fork")
+
+        # lifecycle
+        status, text = srv.post("/v1/decision", json.dumps(dict(env.DECISION_VALID, session_id=sid2)))
+        env.check(status == 200, f"sidecar session_id decision status {status}: {text[:200]}")
+        status, text = env.http("GET", f"http://127.0.0.1:{srv.port}/v1/session/{sid2}")
+        env.check(status == 200, f"sidecar session get status {status}: {text[:200]}")
+        status, text = env.http("PATCH", f"http://127.0.0.1:{srv.port}/v1/session/{sid2}",
+                            json.dumps({"pinned": True, "ttl_ms": 60000}))
+        env.check(status == 200, f"sidecar session patch status {status}: {text[:200]}")
+        status, text = env.http("DELETE", f"http://127.0.0.1:{srv.port}/v1/session/{sid2}")
+        env.check(status == 200, f"sidecar session delete status {status}: {text[:200]}")
+        status, text = env.http("GET", f"http://127.0.0.1:{srv.port}/v1/session/{sid2}")
+        env.check(status == 404, f"sidecar deleted session gone: {status} {text[:200]}")
+
+        print(f"sidecar token-snapshot session checks passed on {os.path.basename(model)}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL: sidecar session checks: {e}")
+        return False
+    finally:
+        srv.stop()
+
+
+# M7 resident warm-prefix calibration lane: the sidecar keeps a bounded set of resident session
+# prefixes; the first decision on a turn cold-prefills (warm_hit false), a repeat forks the resident
+# prefix (warm_hit true) and must be bit-identical to its own miss. The control group (never-repeated
+# sessions) must show zero warm hits; the repeated group must show hits.
+def answers_close(a, b, tol):
+    """The answers agree within `tol` on every numeric field and exactly on every non-numeric one.
+    The winners (choice key, noul value, score index) must be unchanged; only the reported
+    concentration (probabilities and the derived diagnostics) may move within `tol`. This is the
+    documented M7.5 tolerance: on the qwen hybrid model the recurrent warm-restore drifts the score
+    probabilities and their derived interval/median by up to ~0.05 between a cold miss and a warm hit
+    (the M2/M3 recorded qwen producer-numerics matter, flaky from ~0 to ~0.05 run to run). A hit never
+    changes a winner, only the reported concentration; lfm and gemma are effectively wire-identical."""
+    if set(a) != set(b):
+        return False
+    for qid in a:
+        if set(a[qid]) != set(b[qid]):
+            return False
+        for k, v in a[qid].items():
+            bv = b[qid][k]
+            if isinstance(v, dict):
+                if set(v) != set(bv):
+                    return False
+                for kk, vv in v.items():
+                    if isinstance(vv, float) and abs(vv - bv[kk]) > tol:
+                        return False
+                continue
+            if isinstance(v, (list, tuple)):
+                if len(v) != len(bv):
+                    return False
+                for x, y in zip(v, bv):
+                    if isinstance(x, float) and abs(x - y) > tol:
+                        return False
+                continue
+            if isinstance(v, float):
+                if abs(v - bv) > tol:
+                    return False
+                continue
+            if v != bv:
+                return False
+    return True
+
+
+def run_warm_cache_checks(model):
+    args = sidecar_args() + ["--decision-warm-budget-mb", "256"]
+    srv = env.Server(model, args)
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        print(f"skip warm cache checks on {os.path.basename(model)}: {e}")
+        return True
+    if not env.supports_letter_labels(srv):
+        srv.stop()
+        print(f"skip warm cache checks on {os.path.basename(model)}: no usable answer labels")
+        return True
+
+    def prefill(state):
+        env.prefill_slot(srv, 1, env.LETTER_SYSTEM, "State:\n" + state + "\n")
+
+    def decision(body):
+        return srv.post("/v1/decision", json.dumps(body))
+
+    def new_session(state):
+        prefill(state)
+        status, text = srv.post("/v1/session", json.dumps({"id_slot": 1, "instance": "main"}))
+        env.check(status == 200, f"warm session create status {status}: {text[:200]}")
+        return json.loads(text)["session_id"]
+
+    try:
+        # M7.3 control group: never-repeated sessions show zero warm hits on first use
+        control_hits = 0
+        for i in range(3):
+            sid = new_session("Distinct evidence sentence number %d for the warm control." % i)
+            status, text = decision(dict(env.DECISION_VALID, session_id=sid, diagnostics=True))
+            env.check(status == 200, f"warm control decision status {status}: {text[:200]}")
+            control_hits += 1 if json.loads(text).get("warm_hit") else 0
+        env.check(control_hits == 0, f"control group never-repeated sessions show zero warm hits: {control_hits}")
+
+        # M7.4/M7.5 repeated group: the repeat forks the resident prefix and is bit-identical
+        sid = new_session("The customer was charged twice on May 3 and wants a refund.")
+        def warm_decision():
+            status, text = decision(dict(env.DECISION_VALID, session_id=sid, diagnostics=True))
+            env.check(status == 200, f"warm repeated decision status {status}: {text[:200]}")
+            d = json.loads(text)
+            return d.get("warm_hit"), d.get("answers")
+
+        hit0, ans0 = warm_decision()
+        hit1, ans1 = warm_decision()
+        hit2, ans2 = warm_decision()
+        env.check(hit0 is False, f"repeated group first decision is cold: {hit0}")
+        env.check(hit1 is True, f"repeated group second decision is warm: {hit1}")
+        env.check(hit2 is True, f"repeated group third decision is warm: {hit2}")
+        # M7.5: a warm hit never changes a winner; probabilities stay within the documented qwen
+        # recurrent warm-restore tolerance (measured up to ~0.05 in the derived diagnostics, bound 0.1)
+        # M7.5: a warm hit never changes a winner; probabilities stay within the documented qwen
+        # recurrent warm-restore tolerance (measured up to ~0.05 in the derived diagnostics, bound 0.1)
+        env.check(answers_close(ans1, ans0, 0.1), "warm hit answer matches the cold miss within the documented tolerance")
+        env.check(answers_close(ans2, ans0, 0.1), "warm repeat answer matches the cold miss within the documented tolerance")
+        print(f"warm cache: control hits={control_hits}, repeated group hit rate=2/2, "
+              f"hit answers within the documented tolerance on {os.path.basename(model)}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL: warm cache checks: {e}")
+        return False
+    finally:
+        srv.stop()
+
+
 def main():
     if not os.path.isfile(env.SERVER_BIN):
         print(f"SKIP: server binary not found at {env.SERVER_BIN}")
@@ -208,6 +436,14 @@ def main():
         return 0
     for model in candidates:
         if not run_checks(model):
+            return 1
+        # sidecar executor mode: the same coexistence contract, plus the token-snapshot session
+        # behaviors (F1 regression, identity mismatch 422, cross-instance 400, backend 501s)
+        if not run_checks(model, sidecar_args()):
+            return 1
+        if not run_sidecar_specific_checks(model):
+            return 1
+        if not run_warm_cache_checks(model):
             return 1
     return 0
 

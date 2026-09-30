@@ -123,6 +123,13 @@ Server flag: `--decision-permutations N` (env `LLAMA_ARG_DECISION_PERMUTATIONS`,
 default 1) sets the pass count for requests that omit `permutations`; an explicit
 request field always wins and the pass cap still applies.
 
+Server executor: when `--decision-seqs` is set and a pool exists (`--instance`),
+every decision runs on the decision sidecar executor - an internal, undeletable
+pool instance with its own context and scheduler thread, built on first decision
+demand. Chat contexts are never written, stalled, or resized by decision work.
+The sidecar is the only pool executor. A `--decision-instance NAME` names a user
+executor instead of the internal one.
+
 Local-only notes: `model` is required here (the external router selects it) and echoed back
 verbatim, matching Jev. `GET /v1/models` keeps the OpenAI model-list shape
 (`{"object":"list","data":[...]}`), not Jev's `{"models":[...]}` shape.
@@ -229,12 +236,14 @@ silent answer about a different turn.
   rendered through the slot's chat template; the transcript is not re-injected
   as `state`, and the request `state` is still required by the shape but not
   re-decoded.
-* Session readout runs full-logits on the shared context, like the stateless
-  path. There is no classifier context and no answer head.
+* Session readout runs full-logits on the decision sidecar executor's context,
+  like the stateless path. There is no classifier context and no answer head.
 * A session fork is exact: `copy` is refused on a recurrent/hybrid model (it
   would not reproduce the slot state), `hybrid`/`restore`/`auto` are accepted.
-* The source slot is never mutated: a decision reads it only to snapshot. After
-  the request, chat on that slot and a repeat decision both keep working.
+* The source slot is never mutated: a decision reads it only to take an owned
+  token snapshot (a bounded copy of the completed turn's tokens and adapter
+  scope). After the request, chat on that slot and a repeat decision both keep
+  working.
 * The response reports the fork additively: `session_fork: true`, `source_slot`,
   and `session_pos` (and `turn` when the request set one). With
   `diagnostics: true`, `diagnostics.permutations` reports the pass count used.
@@ -245,16 +254,21 @@ A client may create a server-side session that outlives the slot's current turn
 and survives the slot's KV being cleared and reused:
 
 - `POST /v1/session` - create. Body: `{"id_slot": N, "turn": "...",
-  "policy": {"backend": "host|clone|file", "capture_on_turn_complete": bool,
-  "pinned": bool, "ttl_ms": N, "max_turns": N}}`. Returns `session_id`, `id_slot`,
-  `turn`, `backend`, and `captured`. `id_slot` alone keeps working byte-identically;
-  `session_id` is additive.
-- `GET /v1/session/{id}` - status: `session_id`, `id_slot`, `turn`, `backend`,
-  `pinned`, `ttl_ms`, `captured`, `bytes`, `created_ms`, `last_used_ms`, and the
-  exact trigger counters (`n_snapshots`, `n_reuses`, `n_releases`,
-  `n_evictions`, `n_ttl_reaps`, `n_sessions`, `bytes_total`, plus
-  `arena_used`/`arena_capacity`: how many reserved sequences are materialized
-  right now, which returns to 0 between decisions for a non-resident backend).
+  "policy": {"pinned": bool, "ttl_ms": N, "max_turns": N}}`. Returns
+  `session_id`, `id_slot`, `turn`, `backend` (`"tokens"`), and `captured`.
+  `id_slot` alone keeps working byte-identically; `session_id` is additive.
+  Capture is eager: the completed turn's tokens and adapter scope are copied out
+  of the owning instance at create, so there is no lazy window for an idle-slot
+  purge to invalidate. `capture_on_turn_complete` is accepted as always true.
+  The legacy `host`/`clone`/`file` backends are not available on the sidecar
+  executor: `clone` and `file` are a 501 capability refusal, never a silent
+  fallback, and `host` is accepted as the token snapshot.
+- `GET /v1/session/{id}` - status: `session_id`, `id_slot`, `turn`, `backend`
+  (`"tokens"`), `pinned`, `ttl_ms`, `captured`, `bytes`, `created_ms`,
+  `last_used_ms`, and the trigger counters (`n_snapshots`, `n_reuses`,
+  `n_releases`, `n_sessions`, `bytes_total`). The arena counters
+  (`arena_used`/`arena_capacity`) are removed: a token snapshot holds no reserved
+  sequence between decisions, so there is no arena to report.
 - `PATCH /v1/session/{id}` - set `pinned` and/or `ttl_ms`.
 - `DELETE /v1/session/{id}` - erase, releasing the owned reference.
 
@@ -264,45 +278,35 @@ ends the session ends with it.
 
 #### Session substrate
 
-A session decision never forks the live slot. The server keeps a decision-owned
-session registry that owns one retained-turn reference per chat slot, materialized
-into reserved sequences (`--decision-arena-seqs N`, default `n_parallel`) or, for
-the `file` backend, onto disk:
+A session decision never forks the live slot. The pool keeps a decision-owned
+token store keyed by (instance, slot, turn) that owns one eager token snapshot
+per retained turn:
 
-- On the first decision referencing a slot's current turn, the server
-  captures the slot's decoded state into the reference and restores it. This is
-  the on-demand capture trigger: a turn that is never queried produces no
-  reference. Later decisions in the same turn fork the reference
-  (`decide_batch_from_seq`) instead of the slot, so the source survives the
-  slot's KV being cleared and reused by `cache_idle_slots`.
+- The snapshot is taken through a read-only pool op on the owning instance's
+  scheduler: it copies the completed turn's tokens and the enabled adapter scope
+  (path/scale list). Only owned copies cross the boundary - no KV pointer,
+  sequence id, or context handle leaves the owning instance. This is the on-demand
+  capture trigger: a turn that is never queried produces no reference. Later
+  decisions in the same turn reuse the snapshot instead of the slot, so the source
+  survives the slot's KV being cleared and reused by `cache_idle_slots`.
 - The retained-turn policy keeps one reference per slot. When the slot decodes
   past the reference's position (a completed new turn), the reference is released
   before the next decision. A slot with no decoded state (no `pos_max`) cannot
   have advanced, so a cleared slot still matches its reference.
-- The reference backend is selected per session (`host` default, `clone`, or
-  `file`). `host` holds the self-contained host-format state bytes in RAM and
-  loads them into a reserved arena sequence only for the duration of a decision,
-  returning the sequence to the pool as soon as the decision ends, so a retained
-  turn never competes with chat for `n_ctx` between decisions. `clone` is a
-  metadata-only cell reference: it shares the source slot's attention cells
-  (plus an owned partial copy for recurrent/hybrid layers), so it pins those
-  cells and reduces the chat free `n_ctx` by the retained turn length while the
-  session lives. It is not a reserved region. `clone` is selectable only on
-  dense unified attention or recurrent/hybrid models (never a sliding-window
-  cache). `file` keeps the turn state on disk under a writable directory and
-  loads it into an arena sequence on demand; it needs `--slot-save-path` or
-  `--decision-session-persist`. A backend that is not selectable on the model or
-  configuration is a capability refusal, never a silent fallback.
-- A live-session decision decodes the question head under the adapter set the
-  slot was prefilled with (the captured scope), so K/V and queries are
-  conditioning-consistent. A stateless decision stays scoped to the base model.
-  Diagnostics report the scope actually used in `adapter_scope`.
+- A session decision runs on the sidecar executor: it re-prefills the owned
+  token list into the executor's own context (mechanism B, token replay) and
+  scores the question head there. The adapter scope is resolved from the pool
+  adapter registry and applied to the executor context, so K/V and queries are
+  conditioning-consistent with the captured scope. A stateless decision stays
+  scoped to the base model. Diagnostics report the scope actually used in
+  `adapter_scope`.
 - A decision on an in-flight slot (`is_processing()`) is a 422: it measures
   task validity (is the turn complete), never confidence.
-- The reference is bound to a `memory_epoch`: a whole-context replace/load or a
-  model reload bumps the epoch, and a reference captured under an older epoch is
-  stale (HTTP 409), never served. `semantic_error` (422) keeps its existing
-  meaning; "stale" and "invalid request" are different outcomes.
+- Identity is a strong content hash over the token list plus the adapter scope,
+  the turn counter, and the source slot. A request whose pinned `turn` or
+  `session_pos` does not match the snapshot is a 422; a session whose source
+  turn advanced is stale (422), never answered from an old turn. A token
+  snapshot is model-epoch independent: a model reload does not make it stale.
 - Lifecycle: a reference is released by `SLOT_ERASE`, by the slot's release
   callback, by an expired TTL (`ttl_ms`, reaped only when a session is older than
   its TTL and never when pinned or held by an in-flight decision), and, under
@@ -353,25 +357,59 @@ Schema object with `properties`:
 
 ### 2.6 Multi-instance routing
 
-In multi-instance mode (`--instance`, one shared weight load) `/v1/decision` and
-`/v1/session` are routed through the same `instance` / `model` fields chat uses,
-from the body or the query string:
+In multi-instance mode (`--instance`, one shared weight load) every decision
+runs on the decision sidecar executor (the internal `__decision__` instance, or
+a `--decision-instance` executor), so decision traffic never writes, stalls, or
+resizes a chat context. Placement is decided by an explicit `target_specified`
+signal computed from the ORIGINAL request fields, never from a stamped pool id;
+the pool id echoed into a decision body is echo-only and never selects a target.
+The `instance` / `model` fields keep their routing role for the parts that still
+need a target:
 
-* A **stateless** decision is dispatched like any generation request: an explicit
-  `instance` (or `<base>:latest:<instance|group>`) selects the context, a group
-  load-balances, and an omitted target uses the default instance. `model` may be
-  omitted; the pool fills its own id in so the response echoes a real model.
-* `--decision-instance NAME` pins stateless decisions that name no target to that
-  exact instance, so an operator can give decisions their own context and
-  scheduler (isolation from chat) without changing clients. The name must match a
-  configured instance; groups are rejected at startup because a dedicated context
-  is the point.
-* A **live-session** decision (`id_slot`/`session_id`) addresses one instance's
-  slot, so it must route to that instance and never to a group (400). The slot is
-  then resolved inside that context; the same slot id in another instance is a
-  different, empty slot.
-* `/v1/session` create/get/patch/delete carry the same routing fields; a session
+* A **stateless** decision carries no placement: the request is dispatched to
+  the sidecar executor directly. `model` is echo-only and never selects a
+  placement target. A bare pool id, a Jev alias (`jev-latest`/`jev-preview`), or
+  an unknown model all answer on the sidecar; `model` itself is still REQUIRED by
+  the contract (a body without it is a 422). `instance` is likewise echo-only on
+  the stateless sidecar path.
+* `--decision-instance NAME` names the executor for stateless decisions that
+  name no target, so an operator can give decisions a named, dedicated context
+  and scheduler (isolation from chat) without changing clients. The name must
+  match a configured instance; groups are rejected at startup because a
+  dedicated context is the point. When it is unset, the internal `__decision__`
+  executor is used. On this legacy executor the `model`/`instance` fields DO
+  place the request: an unknown model is a 400, and a stateless decision may
+  route to any free member of a group (the group refusal applies only to a
+  session-pinned request, which must name its owning instance).
+* A **live-session** decision (`id_slot`/`session_id`) names the instance that
+  owns the source slot (never a group, 400). The pool takes an owned token
+  snapshot of that slot's completed turn through a read-only op and the decision
+  then runs on the sidecar executor; the source slot is never decoded by the
+  decision.
+* `/v1/session` create names the owning instance (never a group, 400); a session
   handle is instance-local, so get/patch/delete must name its owning instance.
+
+Sidecar executor flags (server side):
+
+* `--decision-sidecar-ctx N` - sidecar context size (default 0 = the largest
+  configured instance window).
+* `--decision-sidecar-prebuild` - build the sidecar context eagerly at startup
+  instead of lazily on the first decision.
+* `--decision-timeout-ms N` - server-side deadline for a whole decision (default
+  0 = none); on expiry the request answers 503 + Retry-After, never a partial
+  answer.
+* `--decision-max-queue N` - concurrent decision cap (default 4); beyond it the
+  request answers 429, above twice it 529. `LLAMA_DECISION_MAX_BODY` and the
+  env-var overrides still apply.
+* `--decision-warm-budget-mb N` - KV budget (mebibytes) for the sidecar's resident
+  session warm prefixes (default 0 = the warm tier is off). With a positive budget
+  the sidecar reserves warm sequences (roughly `budget / (per-cell bytes x n_ctx)`,
+  capped at 8); the first decision on a session turn cold-prefills it into a kept
+  resident sequence and a follow-up decision on the same turn forks that prefix
+  instead of re-prefilling. A hit is wire-identical to a miss on every model; on the
+  qwen hybrid the recurrent warm-restore can drift the reported score concentration
+  by up to ~0.05 (the documented producer-numerics matter), never the winner. The
+  budget is a rough VRAM cap, not exact accounting.
 
 ---
 
@@ -592,10 +630,10 @@ same value.
 | contexts per generic request | `DECISION_MAX_CONTEXTS` |
 | answer-label pool | `LABEL_POOL_CAP` (equal to `DECISION_MAX_CHOICE_OPTIONS`) |
 | request body | `LLAMA_DECISION_MAX_BODY` (default 2 MiB) |
-| concurrent decisions | `LLAMA_DECISION_MAX_QUEUE` (default 4), then 429/529 |
-| retained session references | one per chat slot; `--decision-arena-seqs` sets the reserved-sequence pool; `--decision-session-budget-mb` sets the byte budget (0 = unlimited) and `--decision-session-ttl` sets the default expiry (0 = none) |
-| reserved-sequence residency | `host`/`file` materialize only during a decision (`arena_used` returns to 0); `clone` pins shared cells for the session lifetime |
-| multi-instance routing | `instance`/`model` body or query fields; sessions pin to the owning instance, groups are refused for session requests; `--decision-instance NAME` pins stateless decisions that name no target |
+| concurrent decisions | `--decision-max-queue` (default 4, env `LLAMA_DECISION_MAX_QUEUE`), then 429/529; `--decision-timeout-ms` (env `LLAMA_DECISION_TIMEOUT_MS`) sets the server-side deadline |
+| retained session references | one per chat slot; token snapshots hold only the owned token list plus adapter scope (`bytes` reports that), `--decision-session-budget-mb` sets the byte budget (0 = unlimited) and `--decision-session-ttl` sets the default expiry (0 = none) |
+| session residency | token snapshots are non-resident by design: they hold no context cells between decisions (no arena, no `arena_used`) |
+| multi-instance routing | `instance`/`model` body or query fields; sessions pin to the owning instance, groups are refused for session requests; all decisions run on the decision sidecar executor |
 | trie fields / values per field | 1-32 fields, 1-255 values |
 
 The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (255); the label-pool
@@ -664,23 +702,28 @@ Rules:
   surface-form values.
 - **branch / trunk / prefix**: one KV sequence per scored path; a trunk is
   `shared prefix + context`; the prefix is the cacheable head.
-- **session fork**: answering `id_slot` or `session_id` by forking the slot's
-  owned reference instead of re-prefilling `state`; the source slot is read-only.
-- **session reference / retained turn**: the owned copy of a completed turn's
-  decoded state, taken on the first decision for that turn, reused by later
-  decisions in the same turn, and released when the turn advances. One retained
-  turn per slot. `turn` is the opaque client tag that pins the reference.
+- **session fork**: answering `id_slot` or `session_id` by replaying the slot's
+  owned token snapshot on the decision sidecar executor instead of re-prefilling
+  `state`; the source slot is read-only.
+- **session reference / retained turn**: the owned token snapshot of a completed
+  turn's tokens and adapter scope, taken eagerly at session create (or on the
+  first `id_slot` decision for that turn), reused by later decisions in the same
+  turn, and released when the turn advances. One retained turn per slot. `turn`
+  is the opaque client tag that pins the reference.
 - **session handle / `session_id`**: a first-class, server-side session identity
   decoupled from the reused `id_slot`, with an explicit create/query/pin/erase
   lifecycle over `/v1/session`.
-- **session backend**: how a retained turn is referenced (`host`: owned host-format
-  copy in a reserved sequence; `clone`: metadata-only shared cells; `file`: state
-  on disk). Selected per session; a non-selectable backend is a capability refusal.
+- **session backend**: how a retained turn is referenced. The sidecar executor
+  uses the single `tokens` backend: the owned token list plus adapter scope,
+  replayed into the executor's context on demand. `clone`/`file` are a 501
+  capability refusal; a non-selectable backend is never a silent fallback.
 - **session manifest**: the sidecar a slot save co-writes, bound to the slot file
   by its content hash, that a slot restore uses to rebind or refuse the retained
   reference - a restore never answers from a stale turn.
-- **memory epoch**: a monotonic counter over the context's memory generations; a
-  retained reference captured under an older epoch is stale (HTTP 409), never served.
+- **decision sidecar executor**: the internal pool instance (or a
+  `--decision-instance` executor) that owns every decision, stateless and
+  session, on its own context and scheduler thread; chat contexts are never
+  written, stalled, or resized by decision work.
 - **producer confidence vs task value**: two DIFFERENT axes (Section 6). Never
   use a confidence number to gate caching/admission/correctness.
 - **closed-world probabilities**: `probabilities` are conditional on the

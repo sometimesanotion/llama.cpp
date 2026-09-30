@@ -2145,6 +2145,20 @@ may also carry `snapshot` (apply a saved KV snapshot, see below) and `id_slot` (
 Group dispatch picks the member with the fewest busy slots, then the least recently used,
 waiting up to `--instance-wait` seconds for a free member before returning `503`.
 
+The decision API (`/v1/decision`, `/v1/session`) follows the same routing, with one
+difference: in sidecar mode (the default when `--decision-seqs` is set and a pool exists)
+every decision runs on the internal `__decision__` executor instance, and the `model` /
+`instance` fields are echo-only for a stateless decision - they never select a target. The
+sidecar is sized with `--decision-sidecar-ctx` (default: the largest instance window),
+built lazily on the first decision (or eagerly with `--decision-sidecar-prebuild`), bounded
+by `--decision-max-queue` (429 / 529) and `--decision-timeout-ms` (503 + Retry-After). A
+`--decision-warm-budget-mb N` budget (default 0 = off) makes the sidecar keep recent session
+turns resident and fork them on a repeat instead of re-prefilling; a hit is wire-identical to
+a miss on every model (only the qwen recurrent warm-restore can move the reported score
+concentration by up to ~0.05, never the winner). A
+live-session decision and every `/v1/session` lifecycle call still name the instance that
+owns the source slot and are never group-routed.
+
 Endpoints without a `model` field (`/health`, `/props`, `/tokenize`, `/detokenize`,
 `/apply-template`, `/control`) run on the `default` instance. `/metrics` renders the
 resolved target instance (the default when untargeted, `404` for an unbuilt target, `400`

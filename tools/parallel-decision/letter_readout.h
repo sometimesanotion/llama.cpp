@@ -45,6 +45,7 @@ std::string letter_answer_tail(const std::string & after);
 
 struct letter_metrics {
     bool   cache_hit      = false;
+    bool   warm_hit       = false; // a resident warm prefix was forked instead of a cold replay
     size_t shared_tokens  = 0;
     size_t context_tokens = 0;         // sum over contexts
     std::vector<size_t> per_context_tokens; // one entry per context
@@ -93,9 +94,14 @@ void verify_letter_request(const label_vocab & vocab, const std::string & tail,
 // A live chat sequence to answer about instead of a stateless prompt. The readout forks `seq` at
 // `base_pos` and appends only the decision turn, so the transcript is never re-prefilled and the
 // source sequence is never mutated. Session forks run full logits on the shared context.
+// `tokens` is the token-replay alternative (sidecar executor): the caller owns the completed
+// turn's token list, so the readout re-prefills it and continues from its end; `seq`/`base_pos`
+// are unused. Exactly one of the two is set.
 struct session_source {
     llama_seq_id seq      = -1;
     llama_pos    base_pos = -1;
+    const tokens_t * tokens = nullptr; // owned token snapshot to replay; null for a sequence fork
+    std::string warm_tag;              // resident warm identity (session content hash); empty = cold replay
 };
 
 // The context a letter request runs on: the shared full-logits engine. When `session` is set the

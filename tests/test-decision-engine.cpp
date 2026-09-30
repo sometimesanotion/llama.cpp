@@ -7049,8 +7049,197 @@ static void test_decide_batch_plan_overload(testing & t) {
     });
 }
 
+// The token entry and the text entry must be bit-identical for the same inputs: the token
+// replay path a sidecar uses for a snapshot must never drift from the text path, or a replay
+// would answer differently from the original decision. Both runs decode the same token lists.
+static bool token_entries_identical(const llama_decision::batch_result & a, const llama_decision::batch_result & b) {
+    bool same = a.items.size() == b.items.size() && a.shared_tokens == b.shared_tokens &&
+                a.rows == b.rows && a.suffix_tokens == b.suffix_tokens &&
+                a.common_suffix_tokens == b.common_suffix_tokens && a.leaf_suffix_tokens == b.leaf_suffix_tokens;
+    for (size_t i = 0; same && i < a.items.size(); ++i) {
+        const auto & ia = a.items[i];
+        const auto & ib = b.items[i];
+        same = ia.context_tokens == ib.context_tokens && ia.rows == ib.rows &&
+               ia.fields.size() == ib.fields.size();
+        for (size_t f = 0; same && f < ia.fields.size(); ++f) {
+            same = ia.fields[f].winner == ib.fields[f].winner && ia.fields[f].tree == ib.fields[f].tree &&
+                   ia.fields[f].scored_nodes == ib.fields[f].scored_nodes &&
+                   ia.fields[f].probs.size() == ib.fields[f].probs.size();
+            for (size_t k = 0; same && k < ia.fields[f].probs.size(); ++k) {
+                same = std::fabs(ia.fields[f].probs[k] - ib.fields[f].probs[k]) <= 1e-6f;
+            }
+        }
+    }
+    return same;
+}
+
+static void token_entry_equality_run(testing & t, llama_decision::engine & eng, const std::string & lane) {
+    const std::string                        shared_text = "Answer the questions about the customer.";
+    const std::string                        context_text = "The customer was charged twice on May 3.";
+    const std::vector<llama_decision::field_input> inputs = {
+        { "\nrefund: ", { "yes", "no" }, 1.0f },
+        { "\ndept: ",   { "billing", "technical", "cancellation" }, 1.0f },
+        { "\nscore: ",  { "calm", "upset", "furious" }, 1.0f },
+    };
+    llama_decision::options opt;
+    opt.mode        = "tree";
+    opt.allow_cache = false; // isolate the entry comparison from prefix-cache reuse
+
+    const llama_decision::compiled_fields plan = eng.compile_fields(inputs, opt);
+    const llama_decision::batch_result    text = eng.decide_batch(plan, shared_text, { context_text }, opt);
+
+    // the exact token lists the text entry produces: shared with special tokens on,
+    // context with them off when the shared list is non-empty
+    const llama_decision::tokens_t              shared_toks = eng.tokenize(shared_text, true);
+    const std::vector<llama_decision::tokens_t> ctx_toks    = { eng.tokenize(context_text, shared_toks.empty()) };
+
+    const llama_decision::batch_result toks =
+        eng.decide_batch_tokens(shared_toks, ctx_toks, plan, opt);
+
+    t.assert_true(lane + ": the token entry returns the same item count as the text entry",
+                  toks.items.size() == text.items.size());
+    t.assert_true(lane + ": the token entry is bit-identical to the text entry", token_entries_identical(text, toks));
+    t.assert_true(lane + ": both entries score at least one field",
+                  !text.items.empty() && !text.items[0].fields.empty());
+}
+
 // A classifier-only context has no logits, so the engine refuses a request without a covering
 // head before any decode instead of reaching gather_candidates and reading a null buffer.
+
+static void test_token_entry_equality(testing & t) {
+    t.test("the token entry reproduces the text entry on the CPU scaffold", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 512, false)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            llama_decision::engine eng(te.ctx, 2, 8);
+            token_entry_equality_run(t, eng, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU token entry runs: ") + e.what(), false);
+        }
+    });
+
+    t.test("the token entry reproduces the text entry on the loaded model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("model loads", false);
+            return;
+        }
+        try {
+            llama_decision::engine eng(te.ctx, 2, 8);
+            token_entry_equality_run(t, eng, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU token entry runs: ") + e.what(), false);
+        }
+    });
+}
+
+// The resident warm-prefix tier (sidecar session warm cache): the first decision on a warm_tag
+// cold-prefills the turn's tokens into a kept resident sequence; a repeat forks it instead of
+// re-prefilling. A hit must be bit-identical to its own miss (M7.5), the first call must report a
+// miss and a repeat a hit (M7.3/M7.4), and a full cache must LRU-evict while staying exact.
+static void warm_resident_run(testing & t, llama_decision::engine & eng, llama_context * ctx, const std::string & lane) {
+    const std::vector<llama_decision::field_input> fields = {
+        { "\nrefund: ", { "yes", "no" }, 1.0f },
+        { "\ndept: ",   { "billing", "technical", "cancellation" }, 1.0f },
+    };
+    llama_decision::options opt;
+    opt.mode = "tree";
+    const llama_decision::compiled_fields plan = eng.compile_fields(fields, opt);
+    const llama_vocab * vocab = llama_model_get_vocab(eng.get_model());
+    // a turn long enough that re-prefilling would dominate, like a real session snapshot
+    std::string context_text;
+    for (int i = 0; i < 25; ++i) {
+        context_text += "The customer was charged twice on May 3. ";
+    }
+    const llama_decision::tokens_t tokens = common_tokenize(vocab, context_text, true, true);
+
+    const auto run = [&](const std::string & tag) {
+        const auto cold = eng.decide_warm(tokens, plan, opt, tag);
+        const auto warm = eng.decide_warm(tokens, plan, opt, tag);
+        t.assert_true(lane + " " + tag + " first decision cold-prefills", !cold.warm_hit);
+        t.assert_true(lane + " " + tag + " repeat forks the resident prefix", warm.warm_hit);
+        t.assert_true(lane + " " + tag + " repeat is bit-identical to its miss",
+                      token_entries_identical(cold, warm));
+    };
+
+    t.test(lane + " a repeated session hits a resident prefix bit-identically", [&](testing &) {
+        run("warm-A");
+    });
+
+    t.test(lane + " a full warm cache LRU-evicts a session and re-warms it exactly", [&](testing &) {
+        // two slots: three sessions must evict the least-recently-used one
+        run("warm-B"); // slot 1
+        run("warm-C"); // evicts warm-A's slot
+        const auto againA = eng.decide_warm(tokens, plan, opt, "warm-A");
+        t.assert_true(lane + " the LRU-evicted session is cold again (evicted)", !againA.warm_hit);
+        const auto againAwarm = eng.decide_warm(tokens, plan, opt, "warm-A");
+        t.assert_true(lane + " the re-warmed session hits", againAwarm.warm_hit);
+        t.assert_true(lane + " the re-warmed session is bit-identical",
+                      token_entries_identical(againA, againAwarm));
+    });
+
+    t.test(lane + " the warm tier is off with no resident slots and stays exact", [&](testing &) {
+        // a separate engine on the same context with n_warm=0 falls back to cold replay; its pool
+        // range [2,10) is disjoint from the two resident warm slots [10,12) of `eng`
+        llama_decision::engine eng0(ctx, 2, 8);
+        const auto a = eng0.decide_warm(tokens, plan, opt, "tag");
+        const auto b = eng0.decide_warm(tokens, plan, opt, "tag");
+        t.assert_true(lane + " no warm slots means cold replay", !a.warm_hit && !b.warm_hit);
+        t.assert_true(lane + " cold replay is bit-identical", token_entries_identical(a, b));
+    });
+}
+
+static void test_warm_resident_cache(testing & t) {
+    t.test("warm resident cache on the CPU scaffold", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        // n_ctx 2048, n_seq_max 12: engine pool [2, 10), two resident warm slots [10, 12)
+        if (!te.load(path, 2048, false, 128, 12)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        try {
+            llama_decision::engine eng(te.ctx, 2, 8, 2); // two resident warm slots
+            warm_resident_run(t, eng, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("warm resident cache CPU run: ") + e.what(), false);
+        }
+    });
+
+    t.test("warm resident cache on the loaded model", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path, 12)) {
+            t.assert_true("model loads", false);
+            return;
+        }
+        try {
+            llama_decision::engine eng(te.ctx, 2, 8, 2); // two resident warm slots
+            warm_resident_run(t, eng, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("warm resident cache GPU run: ") + e.what(), false);
+        }
+    });
+}
 
 static void test_prefix_cache_coherence(testing & t) {
     t.test("prefix cache never hits across a changed identity", [](testing & t) {
@@ -9803,6 +9992,8 @@ int main(int argc, char ** argv) {
         test_session_baseline(t);
         test_compile_fields_plan(t);
         test_decide_batch_plan_overload(t);
+        test_token_entry_equality(t);
+        test_warm_resident_cache(t);
         test_prefix_cache_coherence(t);
         test_token_cache(t);
         test_prefix_reuse(t);

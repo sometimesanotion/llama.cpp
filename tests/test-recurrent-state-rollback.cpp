@@ -132,9 +132,10 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     };
 
     if (llama_n_rs_seq(ctx_roll) < n_rollback) {
-        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        fprintf(stderr, "%s : SKIP: n_rs_seq is too small to exercise the recurrent rollback machinery; "
+                        "this run is NOT green\n", __func__);
         cleanup();
-        return true;
+        return false;
     }
 
     const auto tok = [&](uint32_t seq, llama_pos pos) {
@@ -279,10 +280,11 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     }
 
     if (llama_n_rs_seq(ctx_src) == 0) {
-        fprintf(stderr, "%s : skipping because n_rs_seq is disabled\n", __func__);
+        fprintf(stderr, "%s : SKIP: n_rs_seq is disabled on this model; the recurrent rollback "
+                        "machinery was not exercised and this run is NOT green\n", __func__);
         llama_free(ctx_src);
         llama_free(ctx_dst);
-        return 0;
+        return 2;
     }
 
     std::vector<llama_token> tokens;
@@ -294,10 +296,11 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     const uint32_t n_rs_seq = llama_n_rs_seq(ctx_src);
     constexpr uint32_t n_rollback = 3;
     if (n_rs_seq < n_rollback) {
-        fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
+        fprintf(stderr, "%s : SKIP: n_rs_seq (%u) is too small to exercise the recurrent rollback "
+                        "machinery; this run is NOT green\n", __func__, n_rs_seq);
         llama_free(ctx_src);
         llama_free(ctx_dst);
-        return 0;
+        return 2;
     }
     if (tokens.empty()) {
         fprintf(stderr, "%s : not enough prompt tokens\n", __func__);
@@ -457,8 +460,9 @@ int main(int argc, char ** argv) {
     }
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
-        fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
-        return 0;
+        fprintf(stderr, "%s : SKIP: model cannot provide n_rs_seq (non-recurrent); the recurrent "
+                        "rollback machinery was not exercised and this run is NOT green\n", __func__);
+        return 2;
     }
 
     for (uint8_t fill : { 0, 0x3e }) {

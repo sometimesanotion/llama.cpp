@@ -212,11 +212,19 @@ std::string make_prefix_tag(const std::string & system_text, const std::string &
 
 // ---------------------------------------------------------------- engine
 
-engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs)
+engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, int n_warm)
     : ctx(ctx), model(llama_get_model(ctx)), vocab(llama_model_get_vocab(llama_get_model(ctx))),
-      mem(llama_get_memory(ctx)), seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1) {
+      mem(llama_get_memory(ctx)), seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1),
+      n_warm_(std::clamp(n_warm, 0, WARM_MAX_SLOTS)) {
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
+    }
+    // The resident warm prefixes live in the sequences directly above the engine pool, so a caller
+    // that sized them into n_seq_max can ask the engine to keep session prefixes resident. They are
+    // separate from the engine pool and survive between decisions.
+    warm_slots_.reserve((size_t) n_warm_);
+    for (int i = 0; i < n_warm_; ++i) {
+        warm_slots_.push_back({ std::string(), -1, 0 });
     }
     const int n_swa = llama_model_n_swa(model);
     if (n_swa > 0) {
@@ -406,6 +414,66 @@ void engine::clear_seqs(llama_seq_id first, int count) {
 
 void engine::clear_pool_seqs() {
     clear_seqs(seq_pool, n_pool);
+}
+
+// Keep `tokens` decoded on a reserved warm sequence so a follow-up decision can fork it instead of
+// re-prefilling. The sequence is cleared first so a reused (evicted) slot never carries stale cells
+// from a different session.
+void engine::decode_keep(llama_seq_id seq, const tokens_t & tokens) {
+    llama_memory_seq_rm(mem, seq, -1, -1);
+    decode_parts({ { &tokens, 0, seq } });
+    llama_synchronize(ctx);
+}
+
+int engine::warm_slot_for(const std::string & tag) const {
+    for (size_t i = 0; i < warm_slots_.size(); ++i) {
+        if (warm_slots_[i].tag == tag) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+int engine::alloc_warm_slot() {
+    for (size_t i = 0; i < warm_slots_.size(); ++i) {
+        if (warm_slots_[i].tag.empty()) {
+            return (int) i;
+        }
+    }
+    // all slots used: evict the least-recently-used one
+    int lru = 0;
+    for (size_t i = 1; i < warm_slots_.size(); ++i) {
+        if (warm_slots_[i].last_used < warm_slots_[lru].last_used) {
+            lru = (int) i;
+        }
+    }
+    return lru;
+}
+
+void engine::touch_warm(int idx) {
+    warm_slots_[idx].last_used = ++warm_clock_;
+}
+
+batch_result engine::decide_warm(const tokens_t & tokens, const compiled_fields & plan, const options & opt,
+                                 const std::string & warm_tag) {
+    // The warm tier is off (no resident slots, no identity, or caching disabled): replay cold.
+    if (warm_tag.empty() || warm_slots_.empty() || !opt.allow_cache) {
+        return decide_batch_tokens({}, { tokens }, plan, opt);
+    }
+    int slot = warm_slot_for(warm_tag);
+    bool hit = slot >= 0;
+    if (slot < 0) {
+        slot = alloc_warm_slot();
+        const llama_seq_id seq = seq_pool + (llama_seq_id) n_pool + slot;
+        decode_keep(seq, tokens);
+        warm_slots_[slot].tag = warm_tag;
+        warm_slots_[slot].pos = (llama_pos) tokens.size();
+    }
+    touch_warm(slot);
+    const llama_seq_id seq = seq_pool + (llama_seq_id) n_pool + slot;
+    batch_result b = decide_batch_from_seq(seq, (llama_pos) tokens.size(), plan, opt);
+    b.warm_hit = hit;
+    return b;
 }
 
 // Decode several prompts, each on its own sequence, packed into as few batches as n_batch allows.
@@ -769,20 +837,38 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
     if (plan.p == nullptr) {
         throw std::runtime_error("the decision plan is empty");
     }
+    const tokens_t shared = tokenize(shared_text, true);
+    std::vector<tokens_t> prefixes;
+    prefixes.reserve(contexts.size());
+    for (const auto & text : contexts) {
+        prefixes.push_back(tokenize(text, shared.empty()));
+    }
+    return decide_batch_tokens(shared, prefixes, plan, opt);
+}
+
+batch_result engine::decide_batch_tokens(const tokens_t &              shared,
+                                         const std::vector<tokens_t> & contexts,
+                                         const compiled_fields &       plan,
+                                         const options &               opt) {
+    if (opt.mode != "auto" && opt.mode != "tree" && opt.mode != "greedy") {
+        throw std::invalid_argument("mode must be auto, tree or greedy");
+    }
+    if (contexts.empty()) {
+        throw std::invalid_argument("a decision needs at least one context");
+    }
+    if (plan.p == nullptr) {
+        throw std::runtime_error("the decision plan is empty");
+    }
+    for (const auto & p : contexts) {
+        if (p.empty()) {
+            throw std::invalid_argument("the decision context must not be empty");
+        }
+    }
     select_fork(opt.fork);
     stop_  = opt.should_stop;
     yield_ = opt.yield;
     llama_synchronize(ctx); // drain any work left by the previous decision before reusing sequences
     check_cancel();
-    const tokens_t shared = tokenize(shared_text, true);
-    std::vector<tokens_t> prefixes;
-    for (const auto & text : contexts) {
-        prefixes.push_back(tokenize(text, shared.empty()));
-        if (prefixes.back().empty()) {
-            throw std::invalid_argument("the decision context must not be empty");
-        }
-    }
-
     const std::vector<decision_field> & fields          = plan.p->fields;
     const tokens_t &                    plan_common     = plan.p->plan_common;
     const int                           total           = plan.rows;
@@ -791,7 +877,7 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
     const size_t                        leaf_suffix_tokens = plan.leaf_suffix_tokens;
 
     // every trunk decodes its context plus the hoisted suffix head; branches start after it
-    std::vector<tokens_t> tails = prefixes;
+    std::vector<tokens_t> tails = contexts;
     if (!plan_common.empty()) {
         for (auto & t : tails) {
             t.insert(t.end(), plan_common.begin(), plan_common.end());
@@ -880,7 +966,7 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
         for (size_t i = 0; i < n_group; ++i) {
             runs.push_back({ seq_pool + (llama_seq_id) i,
                              (llama_pos) (shared.size() + tails[g0 + i].size()),
-                             g0 + i, prefixes[g0 + i].size() });
+                             g0 + i, contexts[g0 + i].size() });
         }
         run_trunk_wave(out, plan, runs, opt.bypass);
     }

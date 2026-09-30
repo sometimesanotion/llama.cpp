@@ -241,12 +241,19 @@ const common_chat_templates * tmpls, bool use_jinja,
         }
     }
 
+    // A session forks the decoded source sequence (in-context) or replays an owned token snapshot
+    // (sidecar executor). Replay re-prefills the token list into the engine's own sequences, so the
+    // two are wire-identical for the same turn (mechanism B); it never touches the source instance.
+    // A resident warm prefix (warm_tag) makes the replay a fork of a kept prefix on follow-up.
     const batch_result b = session
-        ? sources.full->decide_batch_from_seq(sources.session->seq, sources.session->base_pos, plan, readout_opt)
+        ? (sources.session->tokens != nullptr
+            ? sources.full->decide_warm(*sources.session->tokens, plan, readout_opt, sources.session->warm_tag)
+            : sources.full->decide_batch_from_seq(sources.session->seq, sources.session->base_pos, plan, readout_opt))
         : sources.full->decide_batch(plan, split.first, states, readout_opt);
 
     if (metrics) {
         metrics->cache_hit      = b.cache_hit;
+        metrics->warm_hit       = b.warm_hit;
         metrics->shared_tokens  = b.shared_tokens;
         metrics->prefill_ms     = b.prefill_ms;
         metrics->scoring_ms     = b.scoring_ms;

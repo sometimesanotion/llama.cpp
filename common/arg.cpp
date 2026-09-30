@@ -894,16 +894,39 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     // the decision endpoint is enabled by --decision-seqs alone; the other decision flags tune it
-    // and have no effect without it
+    // and have no effect without it. the sidecar is now the default executor, so only an explicit
+    // --decision-sidecar counts as a flag that requires --decision-seqs.
     if (params.n_seq_decision == 0 &&
         (!params.decision_temperature.empty() || !params.decision_contract.empty() ||
-         params.n_decision_permutations != 1 || !params.decision_instance.empty())) {
+         params.n_decision_permutations != 1 || !params.decision_instance.empty() ||
+         (params.decision_sidecar_explicit && params.decision_sidecar) || params.decision_sidecar_ctx != 0 ||
+         params.decision_warm_budget_mb > 0)) {
         throw std::invalid_argument("error: --decision-* flags require --decision-seqs (the decision endpoint is disabled without it)\n");
     }
 
     // a decision instance only exists in a pool; naming one without --instance can never resolve
     if (!params.decision_instance.empty() && params.instances.empty()) {
         throw std::invalid_argument("error: --decision-instance requires at least one --instance\n");
+    }
+
+    // the sidecar executor is the default decision executor when a pool exists and decisions
+    // are enabled; a named --decision-instance selects the legacy in-context executor instead.
+    // a single-context server has no pool to host the sidecar, so the legacy path stays the default.
+    if (!params.decision_sidecar_explicit) {
+        params.decision_sidecar = params.n_seq_decision > 0 && !params.instances.empty() &&
+                                  params.decision_instance.empty();
+    }
+
+    // the internal sidecar executor is a pool instance; an explicit --decision-sidecar without a
+    // pool can never resolve, so it is a usage error (the default falls back to the legacy path)
+    if (params.decision_sidecar_explicit && params.decision_sidecar && params.instances.empty()) {
+        throw std::invalid_argument("error: --decision-sidecar requires at least one --instance\n");
+    }
+
+    // an explicit sidecar and a named decision instance are two placements for the same decisions;
+    // demanding both is ambiguous
+    if (params.decision_sidecar_explicit && params.decision_sidecar && !params.decision_instance.empty()) {
+        throw std::invalid_argument("error: --decision-sidecar and --decision-instance are mutually exclusive\n");
     }
 
     // decision branches fork from the prompt with llama_memory_seq_cp, which needs one unified
@@ -2658,7 +2681,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_DECISION_SESSION_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
             {"--decision-session-budget-mb"}, "N",
-            string_format("byte budget for all retained-turn references, mebibytes (default: %d = unlimited; a capture that would exceed it is refused until the eviction calibration lands)", params.decision_session_budget_mb),
+            string_format("byte budget for all retained token-snapshot references (the owned token lists), mebibytes (default: %d = unlimited; a create that would exceed it is refused)", params.decision_session_budget_mb),
             [](common_params & params, int value) {
                 if (value < 0) {
                     throw std::invalid_argument("--decision-session-budget-mb needs a non-negative count");
@@ -2680,6 +2703,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.decision_instance = value;
             }
         ).set_env("LLAMA_ARG_DECISION_INSTANCE").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-sidecar"},
+            string_format("run decisions on an internal sidecar executor instance (its own context and scheduler thread, undeletable, built on first decision demand). the sidecar is the default executor when a pool exists (default: %s)", params.decision_sidecar ? "on" : "off"),
+            [](common_params & params) {
+                params.decision_sidecar = true;
+                params.decision_sidecar_explicit = true;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SIDECAR").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-sidecar-ctx"}, "N",
+            string_format("context size for the decision sidecar executor (default: %d = the largest configured instance window; 0 = inherit the model default)", params.decision_sidecar_ctx),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-sidecar-ctx needs a non-negative count");
+                }
+                params.decision_sidecar_ctx = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SIDECAR_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-sidecar-prebuild"},
+            string_format("build the decision sidecar executor context eagerly at startup instead of lazily on the first decision (default: %s)", params.decision_sidecar_prebuild ? "on" : "off"),
+            [](common_params & params) {
+                params.decision_sidecar_prebuild = true;
+            }
+        ).set_env("LLAMA_ARG_DECISION_SIDECAR_PREBUILD").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-warm-budget-mb"}, "MB",
+            string_format("KV budget for the decision sidecar's resident session warm prefixes, mebibytes (default: %d = warm tier off; a follow-up decision on the same session forks a resident prefix instead of re-prefilling. the budget bounds the reserved warm sequences; a larger budget keeps more sessions resident).", (int) params.decision_warm_budget_mb),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-warm-budget-mb needs a non-negative count");
+                }
+                params.decision_warm_budget_mb = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_WARM_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-timeout-ms"}, "N",
+            string_format("server-side deadline for a whole decision, milliseconds (default: %d, calibrated as max(30 s, 4x p99 cold-prefill) on the reference GPU from the M8 measurement; 0 = none; on expiry the request answers 503 + Retry-After, never a partial answer)", params.decision_timeout_ms),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("--decision-timeout-ms needs a non-negative count");
+                }
+                params.decision_timeout_ms = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_TIMEOUT_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--decision-max-queue"}, "N",
+            string_format("concurrent decision cap (default: %d; beyond it the request answers 429, above twice it 529)", params.decision_max_queue),
+            [](common_params & params, int value) {
+                if (value < 1) {
+                    throw std::invalid_argument("--decision-max-queue needs at least 1");
+                }
+                params.decision_max_queue = value;
+            }
+        ).set_env("LLAMA_ARG_DECISION_MAX_QUEUE").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

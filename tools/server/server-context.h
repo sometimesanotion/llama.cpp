@@ -142,6 +142,13 @@ struct server_context {
     // used to wake requests waiting for a free instance in a group
     void set_slot_release_callback(std::function<void(int /* id_slot */)> callback);
 
+    // manager-only (sidecar executor): install the resolver the decision route calls with the
+    // snapshot key embedded in a routed session body, to fetch the pool-owned token snapshot for
+    // the in-flight request. the pool owns the store and the adapter refs; the snapshot is a
+    // read-only owned copy that stays valid for the task.
+    using decision_snapshot_resolver_fn = std::function<std::shared_ptr<server_decision_snapshot>(const std::string & key)>;
+    void set_decision_snapshot_resolver(decision_snapshot_resolver_fn resolver);
+
     // manager-only: two-phase snapshot switching. slot_save_copy() copies the slot KV to
     // a host buffer on the scheduler thread (bounded GPU->host transfer, no file I/O); the
     // manager writes that buffer to disk on its pool I/O worker. slot_restore_apply() applies
@@ -151,6 +158,12 @@ struct server_context {
     // KV-size-scaled compose deadline (ms since epoch); -1 waits forever. returns nullptr on timeout.
     server_task_result_ptr slot_save_copy(int id_slot, int64_t deadline_ms = -1);
     server_task_result_ptr slot_restore_apply(int id_slot, std::vector<uint8_t> buffer, llama_tokens tokens, int64_t deadline_ms = -1);
+
+    // manager-only: copy a completed turn's tokens and enabled adapter scope off the scheduler
+    // thread. the result is an owned copy (tokens + path/scale lora list, no pointers); the source
+    // slot is read-only and its KV is never touched. a processing slot or one without decoded
+    // state is an error result. same deadline contract as instance_op.
+    server_task_result_ptr slot_decision_snapshot(int id_slot, int64_t deadline_ms = -1);
 
     // replace the instance's adapter set. the caller must hold the pool's
     // instance_drain_guard (no slot processing, no interleaving save/restore) and

@@ -80,9 +80,10 @@ static common_speculative_output_limits server_output_limits(const common_params
     // /decision scores one output row per branch sequence, all in the same ubatch. Chat and
     // decision decodes never run at the same time on the one context, so the shared row budget is
     // the larger of the chat need and the decision need - not their sum. The context also holds
-    // every decision sequence alongside the chat slots, so the budget must always cover the full
-    // sequence count (n_parallel + n_seq_decision), which the context's output reserve requires.
-    result.total = std::max(result.total, params.n_parallel + params.n_seq_decision + params.n_seq_arena);
+    // every decision sequence (and the resident warm prefixes) alongside the chat slots, so the
+    // budget must always cover the full sequence count (n_parallel + n_seq_decision + n_seq_warm),
+    // which the context's output reserve requires.
+    result.total = std::max(result.total, params.n_parallel + params.n_seq_decision + params.n_seq_arena + params.n_seq_warm);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -880,6 +881,11 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    // sidecar executor only: resolve the pool-owned token snapshot for a routed session body key
+    std::shared_ptr<server_decision_snapshot> resolve_decision_snapshot(const std::string & key) {
+        return decision_snapshot_resolver ? decision_snapshot_resolver(key) : nullptr;
+    }
+
     // shared-model mode: weights owned externally (the server_instances manager).
     // remembered so resize() can rebuild this instance's context from the same
     // weights without reloading them from disk; not owned, never freed.
@@ -981,6 +987,11 @@ private:
     // set by the manager (server_instances) to wake group-waiting requests; called on
     // the scheduler thread whenever a slot becomes idle
     std::function<void(int /* id_slot */)> callback_on_slot_release;
+
+    // set by the manager (server_instances) on the sidecar executor: resolves the pool-owned
+    // token snapshot for a routed session decision from the key embedded in the request body.
+    // called on the HTTP thread from the decision route; null on a non-sidecar context.
+    server_context::decision_snapshot_resolver_fn decision_snapshot_resolver;
 
     // single-writer aggregates for lock-free manager reads (group routing and
     // last-used reporting). the scheduler thread is the only writer, via
@@ -2560,14 +2571,15 @@ private:
     // applied for chat must not leak into it. A live-session decision reads the slot's own K/V,
     // so it must use the adapter set that conditioned that K/V: decoding it under base weights
     // would attend adapter-conditioned cells with base queries. Chat re-applies its own set
-    // before every batch, so the scope set here never leaks.
-    void decision_scope_adapters(server_slot * slot) {
+    // before every batch, so the scope set here never leaks. `scope` is the adapter list to
+    // decode under; null means the base model.
+    void decision_scope_adapters(std::vector<common_adapter_lora_info> * scope) {
         if (!ctx_tgt) {
             return;
         }
         // common_set_adapter_lora takes a mutable reference; it only reads the entries
-        static std::vector<common_adapter_lora_info> base;
-        common_set_adapter_lora(ctx_tgt, slot != nullptr ? slot->lora : base);
+        std::vector<common_adapter_lora_info> base;
+        common_set_adapter_lora(ctx_tgt, scope != nullptr ? *scope : base);
     }
 
     // The identity of the active adapter set for a slot: "" for the base model, else a hash of the
@@ -2587,10 +2599,23 @@ private:
         return "adapter-scope-v1:" + std::to_string(llama_decision::fnv1a64(scope));
     }
 
+    // One engine on the shared full-logits context (seq ids above the chat slots), created on
+    // first use and reset with the model. The single construction site every decision front-end
+    // shares, so the engine pool can never be sized or seeded differently by two callers.
+    llama_decision::engine & ensure_decision_engine() {
+        if (!decision.decision_letter_engine) {
+            decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
+                ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision,
+                params_base.n_seq_warm);
+        }
+        return *decision.decision_letter_engine;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     // POST /decision: answer a finite JSON schema in one batched pass on this thread.
     // Uses the sequence ids above the slots reserved by --decision-seqs (see tools/parallel-decision).
-    json handle_decision(const json & body, const std::shared_ptr<std::atomic<bool>> & cancel_flag = nullptr) {
+    json handle_decision(const json & body, const std::shared_ptr<std::atomic<bool>> & cancel_flag = nullptr,
+                         const std::shared_ptr<server_decision_snapshot> & snapshot = nullptr) {
         if (params_base.n_seq_decision < 3) {
             throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
         }
@@ -2618,12 +2643,49 @@ private:
             server_slot * slot = nullptr;
             llama_seq_id  seq  = -1;
             llama_pos     pos  = -1;
+            // token-snapshot session (sidecar executor): an owned copy of the completed turn's
+            // tokens the readout re-prefills; the source instance is never touched.
+            const std::vector<llama_token> * snapshot_tokens = nullptr;
             std::string   turn; // retained-turn tag, echoed additively
             std::string   session_id; // first-class session handle, echoed additively
+            int           source_slot = -1; // owning slot id, echoed additively
+            std::string   adapter_scope;    // snapshot scope for diagnostics ("" = base)
+            std::string   warm_tag;         // session content hash; resident warm identity ("" = cold replay)
+            bool          snapshot = false; // token-snapshot session, no live slot on this context
         };
         auto resolve_session = [&](const llama_decision::session_ref & ref) -> session_resolution {
             session_resolution out;
             if (!ref.present) {
+                return out;
+            }
+            if (snapshot != nullptr) {
+                // A token-snapshot session routed by the pool to the sidecar executor: the
+                // snapshot owns the turn's tokens and adapter scope, so the readout re-prefills
+                // them (mechanism B) instead of forking a live slot. The pool already validated
+                // the session identity; here only the pinned request fields are checked.
+                if (!ref.session_id.empty() && !snapshot->session_id.empty() &&
+                    ref.session_id != snapshot->session_id) {
+                    throw llama_decision::semantic_error(
+                        "session " + ref.session_id + " does not match the routed snapshot");
+                }
+                if (!ref.turn.empty() && !snapshot->turn.empty() && ref.turn != snapshot->turn) {
+                    throw llama_decision::semantic_error(
+                        "turn " + ref.turn + " does not match the retained turn of the snapshot (" +
+                        snapshot->turn + ")");
+                }
+                if (ref.session_pos >= 0 && (llama_pos) ref.session_pos != snapshot->base_pos) {
+                    throw llama_decision::semantic_error(
+                        "session_pos " + std::to_string(ref.session_pos) + " does not continue the session " +
+                        snapshot->session_id + " (expected " + std::to_string(snapshot->base_pos) + ")");
+                }
+                out.snapshot         = true;
+                out.snapshot_tokens  = &snapshot->tokens;
+                out.pos              = snapshot->base_pos;
+                out.turn             = snapshot->turn;
+                out.session_id       = snapshot->session_id;
+                out.source_slot      = snapshot->source_slot;
+                out.adapter_scope    = snapshot->adapter_scope;
+                out.warm_tag         = snapshot->warm_tag;
                 return out;
             }
             llama_decision::session_registry & registry = decision_registry();
@@ -2632,7 +2694,7 @@ private:
                 // A first-class session handle: the session owns its source slot and turn.
                 const llama_decision::decision_session * sess = registry.find(ref.session_id);
                 if (sess == nullptr) {
-                    throw std::invalid_argument("session " + ref.session_id + " does not exist");
+                    throw llama_decision::not_found_error("session " + ref.session_id + " does not exist");
                 }
                 slot = get_slot_by_id(sess->id_slot);
                 if (slot == nullptr) {
@@ -2683,20 +2745,29 @@ private:
             }
             return out;
         };
+        // The adapter scope a session decodes under: the source slot's live set (in-context) or
+        // the pool-resolved set of a token snapshot (sidecar); a stateless decision decodes base.
+        auto session_scope = [&](const session_resolution & s) -> std::vector<common_adapter_lora_info> * {
+            if (s.slot != nullptr) {
+                return &s.slot->lora;
+            }
+            if (s.snapshot && snapshot != nullptr) {
+                return &snapshot->loras;
+            }
+            return nullptr;
+        };
         // Generic front-end: a JSON schema or compact typed fields compiled into engine-facing
         // field inputs and scored by the same engine the Jev readout uses. The evidence source
         // (state, contexts, session) is orthogonal to the front-end.
         if (shape == llama_decision::request_shape::generic) {
             llama_decision::generic_request greq = llama_decision::parse_generic_request(body);
             const session_resolution          sess = resolve_session(greq.session);
-            if (sess.slot != nullptr && !greq.evidence.contexts.empty()) {
+            const bool                        is_session = sess.slot != nullptr || sess.snapshot;
+            if (is_session && !greq.evidence.contexts.empty()) {
                 throw std::invalid_argument("a session decision scores exactly one context");
             }
             // One full-logits engine on the shared context, shared with the Jev path.
-            if (!decision.decision_letter_engine) {
-                decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
-                    ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
-            }
+            llama_decision::engine & eng = ensure_decision_engine();
             llama_decision::options gopt;
             gopt.mode        = greq.mode;
             gopt.tree_max    = greq.tree_max;
@@ -2708,7 +2779,7 @@ private:
                 gopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
             }
             gopt.yield = []() { std::this_thread::yield(); };
-            if (sess.slot != nullptr && !decision.decision_letter_engine->session_fork_supported(gopt.fork)) {
+            if (is_session && !eng.session_fork_supported(gopt.fork)) {
                 throw std::invalid_argument(
                     "a session decision needs an exact fork on this model; fork \"" + gopt.fork +
                     "\" would not reproduce the slot state");
@@ -2717,7 +2788,7 @@ private:
             llama_decision::compiled_schema cs = llama_decision::compile_schema(greq.schema, greq.instructions);
             llama_decision::batch_result    b;
             queue_tasks.yield_to_queue([&]() {
-                decision_scope_adapters(sess.slot);
+                decision_scope_adapters(session_scope(sess));
                 if (sess.slot != nullptr) {
                     // a live-session generic answer appends the schema as a fresh user turn
                     const auto turn = llama_decision::split_user_turn(chat_params.tmpls.get(), chat_params.use_jinja);
@@ -2725,8 +2796,17 @@ private:
                     llama_decision::options so = gopt;
                     so.cache_tag = llama_decision::make_prefix_tag(cs.system_text, turn.second,
                                                                    llama_decision::GENERIC_PROMPT_VERSION);
-                    const auto plan = decision.decision_letter_engine->compile_fields(sinputs, so);
-                    b = decision.decision_letter_engine->decide_batch_from_seq(sess.seq, sess.pos, plan, so);
+                    const auto plan = eng.compile_fields(sinputs, so);
+                    b = eng.decide_batch_from_seq(sess.seq, sess.pos, plan, so);
+                } else if (sess.snapshot) {
+                    // a token-snapshot session re-prefills the owned turn tokens (mechanism B)
+                    const auto turn = llama_decision::split_user_turn(chat_params.tmpls.get(), chat_params.use_jinja);
+                    const auto sinputs = llama_decision::session_field_inputs(cs, turn.first, turn.second);
+                    llama_decision::options so = gopt;
+                    so.cache_tag = llama_decision::make_prefix_tag(cs.system_text, turn.second,
+                                                                   llama_decision::GENERIC_PROMPT_VERSION);
+                    const auto plan = eng.compile_fields(sinputs, so);
+                    b = eng.decide_warm(*sess.snapshot_tokens, plan, so, sess.warm_tag);
                 } else {
                     // stateless: one rendered evidence per context, or the single state
                     std::vector<std::string> evidence;
@@ -2751,8 +2831,8 @@ private:
                     }
                     gopt.cache_tag = llama_decision::generic_cache_tag(
                         chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text);
-                    const auto plan = decision.decision_letter_engine->compile_fields(cs.inputs, gopt);
-                    b = decision.decision_letter_engine->decide_batch(plan, shared, dynamic, gopt);
+                    const auto plan = eng.compile_fields(cs.inputs, gopt);
+                    b = eng.decide_batch(plan, shared, dynamic, gopt);
                 }
             });
 
@@ -2803,21 +2883,23 @@ private:
             // the default envelope must stay the strict Jev shape
             const bool                              want_diagnostics = req.diagnostics;
             const session_resolution                  sess = resolve_session(req.session);
-            if (sess.slot != nullptr && !req.contexts.empty()) {
+            const bool                                is_session = sess.slot != nullptr || sess.snapshot;
+            if (is_session && !req.contexts.empty()) {
                 throw std::invalid_argument("a session decision scores exactly one context");
             }
             const bool adapters_on = decision.adapters_configured(params_base.lora_adapters);
             // One full-logits engine on the shared context.
-            if (!decision.decision_letter_engine) {
-                decision.decision_letter_engine = std::make_unique<llama_decision::engine>(
-                    ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
-            }
+            llama_decision::engine & eng = ensure_decision_engine();
             llama_decision::readout_sources sources;
-            sources.full = decision.decision_letter_engine.get();
+            sources.full = &eng;
             llama_decision::session_source session_source;
             if (sess.slot != nullptr) {
                 session_source.seq      = sess.seq;
                 session_source.base_pos = sess.pos;
+                sources.session         = &session_source;
+            } else if (sess.snapshot) {
+                session_source.tokens   = sess.snapshot_tokens;
+                session_source.warm_tag = sess.warm_tag;
                 sources.session         = &session_source;
             }
             if (!decision.decision_label_vocab) {
@@ -2894,7 +2976,7 @@ private:
                 jopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
             }
             jopt.yield = []() { std::this_thread::yield(); };
-            if (sess.slot != nullptr && !decision.decision_letter_engine->session_fork_supported(jopt.fork)) {
+            if (is_session && !eng.session_fork_supported(jopt.fork)) {
                 throw std::invalid_argument(
                     "a session decision needs an exact fork on this model; fork \"" + jopt.fork +
                     "\" would not reproduce the slot state");
@@ -2905,7 +2987,7 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 // the readout decodes on the shared context, scoped to the slot's adapters for a
                 // live-session fork and to the base model for a stateless request
-                decision_scope_adapters(sess.slot);
+                decision_scope_adapters(session_scope(sess));
                 all_probs = llama_decision::letter_readout_multi(sources, *decision.decision_label_vocab,
                                                                  chat_params.tmpls.get(),
                                                                  chat_params.use_jinja, req, decision.decision_labels, jopt,
@@ -2946,8 +3028,11 @@ private:
                 decision_diagnostics["diagnostics"]["permutations"]         = req.permutations;
                 decision_diagnostics["diagnostics"]["adapters_configured"] = adapters_on;
                 // a live-session readout reports the scope it actually decoded under; the base
-                // scope keeps the historical "base" label
-                const std::string readout_scope = sess.slot != nullptr ? adapter_scope_of(sess.slot->lora) : std::string();
+                // scope keeps the historical "base" label. a token-snapshot session reports its
+                // captured scope; the in-context path re-derives it from the live slot's set.
+                const std::string readout_scope = sess.slot != nullptr
+                    ? adapter_scope_of(sess.slot->lora)
+                    : sess.snapshot ? sess.adapter_scope : std::string();
                 decision_diagnostics["diagnostics"]["adapter_scope"] = readout_scope.empty() ? "base" : readout_scope;
                 const llama_decision::temperature_provenance prov =
                     llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
@@ -2959,10 +3044,11 @@ private:
             }
             // a session answer reports the fork it took so a caller can tell it apart from a
             // stateless answer; these are additive and never change an answer
-            if (sess.slot != nullptr) {
+            if (is_session) {
                 decision_diagnostics["session_fork"] = true;
-                decision_diagnostics["source_slot"]  = sess.slot->id;
+                decision_diagnostics["source_slot"]  = sess.slot != nullptr ? sess.slot->id : sess.source_slot;
                 decision_diagnostics["session_pos"]  = (long long) sess.pos;
+                decision_diagnostics["warm_hit"]     = metrics.warm_hit;
                 if (!sess.session_id.empty()) {
                     decision_diagnostics["session_id"] = sess.session_id;
                 }
@@ -2970,7 +3056,7 @@ private:
                     decision_diagnostics["turn"] = sess.turn;
                 }
             }
-            const bool emit_diagnostics = want_diagnostics || sess.slot != nullptr;
+            const bool emit_diagnostics = want_diagnostics || is_session;
             if (!multi) {
                 json out = llama_decision::assemble_decision_response(
                     req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
@@ -3089,12 +3175,12 @@ private:
             case server_task::session_action::get:
                 {
                     if (!decision.decision_sessions) {
-                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                        throw llama_decision::not_found_error("session " + action.session_id + " does not exist");
                     }
                     llama_decision::session_registry & registry = *decision.decision_sessions;
                     const llama_decision::decision_session * sess = registry.find(action.session_id);
                     if (sess == nullptr) {
-                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                        throw llama_decision::not_found_error("session " + action.session_id + " does not exist");
                     }
                     out["session_id"]   = action.session_id;
                     out["id_slot"]      = sess->id_slot;
@@ -3125,7 +3211,7 @@ private:
                     const bool erased = decision.decision_sessions != nullptr &&
                                         decision.decision_sessions->erase(action.session_id);
                     if (!erased) {
-                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                        throw llama_decision::not_found_error("session " + action.session_id + " does not exist");
                     }
                     out["session_id"] = action.session_id;
                     out["erased"]     = true;
@@ -3133,7 +3219,7 @@ private:
             case server_task::session_action::patch:
                 {
                     if (!decision.decision_sessions) {
-                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                        throw llama_decision::not_found_error("session " + action.session_id + " does not exist");
                     }
                     llama_decision::session_registry & registry = *decision.decision_sessions;
                     const json & body = action.body;
@@ -3155,7 +3241,7 @@ private:
                         throw llama_decision::semantic_error("patch needs a pinned or ttl_ms field");
                     }
                     if (!registry.patch(action.session_id, set_pinned, pinned, set_ttl, ttl_ms)) {
-                        throw std::invalid_argument("session " + action.session_id + " does not exist");
+                        throw llama_decision::not_found_error("session " + action.session_id + " does not exist");
                     }
                     const llama_decision::decision_session * sess = registry.find(action.session_id);
                     out["session_id"] = action.session_id;
@@ -3297,7 +3383,7 @@ private:
                     try {
                         auto res  = std::make_unique<server_task_result_decision>();
                         res->id   = task.id;
-                        res->data = handle_decision(task.decision_request, task.decision_cancel);
+                        res->data = handle_decision(task.decision_request, task.decision_cancel, task.decision_snapshot);
                         queue_results.send(std::move(res));
                     } catch (const llama_decision::unsupported_error & e) {
                         send_error(task, e.what(), ERROR_TYPE_NOT_SUPPORTED);
@@ -3311,6 +3397,8 @@ private:
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
                     } catch (const llama_decision::semantic_error & e) {
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    } catch (const llama_decision::not_found_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_NOT_FOUND);
                     } catch (const std::invalid_argument & e) {
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
                     } catch (const common_json_error & e) {
@@ -3334,6 +3422,8 @@ private:
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
                     } catch (const llama_decision::semantic_error & e) {
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    } catch (const llama_decision::not_found_error & e) {
+                        send_error(task, e.what(), ERROR_TYPE_NOT_FOUND);
                     } catch (const std::invalid_argument & e) {
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
                     } catch (const common_json_error & e) {
@@ -3341,6 +3431,48 @@ private:
                     } catch (const std::exception & e) {
                         send_error(task, e.what(), ERROR_TYPE_SERVER);
                     }
+                } break;
+            case SERVER_TASK_TYPE_DECISION_SNAPSHOT:
+                {
+                    // a manager-requested read-only copy of a completed turn: the pool needs the
+                    // tokens and adapter scope for a token-snapshot session. only owned copies
+                    // (tokens, path/scale lora list) leave the instance; the source is never
+                    // decoded, removed, or resized.
+                    const int id_slot = task.slot_action.id_slot;
+                    if (id_slot < 0 || id_slot >= (int) slots.size()) {
+                        send_error(task, "id_slot " + std::to_string(id_slot) + " is out of range [0, " +
+                                   std::to_string(slots.size()) + ")", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // a decision needs a completed turn; this is a task-validity check, never
+                        // a read of a producer concentration score
+                        send_error(task, "id_slot " + std::to_string(id_slot) + " is still processing; a decision needs a completed turn",
+                                   ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                        break;
+                    }
+                    const llama_tokens prefix = slot->prompt.tokens.get_tokens();
+                    if (prefix.empty()) {
+                        send_error(task, "id_slot " + std::to_string(id_slot) + " has no decoded state to snapshot",
+                                   ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_decision_snapshot>();
+                    res->id      = task.id;
+                    res->id_slot = id_slot;
+                    res->tokens  = prefix;
+                    res->base_pos = (llama_pos) prefix.size();
+                    for (const auto & la : slot->lora) {
+                        if (la.scale > 0.0f) {
+                            res->lora_scope.push_back({ la.path, la.scale });
+                        }
+                    }
+                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
@@ -3576,9 +3708,13 @@ private:
                     slot->prompt_clear();
 
                     // an erased slot is released: discard its retained session so a later session
-                    // decision is refused instead of answering a turn the client dropped
+                    // decision is refused instead of answering a turn the client dropped. also wake
+                    // the pool's slot-release hook (group waiters and the decision session store).
                     if (decision.decision_sessions) {
                         decision.decision_sessions->on_slot_release(id_slot);
+                    }
+                    if (callback_on_slot_release) {
+                        callback_on_slot_release(id_slot);
                     }
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
@@ -5296,6 +5432,19 @@ void server_context::set_slot_release_callback(std::function<void(int)> callback
     impl->callback_on_slot_release = std::move(callback);
 }
 
+void server_context::set_decision_snapshot_resolver(decision_snapshot_resolver_fn resolver) {
+    impl->decision_snapshot_resolver = std::move(resolver);
+}
+
+server_task_result_ptr server_context::slot_decision_snapshot(int id_slot, int64_t deadline_ms) {
+    server_task task(SERVER_TASK_TYPE_DECISION_SNAPSHOT);
+    task.slot_action.id_slot = id_slot;
+    task.id_slot             = id_slot;
+    return run_scheduler_task(std::move(task), [deadline_ms]() {
+        return deadline_ms >= 0 && ggml_time_ms() >= deadline_ms;
+    });
+}
+
 server_task_result_ptr server_context::run_scheduler_task(server_task && task, const std::function<bool()> & should_stop) {
     // no-op when the queue is not sleeping, which is always the case in this branch
     impl->queue_tasks.wait_until_no_sleep();
@@ -6294,7 +6443,7 @@ void server_routes::init_routes() {
         auto res = create_response();
 
         size_t max_body = decision_max_body;
-        int    max_queue = decision_max_queue;
+        int    max_queue = params.decision_max_queue > 0 ? params.decision_max_queue : decision_max_queue;
         if (const char * e = std::getenv("LLAMA_DECISION_MAX_BODY")) {
             const long v = std::atol(e);
             if (v > 0) {
@@ -6306,6 +6455,20 @@ void server_routes::init_routes() {
             if (v > 0) {
                 max_queue = v;
             }
+        }
+        // server-side deadline for the whole decision (ms since epoch, 0 = none). on expiry
+        // the cancel flag stops the compute and the request answers 503 + Retry-After, never
+        // a partial answer; the flag is also how a client disconnect is signaled.
+        int64_t deadline = 0;
+        int64_t timeout_ms = params.decision_timeout_ms;
+        if (const char * e = std::getenv("LLAMA_DECISION_TIMEOUT_MS")) {
+            const int64_t v = std::atoll(e);
+            if (v > 0) {
+                timeout_ms = v;
+            }
+        }
+        if (timeout_ms > 0) {
+            deadline = ggml_time_ms() + timeout_ms;
         }
         if (req.body.size() > max_body) {
             res->error(format_error_response("decision request body exceeds the configured cap", ERROR_TYPE_PAYLOAD_TOO_LARGE));
@@ -6343,6 +6506,16 @@ void server_routes::init_routes() {
         task.id               = res->rd.get_new_id();
         task.decision_request = body;
         task.decision_cancel  = cancel_flag;
+        // a routed token-snapshot session (sidecar executor): the pool embedded the snapshot key
+        // and resolves it here into an owned snapshot the task holds for the whole decision
+        if (body.is_object() && body.contains("__decision_snapshot_key")) {
+            const std::string key = body.at("__decision_snapshot_key").get<std::string>();
+            task.decision_snapshot = ctx_server.resolve_decision_snapshot(key);
+            if (task.decision_snapshot == nullptr) {
+                res->error(format_error_response("the decision snapshot is no longer available", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
         res->rd.post_task(std::move(task));
 
         auto result = res->rd.next([&] {
@@ -6350,9 +6523,18 @@ void server_routes::init_routes() {
                 cancel_flag->store(true);
                 return true;
             }
+            if (deadline > 0 && ggml_time_ms() >= deadline) {
+                cancel_flag->store(true);
+                return true;
+            }
             return false;
         });
         if (!result) {
+            if (deadline > 0 && ggml_time_ms() >= deadline) {
+                res->headers["Retry-After"] = "1";
+                res->error(format_error_response("the decision exceeded its server-side deadline", ERROR_TYPE_UNAVAILABLE));
+                return res;
+            }
             // the client went away or the server stopped: never report a partial answer
             res->error(format_error_response("the decision was abandoned before it finished", ERROR_TYPE_CLIENT_CLOSED));
             return res;
