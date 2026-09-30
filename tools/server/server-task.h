@@ -206,7 +206,6 @@ struct server_task {
     struct session_action {
         enum action_t { create, get, erase, patch };
         action_t    action = create;
-        int         id_slot = -1;
         std::string session_id;
         json        body; // create/patch payload
     };

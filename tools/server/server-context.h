@@ -248,6 +248,9 @@ struct server_routes {
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t post_decision;
+    // /v1/systemone: the Jev contract only. /v1/decision is the superset and also serves the
+    // generic `schema` shape; the two share one handler and differ only in the shapes accepted.
+    server_http_context::handler_t post_systemone;
     server_http_context::handler_t post_session;
     server_http_context::handler_t get_session;
     server_http_context::handler_t delete_session;

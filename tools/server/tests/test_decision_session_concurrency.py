@@ -25,13 +25,17 @@ Run with a GPU build:
   python3 test_decision_session_concurrency.py MODEL.gguf
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import time
+
+import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -446,6 +450,23 @@ def main():
         if not run_warm_cache_checks(model):
             return 1
     return 0
+
+
+def test_decision_session_concurrency():
+    """pytest entry point for the checks above.
+
+    The script's return code is the verdict; a missing binary or model is a skip. This
+    suite prints nothing on success, so a completed run is simply a pass.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main()
+    out = buf.getvalue()
+    print(out, end="")
+    if rc != 0:
+        pytest.fail(out.strip() or "the session concurrency checks failed")
+    if "SKIP" in out:
+        pytest.skip(out.strip().splitlines()[-1])
 
 
 if __name__ == "__main__":

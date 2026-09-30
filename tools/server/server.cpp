@@ -244,6 +244,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_embeddings_oai    = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_embeddings_oai(req); };
         routes.post_rerank            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_rerank(req); };
         routes.post_decision          = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_decision(req); };
+        // the strict-Jev route shares the decision dispatcher: the route has already marked the
+        // request body, so the same dispatch carries the restriction to the owning instance
+        routes.post_systemone         = routes.post_decision;
         routes.post_session           = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_session(req); };
         routes.get_session            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_session(req); };
         routes.delete_session         = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_delete_session(req); };
@@ -279,6 +282,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_embeddings_oai         = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
         routes.post_decision               = models_routes->proxy_post;
+        routes.post_systemone              = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -335,6 +339,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
     ctx_http.post("/decision",                 ex_wrapper(routes.post_decision));
     ctx_http.post("/v1/decision",              ex_wrapper(routes.post_decision));
+    ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone)); // the Jev contract only
     ctx_http.post("/v1/session",               ex_wrapper(routes.post_session));
     ctx_http.get ("/v1/session/:session_id",   ex_wrapper(routes.get_session));
     ctx_http.del ("/v1/session/:session_id",   ex_wrapper(routes.delete_session));

@@ -2611,6 +2611,104 @@ private:
         return *decision.decision_letter_engine;
     }
 
+    // The accounting every decision response reports, gathered from whichever front-end scored it.
+    // Both front-ends produce the same batch_result shape, so the usage and timings objects are
+    // built from one record and cannot drift apart.
+    struct decision_accounting {
+        std::vector<size_t> per_context_tokens; // one entry per context, in request order
+        size_t context_tokens = 0;              // sum over contexts
+        size_t shared_tokens  = 0;
+        bool   cache_hit      = false;
+        int    rows           = 0;
+        int    rounds         = 0;
+        double prefill_ms     = 0.0;
+        double scoring_ms     = 0.0;
+
+        size_t context_tokens_at(size_t i) const {
+            return i < per_context_tokens.size() ? per_context_tokens[i] : 0;
+        }
+    };
+
+    static decision_accounting decision_accounting_of(const llama_decision::batch_result & b) {
+        decision_accounting a;
+        a.per_context_tokens.reserve(b.items.size());
+        for (const auto & item : b.items) {
+            a.context_tokens += item.context_tokens;
+            a.per_context_tokens.push_back(item.context_tokens);
+        }
+        a.shared_tokens = b.shared_tokens;
+        a.cache_hit     = b.cache_hit;
+        a.rows          = b.rows;
+        a.rounds        = b.rounds;
+        a.prefill_ms    = b.prefill_ms;
+        a.scoring_ms    = b.scoring_ms;
+        return a;
+    }
+
+    static decision_accounting decision_accounting_of(const llama_decision::letter_metrics & m) {
+        decision_accounting a;
+        a.per_context_tokens = m.per_context_tokens;
+        a.context_tokens     = m.context_tokens;
+        a.shared_tokens      = m.shared_tokens;
+        a.cache_hit          = m.cache_hit;
+        a.rows               = m.rows;
+        a.rounds             = m.rounds;
+        a.prefill_ms         = m.prefill_ms;
+        a.scoring_ms         = m.scoring_ms;
+        return a;
+    }
+
+    // The token accounting for one context. A decision generates nothing, so the output count is
+    // always zero, and a prefix-cache hit counts the cached prefix as its cached tokens.
+    static json decision_usage(const decision_accounting & a, size_t context_tokens) {
+        json usage = json::object();
+        usage["input_tokens"]    = (long long) (a.shared_tokens + context_tokens);
+        usage["output_tokens"]   = 0;
+        usage["cached_tokens"]   = (long long) (a.cache_hit ? a.shared_tokens : 0);
+        usage["state_cache_hit"] = a.cache_hit;
+        return usage;
+    }
+
+    static json decision_timings(const decision_accounting & a) {
+        json timings = json::object();
+        timings["prefill_ms"] = a.prefill_ms;
+        timings["scoring_ms"] = a.scoring_ms;
+        timings["total_ms"]   = a.prefill_ms + a.scoring_ms;
+        timings["rounds"]     = a.rounds;
+        timings["rows"]       = a.rows;
+        timings["per_decision_ms"] = a.per_context_tokens.empty()
+            ? 0.0 : (a.prefill_ms + a.scoring_ms) / (double) a.per_context_tokens.size();
+        return timings;
+    }
+
+    // The engine options shared by every decision front-end: the fork override, the client
+    // disconnect as a cancellation, the scheduler yield, and the exactness gate a session needs.
+    // A front-end sets its own shape (mode, tree_max, allow_cache) on the result.
+    static llama_decision::options decision_engine_options(llama_decision::engine & eng, bool is_session,
+                                                           const std::shared_ptr<std::atomic<bool>> & cancel_flag) {
+        llama_decision::options opt;
+        if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
+            opt.fork = fork;
+        }
+        if (cancel_flag) {
+            opt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
+        }
+        opt.yield = []() { std::this_thread::yield(); };
+        if (is_session && !eng.session_fork_supported(opt.fork)) {
+            throw std::invalid_argument(
+                "a session decision needs an exact fork on this model; fork \"" + opt.fork +
+                "\" would not reproduce the slot state");
+        }
+        return opt;
+    }
+
+    // The echoed model identity: the Jev aliases and an omitted id resolve to the loaded model,
+    // any other requested id is echoed verbatim. One contract, so both front-ends agree.
+    static std::string decision_model_echo(const std::string & requested, const std::string & loaded) {
+        return (requested.empty() || requested == "jev-latest" || requested == "jev-preview")
+            ? loaded : requested;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     // POST /decision: answer a finite JSON schema in one batched pass on this thread.
     // Uses the sequence ids above the slots reserved by --decision-seqs (see tools/parallel-decision).
@@ -2618,6 +2716,16 @@ private:
                          const std::shared_ptr<server_decision_snapshot> & snapshot = nullptr) {
         if (params_base.n_seq_decision < 3) {
             throw std::invalid_argument("decisions are disabled: start the server with --decision-seqs N (N >= 3)");
+        }
+        // /v1/systemone is the Jev contract alone, so the generic front-end is unreachable there: a
+        // `schema` body is the wrong endpoint, not a shape to serve. The route marks the request
+        // and the mark travels in the body, the way the pool's snapshot key does, so one handler
+        // serves both routes through the pool's dispatch with no second dispatch path to keep in
+        // step. A client can only make a request stricter by sending the mark, never looser.
+        if (body.is_object() && body.value(DECISION_JEV_ONLY_KEY, false) && body.contains("schema") &&
+            !body.at("schema").is_null()) {
+            throw std::invalid_argument(
+                "this endpoint serves the Jev \"questions\" shape; a \"schema\" body belongs on /v1/decision");
         }
         // A session decision holds a lease on its materialized reference for the duration of the
         // decode, so a concurrent capture never evicts it mid-decision. The guard releases the
@@ -2768,45 +2876,30 @@ private:
             }
             // One full-logits engine on the shared context, shared with the Jev path.
             llama_decision::engine & eng = ensure_decision_engine();
-            llama_decision::options gopt;
+            llama_decision::options gopt = decision_engine_options(eng, is_session, cancel_flag);
             gopt.mode        = greq.mode;
             gopt.tree_max    = greq.tree_max;
             gopt.allow_cache = greq.allow_cache;
-            if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
-                gopt.fork = fork;
-            }
-            if (cancel_flag) {
-                gopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
-            }
-            gopt.yield = []() { std::this_thread::yield(); };
-            if (is_session && !eng.session_fork_supported(gopt.fork)) {
-                throw std::invalid_argument(
-                    "a session decision needs an exact fork on this model; fork \"" + gopt.fork +
-                    "\" would not reproduce the slot state");
-            }
 
             llama_decision::compiled_schema cs = llama_decision::compile_schema(greq.schema, greq.instructions);
             llama_decision::batch_result    b;
             queue_tasks.yield_to_queue([&]() {
                 decision_scope_adapters(session_scope(sess));
-                if (sess.slot != nullptr) {
-                    // a live-session generic answer appends the schema as a fresh user turn
+                if (sess.slot != nullptr || sess.snapshot) {
+                    // A session appends the schema as a fresh user turn, so both sources frame the
+                    // same plan: a live slot forks its own sequence, and a token snapshot re-prefills
+                    // the owned turn tokens (mechanism B). Only the final decode differs.
                     const auto turn = llama_decision::split_user_turn(chat_params.tmpls.get(), chat_params.use_jinja);
                     const auto sinputs = llama_decision::session_field_inputs(cs, turn.first, turn.second);
                     llama_decision::options so = gopt;
                     so.cache_tag = llama_decision::make_prefix_tag(cs.system_text, turn.second,
                                                                    llama_decision::GENERIC_PROMPT_VERSION);
                     const auto plan = eng.compile_fields(sinputs, so);
-                    b = eng.decide_batch_from_seq(sess.seq, sess.pos, plan, so);
-                } else if (sess.snapshot) {
-                    // a token-snapshot session re-prefills the owned turn tokens (mechanism B)
-                    const auto turn = llama_decision::split_user_turn(chat_params.tmpls.get(), chat_params.use_jinja);
-                    const auto sinputs = llama_decision::session_field_inputs(cs, turn.first, turn.second);
-                    llama_decision::options so = gopt;
-                    so.cache_tag = llama_decision::make_prefix_tag(cs.system_text, turn.second,
-                                                                   llama_decision::GENERIC_PROMPT_VERSION);
-                    const auto plan = eng.compile_fields(sinputs, so);
-                    b = eng.decide_warm(*sess.snapshot_tokens, plan, so, sess.warm_tag);
+                    if (sess.slot != nullptr) {
+                        b = eng.decide_batch_from_seq(sess.seq, sess.pos, plan, so);
+                    } else {
+                        b = eng.decide_warm(*sess.snapshot_tokens, plan, so, sess.warm_tag);
+                    }
                 } else {
                     // stateless: one rendered evidence per context, or the single state
                     std::vector<std::string> evidence;
@@ -2836,12 +2929,9 @@ private:
                 }
             });
 
-            const std::string echo = (greq.model.empty() || greq.model == "jev-latest" || greq.model == "jev-preview")
-                ? model_name : greq.model;
-            size_t context_tokens = 0;
+            const decision_accounting acct = decision_accounting_of(b);
             json results = json::array();
             for (const auto & item : b.items) {
-                context_tokens += item.context_tokens;
                 json record = llama_decision::assemble(cs, item);
                 record["usage"] = {
                     { "context_tokens", (long long) item.context_tokens },
@@ -2849,24 +2939,11 @@ private:
                 };
                 results.push_back(std::move(record));
             }
-            json usage = json::object();
-            usage["input_tokens"]    = (long long) (b.shared_tokens + context_tokens);
-            usage["output_tokens"]   = 0;
-            usage["cached_tokens"]   = (long long) (b.cache_hit ? b.shared_tokens : 0);
-            usage["state_cache_hit"] = b.cache_hit;
-            json timings = json::object();
-            timings["prefill_ms"] = b.prefill_ms;
-            timings["scoring_ms"] = b.scoring_ms;
-            timings["total_ms"]   = b.prefill_ms + b.scoring_ms;
-            timings["rounds"]     = b.rounds;
-            timings["rows"]       = b.rows;
-            timings["per_decision_ms"] = b.items.empty()
-                ? 0.0 : (b.prefill_ms + b.scoring_ms) / (double) b.items.size();
             json out = json::object();
-            out["model"]   = echo;
+            out["model"]   = decision_model_echo(greq.model, model_name);
             out["results"] = results;
-            out["usage"]   = usage;
-            out["timings"] = timings;
+            out["usage"]   = decision_usage(acct, acct.context_tokens);
+            out["timings"] = decision_timings(acct);
             return out;
         }
         // Decision shape: state + typed questions, scored as one next-token choice over the
@@ -2968,19 +3045,7 @@ private:
                 }
             }
 
-            llama_decision::options jopt;
-            if (const char * fork = std::getenv("LLAMA_DECISION_FORK")) {
-                jopt.fork = fork;
-            }
-            if (cancel_flag) {
-                jopt.should_stop = [cancel_flag]() { return cancel_flag->load(); };
-            }
-            jopt.yield = []() { std::this_thread::yield(); };
-            if (is_session && !eng.session_fork_supported(jopt.fork)) {
-                throw std::invalid_argument(
-                    "a session decision needs an exact fork on this model; fork \"" + jopt.fork +
-                    "\" would not reproduce the slot state");
-            }
+            llama_decision::options jopt = decision_engine_options(eng, is_session, cancel_flag);
             llama_decision::letter_metrics metrics;
             std::vector<std::vector<std::vector<float>>> all_probs;
             // run inside a yield so metrics/slot requests are served while the decision computes
@@ -2994,26 +3059,14 @@ private:
                                                                  &metrics);
             });
 
-            const bool multi = !req.contexts.empty();
-            json usage = json::object();
-            usage["input_tokens"]    = (long long) (metrics.shared_tokens + metrics.context_tokens);
-            usage["output_tokens"]   = 0;
-            usage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
-            usage["state_cache_hit"] = metrics.cache_hit;
-
-            json timings = json::object();
-            timings["prefill_ms"] = metrics.prefill_ms;
-            timings["scoring_ms"] = metrics.scoring_ms;
-            timings["total_ms"]   = metrics.prefill_ms + metrics.scoring_ms;
-            timings["rounds"]     = metrics.rounds;
-            timings["rows"]       = metrics.rows;
-            timings["per_decision_ms"] = all_probs.empty()
-                ? 0.0 : (metrics.prefill_ms + metrics.scoring_ms) / (double) all_probs.size();
+            const bool              multi = !req.contexts.empty();
+            const decision_accounting acct = decision_accounting_of(metrics);
+            const json               usage   = decision_usage(acct, acct.context_tokens);
+            const json               timings = decision_timings(acct);
 
             // The echoed model identity: the Jev aliases resolve to the loaded (chat slot) model; any other
             // requested id is echoed verbatim; an omitted model defaults to the loaded model.
-            const std::string echo = (req.model.empty() || req.model == "jev-latest" || req.model == "jev-preview")
-                ? model_name : req.model;
+            const std::string echo = decision_model_echo(req.model, model_name);
             json decision_diagnostics = json::object();
             if (want_diagnostics) {
                 // additive diagnostics: the readout contract identity this server is running
@@ -3070,14 +3123,8 @@ private:
             // one extension over the Jev single-state envelope, so a single-state client is unchanged.
             json contexts_resp = json::array();
             for (size_t ci = 0; ci < all_probs.size(); ++ci) {
-                json cusage = json::object();
-                cusage["input_tokens"] = (long long) (metrics.shared_tokens +
-                    (ci < metrics.per_context_tokens.size() ? metrics.per_context_tokens[ci] : 0));
-                cusage["output_tokens"]   = 0;
-                cusage["cached_tokens"]   = (long long) (metrics.cache_hit ? metrics.shared_tokens : 0);
-                cusage["state_cache_hit"] = metrics.cache_hit;
                 json ans = llama_decision::assemble_decision_response(
-                    req, all_probs[ci], echo, cusage, nullptr);
+                    req, all_probs[ci], echo, decision_usage(acct, acct.context_tokens_at(ci)), nullptr);
                 contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
             }
             json out = json::object();
@@ -3383,7 +3430,8 @@ private:
                     try {
                         auto res  = std::make_unique<server_task_result_decision>();
                         res->id   = task.id;
-                        res->data = handle_decision(task.decision_request, task.decision_cancel, task.decision_snapshot);
+                        res->data = handle_decision(task.decision_request, task.decision_cancel,
+                                                   task.decision_snapshot);
                         queue_results.send(std::move(res));
                     } catch (const llama_decision::unsupported_error & e) {
                         send_error(task, e.what(), ERROR_TYPE_NOT_SUPPORTED);
@@ -6439,7 +6487,10 @@ void server_routes::init_routes() {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
     };
 
-    this->post_decision = [this](const server_http_req & req) {
+    // POST /v1/systemone is the Jev contract alone and POST /v1/decision is the superset that also
+    // carries the generic `schema` shape. One handler, one request path, one error surface: the
+    // route decides which shapes it will accept.
+    auto post_decision_route = [this](const server_http_req & req, bool jev_only) {
         auto res = create_response();
 
         size_t max_body = decision_max_body;
@@ -6504,6 +6555,11 @@ void server_routes::init_routes() {
         auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
         server_task task(SERVER_TASK_TYPE_DECISION);
         task.id               = res->rd.get_new_id();
+        if (jev_only) {
+            // the strict-Jev route mark; harmless to the parsers, which tolerate unknown top-level
+            // fields, and it survives the pool's routing rewrite of the body
+            body[DECISION_JEV_ONLY_KEY] = true;
+        }
         task.decision_request = body;
         task.decision_cancel  = cancel_flag;
         // a routed token-snapshot session (sidecar executor): the pool embedded the snapshot key
@@ -6545,6 +6601,13 @@ void server_routes::init_routes() {
         }
         res->ok(result->to_json());
         return res;
+    };
+
+    this->post_decision = [post_decision_route](const server_http_req & req) {
+        return post_decision_route(req, false);
+    };
+    this->post_systemone = [post_decision_route](const server_http_req & req) {
+        return post_decision_route(req, true);
     };
 
     // POST /v1/session: create a first-class session for a slot's completed turn.

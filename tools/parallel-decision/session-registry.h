@@ -39,12 +39,11 @@ struct decision_session {
 };
 
 // The outcome of a successful resolve: the forkable sequence, the base position the readout
-// continues from, the retained turn tag, the adapter scope, and the session handle.
+// continues from, the retained turn tag, and the session handle.
 struct resolved_session {
     llama_seq_id seq = -1;
     llama_pos    pos = -1;
     std::string  turn;
-    std::string  adapter_scope;
     std::string  session_id;
 };
 
@@ -189,9 +188,6 @@ class session_registry {
     int    n_reuses() const    { return n_reuses_; }
     int    n_releases() const  { return n_releases_; }
 
-    // The byte budget for all retained references; 0 = unlimited.
-    size_t budget_bytes() const { return budget_bytes_; }
-
   private:
     session_store * get_store(session_backend backend);
     void release_capture(decision_session * sess);
@@ -204,8 +200,6 @@ class session_registry {
     std::string issue_session_id();
 
     llama_context * ctx_ = nullptr;
-    llama_seq_id    base_ = -1;
-    int             n_arena_ = 0;
     int             n_slots_ = 0;
     std::unique_ptr<session_arena> arena_; // the shared reserved-sequence pool (the single allocator)
     std::string     file_dir_;             // writable directory for the file backend; "" = unsupported

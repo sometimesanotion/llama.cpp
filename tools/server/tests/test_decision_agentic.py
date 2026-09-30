@@ -24,7 +24,9 @@ Run with a GPU build and the sidecar default:
   python3 test_decision_agentic.py MODEL.gguf
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -35,6 +37,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -361,6 +365,22 @@ def main():
             return 1
         print(f"agentic harness passed on {os.path.basename(model)}")
     return 0
+
+
+def test_decision_agentic():
+    """pytest entry point for the harness above.
+
+    The script's return code is the verdict; a missing binary or model is a skip.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main()
+    out = buf.getvalue()
+    print(out, end="")
+    if rc != 0:
+        pytest.fail(out.strip() or "the agentic harness failed")
+    if "SKIP" in out and "passed" not in out:
+        pytest.skip(out.strip().splitlines()[-1])
 
 
 if __name__ == "__main__":

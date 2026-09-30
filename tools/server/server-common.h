@@ -113,6 +113,16 @@ struct server_grammar_trigger {
 
 json format_error_response(const std::string & message, const enum error_type type);
 
+// The strict-Jev decision route. /v1/decision is the superset and also serves the generic `schema`
+// shape; this one serves the Jev contract alone, so a `schema` body is refused there.
+static const char * const DECISION_JEV_PATH = "/v1/systemone";
+
+// The request mark DECISION_JEV_PATH sets to pin the Jev contract. It travels in the body, the way
+// the pool's `__decision_snapshot_key` does, so one decision handler serves both routes through
+// whichever dispatcher is installed: the pool's, or the single context's own. A client can only
+// make a request stricter by sending the mark itself, never looser.
+static const char * const DECISION_JEV_ONLY_KEY = "__decision_jev_only";
+
 //
 // random string / id
 //

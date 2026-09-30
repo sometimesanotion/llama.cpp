@@ -7,12 +7,16 @@ request shape (state/contexts + questions). Skips cleanly (exit 0) when the
 server binary or a small test model is not available, so it never fails open.
 """
 
+import contextlib
+import io
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+
+import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -1062,6 +1066,24 @@ def main():
 
     print("SKIP: no candidate model supports letter labels; set LLAMA_SERVER_TEST_MODEL")
     return 0
+
+
+def test_decision_envelope():
+    """pytest entry point for the checks above.
+
+    The script's return code is the verdict. A missing binary or model is a skip, never
+    a pass; a run that skips an individual sub-check but still completes the suite is a
+    pass, so a partial skip is not reported as a whole-suite skip.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main()
+    out = buf.getvalue()
+    print(out, end="")
+    if rc != 0:
+        pytest.fail(out.strip() or "the decision envelope checks failed")
+    if "SKIP" in out and "passed" not in out:
+        pytest.skip(out.strip().splitlines()[-1])
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ invalid request -> 422. Skips cleanly (exit 0) when the server binary or a small
 test model is missing, so it never fails open.
 """
 
+import contextlib
+import io
 import json
 import os
 import socket
@@ -17,6 +19,8 @@ import sys
 import tempfile
 import threading
 import time
+
+import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -798,6 +802,24 @@ def main():
         return 0
     print("FAIL: no candidate model supports letter labels; set LLAMA_SERVER_TEST_MODEL")
     return 1
+
+
+def test_decision_admission():
+    """pytest entry point for the checks above.
+
+    The script's return code is the verdict; LLAMA_SERVER_TEST_ALLOW_SKIP keeps the
+    missing-model case a skip rather than a failure. A run that skips an individual
+    sub-check but still completes the suite is a pass, not a whole-suite skip.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main()
+    out = buf.getvalue()
+    print(out, end="")
+    if rc != 0:
+        pytest.fail(out.strip() or "the decision admission checks failed")
+    if "SKIP" in out and "passed" not in out:
+        pytest.skip(out.strip().splitlines()[-1])
 
 
 if __name__ == "__main__":

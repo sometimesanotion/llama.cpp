@@ -36,7 +36,7 @@ static bool write_binary_file(const std::string & path, const std::vector<uint8_
 
 session_registry::session_registry(llama_context * ctx, llama_seq_id base_seq, int n_arena, int n_slots, uint64_t epoch,
                                    const std::string & file_dir, size_t budget_bytes)
-    : ctx_(ctx), base_(base_seq), n_arena_(n_arena), n_slots_(n_slots),
+    : ctx_(ctx), n_slots_(n_slots),
       arena_(make_session_arena(base_seq, n_arena)), file_dir_(file_dir), budget_bytes_(budget_bytes),
       slots_(n_slots), slot_turns_(n_slots, 0), epoch_(epoch) {
     session_id_seed_ = (uint64_t) now_ms();
@@ -288,7 +288,6 @@ session_store * session_registry::get_store(session_backend backend) {
     cfg.ctx         = ctx_;
     cfg.arena       = arena_.get();
     cfg.file_dir    = file_dir_;
-    cfg.budget_bytes = budget_bytes_;
     auto store = make_session_store(backend, cfg);
     if (store == nullptr) {
         return nullptr;
@@ -423,7 +422,6 @@ static resolved_session materialize_session(llama_decision::session_store * stor
     out.seq          = seq;
     out.pos          = sess->pos;
     out.turn         = sess->turn;
-    out.adapter_scope = sess->identity.adapter_scope;
     out.session_id   = sess->id;
     return out;
 }

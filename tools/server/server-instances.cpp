@@ -2473,6 +2473,19 @@ server_http_res_ptr server_instances::handle_post_decision(const server_http_req
     if (params.decision_sidecar) {
         return handle_post_decision_sidecar(req);
     }
+    // the strict-Jev route is the same dispatch with the Jev contract pinned on the body
+    server_http_req jev_req = req;
+    if (req.path == DECISION_JEV_PATH) {
+        try {
+            json body = json::parse(req.body);
+            if (body.is_object()) {
+                body[DECISION_JEV_ONLY_KEY] = true;
+                jev_req.body                  = body.dump();
+            }
+        } catch (const std::exception &) {
+            // a malformed body is reported by the owning instance's handler
+        }
+    }
     // stateless decisions may be pinned to a declared decision instance (--decision-instance);
     // a live-session decision must name the instance that owns the slot instead
     dispatch_options opt;
@@ -2484,9 +2497,9 @@ server_http_res_ptr server_instances::handle_post_decision(const server_http_req
     // target. When the client names only the instance (or nothing at all, or a Jev alias), fill
     // the pool id in so the request routes here and the parser still sees a model. The response
     // echoes it.
-    server_http_req routed = req;
+    server_http_req routed = jev_req;
     try {
-        json              body        = json::parse(req.body);
+        json              body        = json::parse(routed.body);
         const std::string model_field = body.is_object() ? json_value(body, "model", std::string()) : std::string();
         if (body.is_object() &&
             (model_field.empty() || model_field == "jev-latest" || model_field == "jev-preview")) {
@@ -2515,8 +2528,12 @@ server_http_res_ptr server_instances::handle_post_decision_sidecar(const server_
     try {
         body = json::parse(req.body);
     } catch (const std::exception &) {
-        // malformed JSON is reported by the sidecar's own handler
+        // a malformed body is reported by the sidecar's own handler
         return dispatch_instance(routed, sidecar, "", -1, forward);
+    }
+    if (body.is_object() && req.path == DECISION_JEV_PATH) {
+        body[DECISION_JEV_ONLY_KEY] = true;
+        routed.body                  = body.dump();
     }
     if (body.is_object() && decision_request_is_session_pinned(req)) {
         // the session fields may arrive in the query string (as chat routing allows); merge them

@@ -98,13 +98,11 @@ class session_arena {
     virtual size_t       used() const = 0;
 };
 
-// How a backend is configured: the shared arena, the writable directory for the file backend, and
-// the byte budget the registry accounts against.
+// How a backend is configured: the shared arena and the writable directory for the file backend.
 struct session_store_config {
     llama_context * ctx = nullptr;
     session_arena * arena = nullptr;    // shared reserved-sequence allocator (registry-owned)
     std::string     file_dir;           // writable directory for the file backend; "" = unsupported
-    size_t          budget_bytes = 0;   // max bytes all references may hold (0 = unlimited)
 };
 
 // The reference backend interface. A backend knows one reference at a time: how to capture it from

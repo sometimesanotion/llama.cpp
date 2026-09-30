@@ -1827,7 +1827,210 @@ static void test_generic_jev_winner_equivalence(testing & t) {
     });
 }
 
+// A schema the compiler must refuse, with the phrase the reason has to carry.
+static void expect_schema_reject(testing & t, const std::string & schema_text, const std::string & needle) {
+    try {
+        (void) llama_decision::compile_schema(common_json::parse(schema_text), "");
+        t.assert_true("schema is rejected: " + schema_text, false);
+    } catch (const llama_decision::semantic_error & e) {
+        const std::string what = e.what();
+        t.assert_true("reject reason contains \"" + needle + "\": " + schema_text + " -> " + what,
+                      what.find(needle) != std::string::npos);
+    }
+}
+
+// The schema compiler is a pure function of the request body: it validates the field catalogue,
+// encodes the typed grids, and hoists each field's common value prefix into its suffix. These cases
+// pin the accepted shapes, the refusals, and the hoisting. They need no model and no context, so a
+// capability the refactor drops fails here rather than only at the HTTP layer.
+static void test_generic_schema_compiler(testing & t) {
+    t.test("the compiler accepts every supported field type and aggregate", [](testing & t) {
+        const llama_decision::compiled_schema cs = llama_decision::compile_schema(common_json::parse(R"({
+            "flag":    {"type": "boolean", "description": "is it active"},
+            "team":    {"type": "enum", "description": "owning team", "enum": ["billing", "tech"]},
+            "count":   {"type": "integer", "description": "affected rows", "minimum": 1, "maximum": 4},
+            "impact":  {"type": "number", "description": "impact factor", "minimum": 0.0, "maximum": 1.0,
+                        "step": 0.5, "aggregate": "mean"},
+            "sev":     {"type": "integer", "description": "severity", "minimum": 0, "maximum": 2,
+                        "aggregate": "median"}
+        })"), "extra instruction");
+        t.assert_equal("one spec per field", (size_t) 5, cs.specs.size());
+        t.assert_equal("one scoring field per spec", cs.specs.size(), cs.inputs.size());
+        t.assert_equal("boolean type", std::string("boolean"), cs.specs[0].type);
+        t.assert_equal("enum type", std::string("enum"), cs.specs[1].type);
+        t.assert_equal("integer type", std::string("integer"), cs.specs[2].type);
+        t.assert_equal("number type", std::string("number"), cs.specs[3].type);
+        t.assert_equal("boolean values", (size_t) 2, cs.specs[0].values.size());
+        t.assert_equal("boolean encodes true and false", std::string("true,false"),
+                       cs.specs[0].encoded[0] + "," + cs.specs[0].encoded[1]);
+        t.assert_equal("integer grid is inclusive of both bounds", (size_t) 4, cs.specs[2].values.size());
+        t.assert_equal("number grid honours the step", (size_t) 3, cs.specs[3].values.size());
+        t.assert_equal("mode is the default aggregate", std::string("mode"), cs.specs[0].aggregate);
+        t.assert_equal("mean aggregate is kept", std::string("mean"), cs.specs[3].aggregate);
+        t.assert_equal("median aggregate is kept", std::string("median"), cs.specs[4].aggregate);
+        t.assert_true("the instructions reach the system text",
+                      cs.system_text.find("extra instruction") != std::string::npos);
+        t.assert_true("the catalogue names the field", cs.catalogue.find("team") != std::string::npos);
+    });
+
+    t.test("a JSON Schema body compiles the same catalogue without requiring a description",
+           [](testing & t) {
+        const llama_decision::compiled_schema cs = llama_decision::compile_schema(common_json::parse(R"({
+            "type": "object",
+            "properties": {
+                "active": {"type": "boolean"},
+                "level":  {"type": "integer", "minimum": 0, "maximum": 2},
+                "grade":  {"type": "number", "minimum": 0.0, "maximum": 1.0, "multipleOf": 0.25}
+            }
+        })"), "");
+        t.assert_equal("the properties object is the field catalogue", (size_t) 3, cs.specs.size());
+        t.assert_equal("a description is optional here", std::string(), cs.specs[0].description);
+        t.assert_equal("multipleOf builds the grid", (size_t) 5, cs.specs[2].values.size());
+    });
+
+    // The prefix hoist is what keeps a wide enum cheap: the shared leading characters are scored
+    // once in the suffix and only the remainder is branched on.
+    t.test("the compiler hoists each field's shared value prefix into its suffix", [](testing & t) {
+        const llama_decision::compiled_schema cs = llama_decision::compile_schema(common_json::parse(R"({
+            "team": {"type": "enum", "description": "owning team",
+                     "enum": ["platform-frontend", "platform-backend", "platform-infra"]}
+        })"), "");
+        const llama_decision::generic_field_spec & f = cs.specs[0];
+        t.assert_equal("the shared prefix is the longest common head", std::string("\"platform-"),
+                       f.common);
+        t.assert_true("the suffix ends with the hoisted prefix",
+                      cs.inputs[0].suffix.size() >= f.common.size() &&
+                      cs.inputs[0].suffix.compare(cs.inputs[0].suffix.size() - f.common.size(),
+                                                  f.common.size(), f.common) == 0);
+        t.assert_equal("one candidate per value", f.encoded.size(), cs.inputs[0].candidates.size());
+        for (size_t i = 0; i < f.encoded.size(); ++i) {
+            t.assert_equal("the candidate is the value minus the hoisted prefix",
+                           f.encoded[i].substr(f.common.size()), cs.inputs[0].candidates[i]);
+        }
+    });
+
+    // The wide-domain escape: a field may carry up to 255 values whatever the tokenizer resolves.
+    // That is the capability the Jev label pool cannot offer, so it is pinned by size.
+    t.test("the compiler accepts a field wider than the Jev label pool", [](testing & t) {
+        common_json many = common_json::array();
+        for (int i = 0; i < 255; ++i) {
+            many.push_back("option-" + std::to_string(i));
+        }
+        common_json schema = common_json::object();
+        schema["wide"] = common_json::object();
+        schema["wide"]["type"] = "enum";
+        schema["wide"]["description"] = "a wide catalogue";
+        schema["wide"]["enum"] = many;
+        const llama_decision::compiled_schema cs = llama_decision::compile_schema(schema, "");
+        t.assert_equal("255 values are accepted", (size_t) 255, cs.specs[0].values.size());
+        t.assert_equal("255 candidates are scored", (size_t) 255, cs.inputs[0].candidates.size());
+    });
+
+    t.test("the compiler refuses a malformed schema", [](testing & t) {
+        expect_schema_reject(t, R"(null)", "must be an object");
+        expect_schema_reject(t, R"({})", "1-32 fields");
+        expect_schema_reject(t, R"({"a": {"type": "boolean"}})", "needs a description");
+        expect_schema_reject(t, R"({"a": {"type": "wat", "description": "d"}})", "boolean, enum, integer and number");
+        expect_schema_reject(t, R"({"a": {"type": "enum", "description": "d"}})", "need a list of choices");
+        expect_schema_reject(t, R"({"a": {"type": "enum", "description": "d", "enum": [1, 2]}})",
+                             "must be strings");
+        expect_schema_reject(t, R"({"a": {"type": "enum", "description": "d", "enum": ["x", "x"]}})",
+                             "duplicate");
+        expect_schema_reject(t, R"({"a": {"type": "integer", "description": "d", "minimum": 0}})",
+                             "minimum and maximum");
+        expect_schema_reject(t, R"({"a": {"type": "integer", "description": "d", "minimum": 0.5,
+                            "maximum": 2}})", "integer minimum and maximum");
+        expect_schema_reject(t, R"({"a": {"type": "integer", "description": "d", "minimum": 0,
+                            "maximum": 300}})", "1-255 values");
+        expect_schema_reject(t, R"({"a": {"type": "number", "description": "d", "minimum": 0.0,
+                            "maximum": 1.0}})", "step");
+        expect_schema_reject(t, R"({"a": {"type": "number", "description": "d", "minimum": 0.0,
+                            "maximum": 1.0, "step": -0.5}})", "positive step");
+        expect_schema_reject(t, R"({"a": {"type": "boolean", "description": "d",
+                            "aggregate": "mean"}})", "median/mean for numeric");
+    });
+
+    // A wrong-typed `type`, `description` or `aggregate` is read with common_json::value, which
+    // reports the JSON type mismatch instead of the field-level reason every other malformed
+    // schema produces. handle_decision maps this to 400, not the 422 the other refusals use, and
+    // the message carries no field name. Pinned as-is so the change is deliberate if it is fixed.
+    t.test("a wrong-typed spec member reports the JSON type mismatch, not a field reason",
+           [](testing & t) {
+        for (const char * member : { "type", "description", "aggregate", "x-aggregate" }) {
+            common_json spec = common_json::object();
+            spec["type"]        = "boolean";
+            spec["description"] = "d";
+            if (std::string(member) == "type") {
+                spec["type"] = 7;
+            } else if (std::string(member) == "aggregate" || std::string(member) == "x-aggregate") {
+                spec["type"] = "integer";
+                spec["minimum"] = 0;
+                spec["maximum"] = 2;
+                spec[member]   = 7;
+            } else {
+                spec[member] = 7;
+            }
+            common_json schema = common_json::object();
+            schema["a"] = spec;
+            bool threw = false;
+            try {
+                (void) llama_decision::compile_schema(schema, "");
+            } catch (const common_json_error &) {
+                threw = true;
+            } catch (const llama_decision::semantic_error &) {
+                threw = false;
+            }
+            t.assert_true(std::string("a wrong-typed ") + member + " is refused", threw);
+        }
+    });
+
+    t.test("the shape dispatch accepts each body and refuses the ambiguous one", [](testing & t) {
+        t.assert_true("a schema body selects the generic front-end",
+                      llama_decision::select_request_shape(
+                          common_json::parse(R"({"schema": {"a": {"type": "boolean"}}})")) ==
+                      llama_decision::request_shape::generic);
+        t.assert_true("a questions body selects the Jev front-end",
+                      llama_decision::select_request_shape(
+                          common_json::parse(R"({"questions": {}})")) ==
+                      llama_decision::request_shape::jev);
+        t.assert_true("a state-only body selects the Jev front-end",
+                      llama_decision::select_request_shape(common_json::parse(R"({"state": "s"})")) ==
+                      llama_decision::request_shape::jev);
+        t.assert_true("a body with neither selects no front-end",
+                      llama_decision::select_request_shape(common_json::parse(R"({"model": "m"})")) ==
+                      llama_decision::request_shape::none);
+        t.assert_true("a non-object body selects no front-end",
+                      llama_decision::select_request_shape(common_json::parse("[]")) ==
+                      llama_decision::request_shape::none);
+    });
+}
+
+// The accepted spellings of one field: the type aliases, the choices key, and the aggregate alias.
+static void test_generic_field_spellings(testing & t) {
+    t.test("the compiler accepts the documented field spellings", [](testing & t) {
+        for (const char * type : { "choice", "selection" }) {
+            const common_json body = common_json::parse(
+                std::string(R"({"a": {"type": ")") + type + R"(", "description": "d",
+                             "choices": ["x", "y"]}})");
+            t.assert_equal(std::string("type ") + type + " compiles to an enum",
+                           std::string("enum"), llama_decision::compile_schema(body, "").specs[0].type);
+        }
+        // an explicit enum member wins over a declared type
+        t.assert_equal("an enum member forces the enum type", std::string("enum"),
+                       llama_decision::compile_schema(
+                           common_json::parse(R"({"a": {"type": "string", "description": "d",
+                                        "enum": ["x", "y"]}})"), "").specs[0].type);
+        t.assert_equal("the x-aggregate alias is accepted", std::string("median"),
+                       llama_decision::compile_schema(
+                           common_json::parse(R"({"a": {"type": "integer", "description": "d",
+                                        "minimum": 0, "maximum": 2, "x-aggregate": "median"}})"),
+                           "").specs[0].aggregate);
+    });
+}
+
 static void test_generic_frontend(testing & t) {
+    test_generic_schema_compiler(t);
+    test_generic_field_spellings(t);
     test_generic_typed_golden(t);
     test_generic_mutual_exclusion(t);
     test_generic_drives_engine(t);
