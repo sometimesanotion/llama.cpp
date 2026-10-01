@@ -89,16 +89,16 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "overloaded_error";
             code = 529;
             break;
-        case ERROR_TYPE_CONFLICT:
-            type_str = "conflict_error";
-            code = 409;
-            break;
     }
     return json {
         {"code", code},
         {"message", message},
         {"type", type_str},
     };
+}
+
+int error_status(const enum error_type type) {
+    return json_value(format_error_response("", type), "code", 500);
 }
 
 //

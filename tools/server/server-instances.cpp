@@ -1,7 +1,7 @@
 #include "server-instances.h"
 
+#include "decision-engine.h"
 #include "decision-protocol.h"
-#include "session-store.h"
 
 #include "common.h"
 #include "log.h"
@@ -26,29 +26,13 @@ static int64_t now_ms() {
 }
 
 // The number of resident warm-prefix slots for the decision sidecar, derived from
-// --decision-warm-budget-mb. Each slot reserves one sequence of `n_ctx` cells (so it costs roughly
-// budget/n_slots bytes of KV), and each holds one session turn's decoded token list resident so a
-// follow-up decision forks it instead of re-prefilling. 0 disables the warm tier (cold replay, always
-// correct). The budget is a rough VRAM cap, not an exact accounting: per-cell bytes are estimated
-// from the model dims and the KV cache types, and a single-slot minimum keeps the tier usable.
+// --decision-warm-budget-mb. The engine owns the number and the derivation
+// (engine::warm_slots_for_budget), so nothing here clamps it a second time.
 static int decision_warm_slots(const llama_model * model, const common_params & params) {
-    if (params.decision_warm_budget_mb <= 0 || params.n_ctx == 0) {
-        return 0;
-    }
-    const int  n_layer = llama_model_n_layer(model);
-    const int  n_embd  = llama_model_n_embd(model);
-    const int  n_head  = llama_model_n_head(model);
-    const int  n_kv    = llama_model_n_head_kv(model);
-    const float ratio  = n_kv > 0 ? (float) n_kv / (float) n_head : 1.0f;
-    const size_t per_cell = (size_t) ((double) n_layer * n_embd * ratio *
-                                      (ggml_type_size(params.cache_type_k) + ggml_type_size(params.cache_type_v)));
-    if (per_cell == 0) {
-        return 0;
-    }
-    const size_t budget_cells = (size_t) ((double) params.decision_warm_budget_mb * 1024.0 * 1024.0 / (double) per_cell);
-    const size_t slots        = budget_cells / (size_t) params.n_ctx;
-    const size_t capped       = std::clamp<size_t>(slots, 1, 8);
-    return (int) capped;
+    return llama_decision::engine::warm_slots_for_budget(llama_model_n_layer(model), llama_model_n_embd(model),
+                                                         llama_model_n_head(model), llama_model_n_head_kv(model),
+                                                         params.n_ctx, params.decision_warm_budget_mb,
+                                                         params.cache_type_k, params.cache_type_v);
 }
 
 // size the per-slot snapshot locks: one heap-allocated mutex per slot so the vector
@@ -185,7 +169,7 @@ bool server_instances::load(const common_params & params) {
 
     // the internal sidecar executor needs a decision engine to justify its context
     if (params.decision_sidecar && params.n_seq_decision < 3) {
-        IST_ERR("%s", "--decision-sidecar requires --decision-seqs N (N >= 3)\n");
+        IST_ERR("%s", "the decision sidecar executor requires --decision-seqs N (N >= 3)\n");
         return false;
     }
 
@@ -268,8 +252,8 @@ bool server_instances::load(const common_params & params) {
                 cfg.is_default ? ", default" : "");
     }
 
-    // --decision-sidecar: an internal, undeletable executor instance with its own context
-    // and scheduler thread. lazy built on the first decision that routes to it. sized to
+    // the decision sidecar executor: an internal, undeletable executor instance with its own
+    // context and scheduler thread. lazy built on the first decision that routes to it. sized to
     // --decision-sidecar-ctx, else the largest configured window, so the longest turn a
     // chat instance can produce still replays on the sidecar. never the default, never in
     // any user group, so chat never lands on it.
@@ -853,7 +837,7 @@ server_instances::kv_copy_out server_instances::kv_copy_to_data(server_instance 
     }
     if (result->is_error()) {
         // a busy slot fails with a retriable 503 instead of deferring
-        out.error = make_error(result->to_json());
+        out.error = make_error_from_result(*result);
         return out;
     }
     auto * copy = dynamic_cast<server_task_result_slot_copy *>(result.get());
@@ -889,7 +873,7 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
     // file is the migration fallback ("" when neither exists, read as 404).
     const std::string filepath = resolve_snapshot_path(inst.cfg.name, snapshot);
     if (filepath.empty()) {
-        return make_error(format_error_response("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND));
+        return make_error("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND);
     }
 
     // 1. per-slot lock: switching different slots of one instance do not serialize
@@ -956,17 +940,15 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
         return make_error("snapshot read timed out", ERROR_TYPE_UNAVAILABLE);
     }
     if (read.status == server_snapshot_status::MISSING) {
-        return make_error(format_error_response("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND));
+        return make_error("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND);
     }
     if (read.status == server_snapshot_status::CORRUPT || !read.data) {
-        return make_error(format_error_response("corrupt or unreadable snapshot: '" + snapshot + "'",
-                                                ERROR_TYPE_INVALID_REQUEST));
+        return make_error("corrupt or unreadable snapshot: '" + snapshot + "'", ERROR_TYPE_INVALID_REQUEST);
     }
 
     // 6. a snapshot saved under a different context size is incompatible with this slot
     if (read.data->n_ctx_seq != inst.ctx_server->get_slot_n_ctx()) {
-        return make_error(format_error_response(
-            "snapshot context size does not match this slot", ERROR_TYPE_INVALID_REQUEST));
+        return make_error("snapshot context size does not match this slot", ERROR_TYPE_INVALID_REQUEST);
     }
 
     // 6b. a snapshot saved under a different adapter set is incompatible with this
@@ -978,8 +960,7 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
     if (!read.data->adapter_fp.empty() || read.data->version > 1) {
         const std::string current_fp = common_lora_fingerprint(inst.effective.lora_adapters);
         if (read.data->adapter_fp != current_fp) {
-            return make_error(format_error_response(
-                "snapshot adapter set does not match this instance", ERROR_TYPE_INVALID_REQUEST));
+            return make_error("snapshot adapter set does not match this instance", ERROR_TYPE_INVALID_REQUEST);
         }
     } else {
         IST_WRN("snapshot '%s' has no adapter fingerprint (pre-v2 file), skipping the adapter check\n",
@@ -995,7 +976,7 @@ server_http_res_ptr server_instances::apply_snapshot(server_instance &   inst,
     }
     if (result->is_error()) {
         clear_slot_binding(inst, id_slot);
-        return make_error(result->to_json());
+        return make_error_from_result(*result);
     }
 
     // 8. bind on success
@@ -1534,12 +1515,11 @@ bool server_instances::build_context_into(server_instance & inst) {
     }
 
     // the internal decision sidecar is the one executor that owns a decision engine pool: it
-    // restores the decision sequences and unified KV that chat instances no longer carry (M4),
+    // restores the decision sequences and unified KV that chat instances no longer carry,
     // so its own context is sized for the engine pool while every chat instance is stock. the
-    // resident warm-prefix slots (M7) sit above the pool and hold session prefixes resident.
+    // resident warm-prefix slots sit above the pool and hold session prefixes resident.
     if (inst.internal) {
         inst.effective.n_seq_decision = params.n_seq_decision;
-        inst.effective.n_seq_arena    = 0;
         inst.effective.n_seq_warm     = decision_warm_slots(model, inst.effective);
         inst.effective.kv_unified     = true;
     }
@@ -1824,7 +1804,7 @@ server_http_res_ptr server_instances::destroy_instance(const std::string & name,
     }
 
     if (!inst) {
-        return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+        return make_error("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND);
     }
 
     // an unbuilt window never started a scheduler and owns no context: nothing to
@@ -1921,7 +1901,7 @@ server_http_res_ptr server_instances::resize_instance(const std::string & name, 
             }
         }
         if (!inst) {
-            return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+            return make_error("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND);
         }
         // an unbuilt window has no context to rebuild: record the new size, it applies
         // when the window materializes on first demand. the display cache follows the
@@ -2003,7 +1983,7 @@ server_http_res_ptr server_instances::set_instance_pinned(const std::string & na
             }
         }
         if (!inst) {
-            return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+            return make_error("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND);
         }
         inst->cfg.pinned = pinned;
     }
@@ -2572,11 +2552,12 @@ server_http_res_ptr server_instances::handle_post_session_sidecar(const server_h
         return err;
     }
 
-    // policy: the only backend left is the token snapshot. clone/file were host/recurrent-state
-    // backends of the in-context registry, which the sidecar design removes (501 capability
-    // refusal, never a silent fallback). capture_on_turn_complete is accepted as always true:
-    // every create captures eagerly, so there is no lazy window for cache_idle_slots to clear.
-    llama_decision::session_policy policy;
+    // policy: the only backend is the token snapshot. clone/file were host/recurrent-state
+    // backends of the removed in-context registry and are a capability refusal (501), never a
+    // silent fallback. capture_on_turn_complete is accepted as always true: every create captures
+    // eagerly, so there is no lazy window for cache_idle_slots to clear.
+    bool    pinned = false;
+    int64_t ttl_ms = 0;
     if (body.contains("policy") && body.at("policy").is_object()) {
         const json & p = body.at("policy");
         if (p.contains("backend")) {
@@ -2587,18 +2568,27 @@ server_http_res_ptr server_instances::handle_post_session_sidecar(const server_h
             }
         }
         if (p.contains("pinned")) {
-            policy.pinned = p.at("pinned").get<bool>();
+            pinned = p.at("pinned").get<bool>();
         }
         if (p.contains("ttl_ms")) {
-            policy.ttl_ms = p.at("ttl_ms").get<int64_t>();
-            if (policy.ttl_ms < 0) {
+            ttl_ms = p.at("ttl_ms").get<int64_t>();
+            if (ttl_ms < 0) {
                 return make_error("ttl_ms must be >= 0", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+            }
+        }
+        // the token store keeps one snapshot per slot, so there is no per-session turn count to
+        // cap. refusing beats accepting a limit that cannot be enforced.
+        if (const auto max_turns = llama_decision::read_integer(p, "max_turns", "policy.")) {
+            if (*max_turns > 0) {
+                return make_error("max_turns is not supported: the session store keeps one token snapshot "
+                                  "per slot, so there is no per-session turn limit",
+                                  ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
             }
         }
     }
     // the server default --decision-session-ttl applies when the request omits it (0 = no expiry)
-    if (policy.ttl_ms == 0) {
-        policy.ttl_ms = params.decision_session_ttl_ms;
+    if (ttl_ms == 0) {
+        ttl_ms = params.decision_session_ttl_ms;
     }
 
     // eager read-only capture on the owning instance's scheduler (no decoded state or a still-
@@ -2633,7 +2623,7 @@ server_http_res_ptr server_instances::handle_post_session_sidecar(const server_h
         stale_loras = finalize_decision_session_locked(key);
         // token-snapshot budget: --decision-session-budget-mb caps the total owned token bytes
         // across all retained references (0 = unlimited). an over-budget create is refused, never
-        // truncated; the LRU eviction tier that frees a reference under pressure is the M7 warm tier.
+        // truncated; the LRU eviction tier that frees a reference under pressure is the warm tier.
         if (params.decision_session_budget_mb > 0) {
             const size_t budget = (size_t) params.decision_session_budget_mb * 1024u * 1024u;
             size_t total = op_res->tokens.size() * sizeof(llama_token);
@@ -2661,8 +2651,8 @@ server_http_res_ptr server_instances::handle_post_session_sidecar(const server_h
         entry.turn_counter  = decision_slot_turns_[key];
         entry.created_ms    = now_ms();
         entry.last_used_ms  = entry.created_ms;
-        entry.pinned        = policy.pinned;
-        entry.ttl_ms        = policy.ttl_ms;
+        entry.pinned        = pinned;
+        entry.ttl_ms        = ttl_ms;
         session_id = "ses_" + std::to_string(llama_decision::fnv1a64(
             std::to_string(entry.created_ms) + decision_session_key(inst->cfg.name, id_slot))) ;
         entry.session_id = session_id;
@@ -2828,6 +2818,14 @@ std::string server_instances::decision_adapter_scope_of(const std::vector<std::p
     return "adapter-scope-v1:" + llama_decision::sha256_hex(s);
 }
 
+// Warm identity for the sidecar, hashed with sha256 because it keys only this store's own warm
+// tier. The registry's manifest path hash (session-registry.cpp) is fnv1a64 and is deliberately a
+// different function over a different string. The two never exchange hashes: a warm_tag is compared
+// only against another warm_tag in this map, and a manifest hash only against another manifest hash,
+// so the split is currently harmless. Unifying them would change every warm tag and invalidate the
+// resident tier.
+
+
 std::string server_instances::decision_content_hash_of(const std::vector<llama_token> & tokens,
                                                        const std::vector<std::pair<std::string, float>> & scope) {
     std::string bytes;
@@ -2991,7 +2989,7 @@ server_http_res_ptr server_instances::decision_snapshot_op(const std::shared_ptr
         return make_error("the decision snapshot timed out on instance '" + inst->cfg.name + "'", ERROR_TYPE_UNAVAILABLE);
     }
     if (res->is_error()) {
-        return make_error(res->to_json());
+        return make_error_from_result(*res);
     }
     auto * snap = dynamic_cast<server_task_result_decision_snapshot *>(res.get());
     if (snap == nullptr) {
@@ -3112,6 +3110,25 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
                     stale_loras = finalize_decision_session_locked(key);
                 }
                 decision_session_entry entry;
+                // token-snapshot budget: the capture path holds the same --decision-session-budget-mb
+                // cap as the create path, so a client that only ever sends id_slot-pinned decisions
+                // cannot grow the store past it. The entry at this key is about to be replaced, so it
+                // is excluded from the total rather than counted twice.
+                if (params.decision_session_budget_mb > 0) {
+                    const size_t budget = (size_t) params.decision_session_budget_mb * 1024u * 1024u;
+                    size_t total = op_res->tokens.size() * sizeof(llama_token);
+                    for (const auto & kv : decision_sessions_) {
+                        if (kv.second.removed || kv.first == key) {
+                            continue;
+                        }
+                        total += kv.second.tokens.size() * sizeof(llama_token);
+                    }
+                    if (total > budget) {
+                        return make_error("capturing this id_slot snapshot would exceed the --decision-session-budget-mb "
+                                          "budget (" + std::to_string(total) + " > " + std::to_string(budget) + " bytes); "
+                                          "delete sessions or raise the budget", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                    }
+                }
                 entry.instance       = inst->cfg.name;
                 entry.id_slot        = id_slot;
                 entry.base_pos       = op_res->base_pos;
@@ -3661,13 +3678,12 @@ server_http_res_ptr server_instances::handle_post_instance_snapshot(const server
 
     auto inst = get_instance(name);
     if (!inst) {
-        return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+        return make_error("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND);
     }
     // saving needs live KV; unlike a generation request, a save must not materialize
     // a window as a side effect
     if (!inst->built.load(std::memory_order_acquire)) {
-        return make_error(format_error_response("instance '" + name + "' has no loaded context",
-                                                ERROR_TYPE_NOT_FOUND));
+        return make_error("instance '" + name + "' has no loaded context", ERROR_TYPE_NOT_FOUND);
     }
     if (id_slot < 0 || (size_t) id_slot >= inst->slot_snapshots.size()) {
         return make_error("invalid slot id", ERROR_TYPE_INVALID_REQUEST);
@@ -3731,7 +3747,7 @@ server_http_res_ptr server_instances::handle_get_instance_snapshots(const server
     const std::string name = req.get_param("name");
     auto              inst = get_instance(name);
     if (!inst) {
-        return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+        return make_error("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND);
     }
     if (params.slot_save_path.empty()) {
         return make_error("snapshot management requires --slot-save-path", ERROR_TYPE_NOT_SUPPORTED);
@@ -3758,7 +3774,7 @@ server_http_res_ptr server_instances::handle_delete_instance_snapshot(const serv
 
     auto inst = get_instance(name);
     if (!inst) {
-        return make_error(format_error_response("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND));
+        return make_error("instance not found: '" + name + "'", ERROR_TYPE_NOT_FOUND);
     }
 
     // per-instance delete: the hashed-key scoped file, the previous-key scoped
@@ -3778,7 +3794,7 @@ server_http_res_ptr server_instances::handle_delete_instance_snapshot(const serv
     const bool removed_leg = std::filesystem::remove(leg_path, ec);
 
     if (!removed_inst && !removed_prev && !removed_leg) {
-        return make_error(format_error_response("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND));
+        return make_error("snapshot not found: '" + snapshot + "'", ERROR_TYPE_NOT_FOUND);
     }
 
     // unbind any slot that was bound to the deleted snapshot
@@ -3994,15 +4010,26 @@ server_http_res_ptr server_instances::default_instance_forward(const server_http
 }
 
 server_http_res_ptr server_instances::make_error(const std::string & message, error_type type) const {
-    return make_error(format_error_response(message, type));
-}
-
-server_http_res_ptr server_instances::make_error(const json & error) const {
     auto res          = std::make_unique<server_http_res>();
-    res->status       = json_value(error, "code", 500);
+    res->status       = error_status(type);
     res->content_type = "application/json; charset=utf-8";
     res->data         = safe_json_to_str({
-        { "error", error }
+        { "error", format_error_response(message, type) }
+    });
+    return res;
+}
+
+server_http_res_ptr server_instances::make_error_from_result(server_task_result & result) {
+    auto * err = dynamic_cast<server_task_result_error *>(&result);
+    // the error class travels with the result: the body is the class's own render and
+    // the status comes from the same table, never from a field of that body. a result
+    // that is not an error means the caller reached an error branch unexpectedly.
+    auto res          = std::make_unique<server_http_res>();
+    res->status       = err != nullptr ? error_status(err->err_type) : error_status(ERROR_TYPE_SERVER);
+    res->content_type = "application/json; charset=utf-8";
+    res->data         = safe_json_to_str({
+        { "error", err != nullptr ? err->to_json() :
+                                    format_error_response("unexpected instance task result", ERROR_TYPE_SERVER) }
     });
     return res;
 }

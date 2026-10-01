@@ -1153,13 +1153,6 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
-When the slot holds a retained decision session (see `POST /v1/session`), a
-session manifest sidecar (`<filename>.manifest` and `<filename>.sblob`) is
-co-written next to the slot file. The sidecar is bound to the slot file by its
-content hash and carries the session identity, policy, backend, and reference
-state, so a later restore can rebind the session or refuse it, never answer a
-different window. The slot file format is unchanged.
-
 **Response format**
 
 ```json
@@ -1180,12 +1173,9 @@ different window. The slot file format is unchanged.
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
 
-When a session manifest sidecar is present next to the slot file, the restore
-rebinds a matching retained session to the restored window, marks a mismatched
-or foreign manifest unresolvable (dropped, never served), and drops any
-retained reference the restore does not account for - a restore never leaves a
-stale retained turn. A slot restored without a sidecar drops any retained
-reference.
+The slot file carries only the slot's token and KV state. A retained decision
+session (see `POST /v1/session`) is a live sidecar handle keyed by (instance,
+slot, turn) and is not part of the slot file; a restore does not rebind it.
 
 **Response format**
 

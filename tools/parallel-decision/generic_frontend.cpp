@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -56,34 +57,35 @@ generic_field_spec make_field(const std::string & name, const std::string & type
             f.encoded.push_back(json_text(v));
         }
     } else if (kind == "integer") {
-        if (!spec.contains("minimum") || !spec.contains("maximum") ||
-            !spec.at("minimum").is_number_integer() || !spec.at("maximum").is_number_integer()) {
+        const std::string               where = "field \"" + name + "\": ";
+        const std::optional<long long> lo     = read_integer(spec, "minimum", where);
+        const std::optional<long long> hi     = read_integer(spec, "maximum", where);
+        if (!lo || !hi) {
             throw semantic_error("field \"" + name + "\": integer fields need integer minimum and maximum");
         }
-        const long long lo = spec.at("minimum").get<long long>();
-        const long long hi = spec.at("maximum").get<long long>();
-        if (hi < lo || hi - lo + 1 > (long long) DECISION_MAX_NUMERIC_VALUES) {
+        if (*hi < *lo || *hi - *lo + 1 > (long long) DECISION_MAX_NUMERIC_VALUES) {
             throw semantic_error("field \"" + name + "\": integer bounds must define 1-" +
                                  std::to_string(DECISION_MAX_NUMERIC_VALUES) + " values");
         }
         f.type = "integer";
-        for (const auto & gv : numeric_grid((double) lo, (double) hi, 1.0)) {
+        for (const auto & gv : numeric_grid((double) *lo, (double) *hi, 1.0)) {
             f.values.push_back(common_json((long long) gv.value));
             f.encoded.push_back(gv.text);
         }
     } else if (kind == "number") {
-        const char * step_key = json_schema ? "multipleOf" : "step";
-        if (!spec.contains("minimum") || !spec.contains("maximum") || !spec.contains(step_key)) {
+        const char *                step_key = json_schema ? "multipleOf" : "step";
+        const std::string           where    = "field \"" + name + "\": ";
+        const std::optional<double> lo       = read_number(spec, "minimum", where);
+        const std::optional<double> hi       = read_number(spec, "maximum", where);
+        const std::optional<double> step     = read_number(spec, step_key, where);
+        if (!lo || !hi || !step) {
             throw semantic_error("field \"" + name + "\": number fields need minimum, maximum and " + step_key);
         }
-        const double lo   = spec.at("minimum").get<double>();
-        const double hi   = spec.at("maximum").get<double>();
-        const double step = spec.at(step_key).get<double>();
-        if (!(step > 0) || !(hi >= lo)) {
+        if (!(*step > 0) || !(*hi >= *lo)) {
             throw semantic_error("field \"" + name + "\": number needs ordered bounds and a positive step");
         }
         f.type = "number";
-        for (const auto & gv : numeric_grid(lo, hi, step)) {
+        for (const auto & gv : numeric_grid(*lo, *hi, *step)) {
             f.values.push_back(common_json(gv.value));
             f.encoded.push_back(gv.text);
         }
@@ -101,12 +103,15 @@ generic_field_spec make_field(const std::string & name, const std::string & type
             }
         }
     }
-    const std::string agg = spec.value("aggregate", spec.value("x-aggregate", std::string("mode")));
-    const bool        numeric = f.type == "integer" || f.type == "number";
+    const std::string where = "field \"" + name + "\": ";
+    std::string       agg   = read_string(spec, "x-aggregate", where).value_or("mode");
+    agg                      = read_string(spec, "aggregate", where).value_or(agg);
+    const bool numeric = f.type == "integer" || f.type == "number";
     if (agg != "mode" && !(numeric && (agg == "median" || agg == "mean"))) {
         throw semantic_error("field \"" + name + "\": aggregate must be mode, or median/mean for numeric fields");
     }
     f.aggregate = agg;
+
     return f;
 }
 
@@ -155,11 +160,12 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
         if (!spec.is_object()) {
             throw semantic_error("field \"" + e.key() + "\" must be an object");
         }
-        std::string type = spec.value("type", std::string());
+        const std::string where = "field \"" + e.key() + "\": ";
+        std::string       type  = read_string(spec, "type", where).value_or(std::string());
         if (spec.contains("enum")) {
             type = "enum";
         }
-        std::string description = spec.value("description", std::string());
+        std::string description = read_string(spec, "description", where).value_or(std::string());
         if (!json_schema && description.empty()) {
             throw semantic_error("field \"" + e.key() + "\" needs a description");
         }
@@ -199,15 +205,62 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
     return cs;
 }
 
-common_json generic_field_record(const generic_field_spec & spec, const field_result & fr) {
+// The probability/legend key for an allowed value. A string value keys itself; anything else keys
+// by its JSON literal, so a boolean is "true" and a grid point is "2" - never a quoted JSON string.
+static std::string generic_value_key(const common_json & v) {
+    return v.is_string() ? v.get<std::string>() : v.dump();
+}
+
+// One scored field as a Jev-shaped answer. The generic path *extends* the Jev answer rather than
+// replacing it, so a client written against the Jev envelope reads the same keys:
+//   type          the generic field type (boolean | enum | integer | number)
+//   value         the selected typed value - the generic extension over a Jev choice/score key
+//   confidence    the Jev winner-share, from the same helper the Jev path uses
+//   probabilities the Jev map: every allowed value keyed by its value, summing to 1
+//   legend        the value space, as a Jev ScoreAnswer legend
+//   scored        "tree" for a real distribution, "argmax" for a greedy-scored field
+// The spread summaries (aggregate, interval_p10_p90) are diagnostics-only, matching the Jev path,
+// so the default answer carries no off-envelope field.
+common_json generic_field_record(const generic_field_spec & spec, const field_result & fr, bool diagnostics) {
     const int idx = fr.winner;
     if (idx < 0 || idx >= (int) spec.values.size()) {
         throw std::runtime_error("field \"" + spec.name + "\" has no selected value");
     }
+    const bool numeric = spec.type == "integer" || spec.type == "number";
+    const bool have_dist = fr.probs.size() == spec.values.size();
+
+    common_json probs_obj = common_json::object();
+    common_json legend    = common_json::object();
+    std::vector<float>    p;
+    for (size_t i = 0; i < spec.values.size(); ++i) {
+        legend[generic_value_key(spec.values[i])] = spec.values[i];
+        // Every allowed value gets a key, so the Jev map invariant holds even for a greedily
+        // scored field: its non-winning values are the zeros of the point mass.
+        probs_obj[generic_value_key(spec.values[i])] = have_dist ? (double) fr.probs[i] : 0.0;
+    }
+    if (have_dist) {
+        p = fr.probs;
+    } else {
+        // A field scored greedily (more allowed values than the tree bound) has no distribution
+        // over the space, only the winning path's share. Report the point mass it actually chose
+        // rather than fabricating a spread, and say so in `scored`.
+        p.assign(spec.values.size(), 0.0f);
+        p[idx] = 1.0f;
+        probs_obj[generic_value_key(spec.values[idx])] = 1.0;
+    }
+
     common_json f = common_json::object();
-    const bool  numeric = spec.type == "integer" || spec.type == "number";
-    // the numeric spread summary and aggregate reuse the Jev value-space quantile over the grid
-    if (numeric && fr.probs.size() == spec.values.size()) {
+    f["type"]         = spec.type;
+    f["value"]        = spec.values[idx];
+    const common_json conc = concentration_metrics(p, "jev");
+    f["confidence"]   = conc.at("confidence");
+    f["probabilities"] = probs_obj;
+    f["legend"]       = legend;
+    f["scored"]       = have_dist ? "tree" : "argmax";
+    f["scored_nodes"] = fr.scored_nodes;
+
+    if (diagnostics && numeric && have_dist) {
+        // the numeric spread summary and aggregate reuse the Jev value-space quantile over the grid
         const std::vector<double> values = numeric_values(spec);
         common_json interval = common_json::array();
         interval.push_back(json_number(value_quantile(fr.probs, values, 0.10)));
@@ -224,28 +277,20 @@ common_json generic_field_record(const generic_field_spec & spec, const field_re
         }
         f["aggregate"] = json_number(agg);
     }
-    f["value"]        = spec.values[idx];
-    f["probability"]  = (double) (fr.probs.size() == spec.values.size() ? fr.probs[idx] : fr.path_score);
-    f["scored_nodes"] = fr.scored_nodes;
-    f["tree"]         = fr.tree;
     return f;
 }
 
-common_json assemble(const compiled_schema & cs, const result & r) {
-    common_json decision = common_json::object();
-    common_json fields   = common_json::object();
+// One context's scored fields as a Jev `answers` map, keyed by field name. A single context emits
+// this at the top level; several contexts are wrapped in the documented `contexts` array.
+common_json assemble(const compiled_schema & cs, const result & r, bool diagnostics) {
+    common_json answers = common_json::object();
     for (size_t i = 0; i < cs.specs.size(); ++i) {
         if (i >= r.fields.size()) {
             throw std::runtime_error("the scored result is missing field \"" + cs.specs[i].name + "\"");
         }
-        const common_json record = generic_field_record(cs.specs[i], r.fields[i]);
-        decision[cs.specs[i].name] = record.at("value");
-        fields[cs.specs[i].name]   = record;
+        answers[cs.specs[i].name] = generic_field_record(cs.specs[i], r.fields[i], diagnostics);
     }
-    common_json out = common_json::object();
-    out["decision"] = decision;
-    out["fields"]   = fields;
-    return out;
+    return answers;
 }
 
 std::pair<std::string, std::string> render_schema_prompt(const common_chat_templates * tmpls, bool use_jinja,
@@ -271,24 +316,19 @@ generic_request parse_generic_request(const common_json & body) {
     generic_request req;
 
     // the model is required and echoed back, matching the Jev contract
-    if (!body.contains("model") || body.at("model").is_null()) {
+    const std::optional<std::string> model = read_string(body, "model");
+    if (!model) {
         throw semantic_error("model is required");
     }
-    if (!body.at("model").is_string()) {
-        throw semantic_error("model must be a string");
-    }
-    req.model = body.at("model").get<std::string>();
+    req.model = *model;
 
     if (!body.contains("schema") || !body.at("schema").is_object()) {
         throw semantic_error("\"schema\" must be an object");
     }
     req.schema = body.at("schema");
 
-    if (body.contains("instructions") && !body.at("instructions").is_null()) {
-        if (!body.at("instructions").is_string()) {
-            throw semantic_error("instructions must be a string");
-        }
-        req.instructions = body.at("instructions").get<std::string>();
+    if (const std::optional<std::string> ins = read_string(body, "instructions")) {
+        req.instructions = *ins;
     }
 
     // the evidence source (state/contexts/session) is orthogonal to the front-end
@@ -298,26 +338,22 @@ generic_request parse_generic_request(const common_json & body) {
         throw semantic_error("state (or contexts or id_slot) is required");
     }
 
-    if (body.contains("mode") && !body.at("mode").is_null()) {
-        if (!body.at("mode").is_string()) {
-            throw semantic_error("mode must be a string");
-        }
-        req.mode = body.at("mode").get<std::string>();
+    // the same opt-in the Jev path uses: without it the answer stays on the shared envelope
+    if (const std::optional<bool> diag = read_bool(body, "diagnostics")) {
+        req.diagnostics = *diag;
+    }
+
+    if (const std::optional<std::string> mode = read_string(body, "mode")) {
+        req.mode = *mode;
         if (req.mode != "auto" && req.mode != "tree" && req.mode != "greedy") {
             throw semantic_error("mode must be auto, tree or greedy");
         }
     }
-    if (body.contains("tree_max") && !body.at("tree_max").is_null()) {
-        if (!body.at("tree_max").is_number_integer()) {
-            throw semantic_error("tree_max must be an integer");
-        }
-        req.tree_max = (size_t) body.at("tree_max").get<long long>();
+    if (const std::optional<long long> tree_max = read_integer(body, "tree_max")) {
+        req.tree_max = (size_t) *tree_max;
     }
-    if (body.contains("cache_prompt") && !body.at("cache_prompt").is_null()) {
-        if (!body.at("cache_prompt").is_boolean()) {
-            throw semantic_error("cache_prompt must be a boolean");
-        }
-        req.allow_cache = body.at("cache_prompt").get<bool>();
+    if (const std::optional<bool> cache = read_bool(body, "cache_prompt")) {
+        req.allow_cache = *cache;
     }
 
     return req;

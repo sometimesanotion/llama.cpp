@@ -212,10 +212,41 @@ std::string make_prefix_tag(const std::string & system_text, const std::string &
 
 // ---------------------------------------------------------------- engine
 
+int engine::warm_slots_for_budget(int n_layer, int n_embd, int n_head, int n_kv, int n_ctx, int budget_mb,
+                                  ggml_type type_k, ggml_type type_v) {
+    if (budget_mb <= 0 || n_ctx <= 0) {
+        return 0;
+    }
+    const float  ratio    = n_kv > 0 ? (float) n_kv / (float) n_head : 1.0f;
+    const size_t per_cell = (size_t) ((double) n_layer * n_embd * ratio *
+                                      (ggml_type_size(type_k) + ggml_type_size(type_v)));
+    if (per_cell == 0) {
+        return 0;
+    }
+    const size_t budget_cells = (size_t) ((double) budget_mb * 1024.0 * 1024.0 / (double) per_cell);
+    const size_t slots        = budget_cells / (size_t) n_ctx;
+    return (int) std::clamp<size_t>(slots, 1, WARM_MAX_SLOTS);
+}
+
+size_t engine::resident_warm_cells(llama_seq_id except) const {
+    size_t resident = 0;
+    for (size_t i = 0; i < warm_slots_.size(); ++i) {
+        if (warm_slots_[i].tag.empty()) {
+            continue;
+        }
+        if (except >= 0 && seq_pool + (llama_seq_id) n_pool + (llama_seq_id) i == except) {
+            continue;
+        }
+        resident += (size_t) std::max<llama_pos>(warm_slots_[i].pos, 0);
+    }
+    return resident;
+}
+
 engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, int n_warm)
     : ctx(ctx), model(llama_get_model(ctx)), vocab(llama_model_get_vocab(llama_get_model(ctx))),
       mem(llama_get_memory(ctx)), seq_snap(seq_base), seq_pool(seq_base + 1), n_pool(n_seqs - 1),
-      n_warm_(std::clamp(n_warm, 0, WARM_MAX_SLOTS)) {
+      n_warm_(n_warm) {
+    assert(n_warm >= 0 && n_warm <= WARM_MAX_SLOTS);
     if (n_seqs < 3) {
         throw std::invalid_argument("a decision engine needs at least 3 sequences");
     }
@@ -688,18 +719,6 @@ void engine::gather_candidates(int out_idx, const tokens_t & cands, branch_score
     }
 }
 
-result engine::decide(const std::string & shared_text, const std::string & context_text,
-                      const std::vector<field_input> & inputs, const options & opt) {
-    batch_result b = decide_batch(shared_text, { context_text }, inputs, opt);
-    result r = std::move(b.items[0]);
-    r.cache_hit     = b.cache_hit;
-    r.shared_tokens = b.shared_tokens;
-    r.rounds        = b.rounds;
-    r.prefill_ms    = b.prefill_ms;
-    r.scoring_ms    = b.scoring_ms;
-    return r;
-}
-
 compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, const options & opt) const {
     compiled_fields plan;
     plan.p = std::make_unique<compiled_fields::impl>();
@@ -714,12 +733,7 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
         }
         tokens_t suffix;
         std::vector<tokens_t> paths;
-        if (opt.split_boundary) {
-            for (const auto & c : in.candidates) {
-                paths.push_back(tokenize(c + "\n", false));
-            }
-            suffix = tokenize(in.suffix, false);
-        } else {
+        {
             // Tokenise each complete "suffix + value + terminator" and split at the longest token
             // prefix shared by every candidate: the value's first token is exactly what the model
             // would write itself (e.g. `":` then ` true`, not `": ` then `true`).
@@ -904,10 +918,12 @@ batch_result engine::decide_batch_tokens(const tokens_t &              shared,
     }
 
     // Bounded decision context: reject a request whose peak KV use cannot fit before touching the
-    // cache, so the failure is a clean client error. The peak estimate uses the full n_ctx as the
-    // budget and ignores resident chat cells (no free-cell API exists), so it is conservative and
-    // may reject a request that would fit; the decode-time rc==1 path is the actual guarantee
-    // against a partial restore. Never truncate.
+    // cache, so the failure is a clean client error. The peak counts only this request's own
+    // sequences, so the budget is what is actually free: the whole window minus the cells the warm
+    // tier is holding resident, which this request cannot evict. Counted as an upper bound (a warm
+    // slot holds at most its decoded turn), so the check is conservative and may reject a request
+    // that would in fact fit; the decode-time rc==1 path is the actual guarantee against a partial
+    // restore. Never truncate.
     const size_t per_group = std::clamp<size_t>(n_pool / (1 + branches), 1, contexts.size());
     const size_t group     = std::min(per_group, contexts.size());
     const size_t n_free    = (size_t) std::max(0, n_pool - (int) group);
@@ -916,7 +932,8 @@ batch_result engine::decide_batch_tokens(const tokens_t &              shared,
     const size_t peak        = shared.size()
                              + group * trunk_len
                              + branch_wave * (trunk_len + max_branch);
-    const size_t budget      = (size_t) llama_n_ctx(ctx);
+    const size_t resident = resident_warm_cells(-1);
+    const size_t budget = (size_t) llama_n_ctx(ctx) > resident ? (size_t) llama_n_ctx(ctx) - resident : 0;
     if (peak > budget) {
         throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
                              " tokens but the context holds " + std::to_string(budget) +
@@ -1134,12 +1151,15 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
         }
     }
     // The source occupies cells up to base_pos and the trunk copies them, so the peak is the
-    // source plus the head and the branch suffixes decoded above it. Reject an over-budget request
-    // before touching the cache; the decode rc==1 path is the actual guarantee.
+    // source plus the head and the branch suffixes decoded above it. The source's own cells are
+    // already inside that peak, so only the OTHER resident warm prefixes are subtracted from the
+    // window; charging the source twice would reject requests that fit. Reject an over-budget
+    // request before touching the cache; the decode rc==1 path is the actual guarantee.
     const size_t branch_wave = std::min((size_t) n_pool, (size_t) plan.branches);
     const size_t peak        = (size_t) std::max<llama_pos>(base_pos, 0) + head.size()
                              + branch_wave * (head.size() + max_branch);
-    const size_t budget      = (size_t) llama_n_ctx(ctx);
+    const size_t resident    = resident_warm_cells(src);
+    const size_t budget      = (size_t) llama_n_ctx(ctx) > resident ? (size_t) llama_n_ctx(ctx) - resident : 0;
     if (peak > budget) {
         throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
                              " tokens but the context holds " + std::to_string(budget) +

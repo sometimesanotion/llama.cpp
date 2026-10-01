@@ -15,15 +15,18 @@ std::string letter_answer_tail(const std::string & after) {
     return after + "Answer:\n";
 }
 
+// The one option-value formatter: `key`, with ` - description` appended only when a rendered
+// description is non-empty. The option line prefixes the label, so an option always reads the same
+// way and an empty description never leaves a trailing separator.
+std::string format_option_value(const decision_option & opt) {
+    return opt.description.empty() ? opt.key : opt.key + " - " + opt.description;
+}
+
 // The one option-line formatter: `label: key`, with ` - description` appended only when a rendered
 // description is non-empty. The framer builds every scored line through this function, so an empty
 // description can never leave a trailing separator that would change the prompt layout.
 std::string format_option_line(const label & l, const decision_option & opt) {
-    std::string line = l.text + ": " + opt.key;
-    if (!opt.description.empty()) {
-        line += " - " + opt.description;
-    }
-    return line;
+    return l.text + ": " + format_option_value(opt);
 }
 
 namespace {
@@ -162,7 +165,7 @@ const common_chat_templates * tmpls, bool use_jinja,
                                                                    const decision_request & req,
                                                                    const std::vector<label> & labels,
                                                                    const options & opt,
-                                                                   letter_metrics * metrics) {
+                                                                   readout_metrics * metrics) {
     if (sources.full == nullptr) {
         throw std::invalid_argument("the letter readout needs a full-logits engine");
     }
@@ -220,7 +223,6 @@ const common_chat_templates * tmpls, bool use_jinja,
     options readout_opt = opt;
     readout_opt.mode           = "tree"; // the readout needs the exact distribution
     readout_opt.tree_max       = labels.size();
-    readout_opt.split_boundary = false;
     readout_opt.cache_tag      = make_prefix_tag(system_text, split.second, prompt_version);
 
     // compile the plan once on the full engine (the readout_sources contract guarantees it is
@@ -241,14 +243,11 @@ const common_chat_templates * tmpls, bool use_jinja,
         }
     }
 
-    // A session forks the decoded source sequence (in-context) or replays an owned token snapshot
-    // (sidecar executor). Replay re-prefills the token list into the engine's own sequences, so the
-    // two are wire-identical for the same turn (mechanism B); it never touches the source instance.
-    // A resident warm prefix (warm_tag) makes the replay a fork of a kept prefix on follow-up.
+    // A session replays an owned token snapshot: it re-prefills the token list into the engine's
+    // own sequences (mechanism B), so the source instance is never touched. A resident warm prefix
+    // (warm_tag) makes the replay a fork of a kept prefix on follow-up.
     const batch_result b = session
-        ? (sources.session->tokens != nullptr
-            ? sources.full->decide_warm(*sources.session->tokens, plan, readout_opt, sources.session->warm_tag)
-            : sources.full->decide_batch_from_seq(sources.session->seq, sources.session->base_pos, plan, readout_opt))
+        ? sources.full->decide_warm(*sources.session->tokens, plan, readout_opt, sources.session->warm_tag)
         : sources.full->decide_batch(plan, split.first, states, readout_opt);
 
     if (metrics) {

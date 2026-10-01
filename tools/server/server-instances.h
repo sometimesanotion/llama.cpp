@@ -92,7 +92,7 @@ struct server_instance {
 
     // manager-internal window (the decision sidecar executor): reserved name,
     // never deletable, never resized, never picked as the default. chat is
-    // never routed to it; stateless decisions are, via --decision-sidecar.
+    // never routed to it; stateless decisions always are.
     bool internal          = false;
 };
 
@@ -230,6 +230,14 @@ struct server_instances {
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward);
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward,
                                  const dispatch_options & opt);
+
+    // Converts one instance-side task result into a response. The result is already
+    // typed, so the error class travels with it: an error result renders through
+    // format_error_response and its status comes from that same table, never from a
+    // field of a rendered body. A result that is not an error means the caller reached
+    // an error branch by mistake (500). Static so the mapping is testable without a
+    // manager instance.
+    static server_http_res_ptr make_error_from_result(server_task_result & result);
 
     // --- management API ---
     server_http_res_ptr handle_get_instances(const server_http_req & req);
@@ -540,7 +548,6 @@ struct server_instances {
     std::shared_ptr<server_instance> default_instance() const;
 
     server_http_res_ptr make_error(const std::string & message, error_type type) const;
-    server_http_res_ptr make_error(const json & error) const;
     server_http_res_ptr make_error(int code, const std::string & type, const std::string & message) const;
     server_http_res_ptr make_ok(const json & data, int status = 200) const;
 
@@ -643,7 +650,7 @@ struct server_instances {
     // before the store entry (and its adapter refs) is released, then unlease the entry.
     void release_decision_snapshot_after_dispatch(const std::string & snap_key,
                                                   const std::pair<std::string, int> & entry_key);
-    // sidecar executor routing for /v1/decision and /v1/session (--decision-sidecar)
+    // sidecar executor routing for /v1/decision and /v1/session
     server_http_res_ptr handle_post_decision_sidecar(const server_http_req & req);
     server_http_res_ptr handle_post_session_sidecar(const server_http_req & req);
     server_http_res_ptr handle_get_session_sidecar(const server_http_req & req);

@@ -460,18 +460,10 @@ def run_session_checks(model):
         after = json.loads(text)["answers"]
         # a session replay re-prefills on the executor's own context, so a later stateless
         # decision restores its prefix through the engine's host-state warm path; on recurrent
-        # models that restore is exact in the winner but drifts within a small producer bound
-        # (winner stays pinned).
-        prob_tol = 0.1
-        for qid in control:
-            if "noul" in control[qid]:
-                check(abs(after[qid]["noul"] - control[qid]["noul"]) <= prob_tol, f"{qid} stateless unchanged by sessions")
-            else:
-                delta = max_prob_delta(after[qid]["probabilities"], control[qid]["probabilities"])
-                check(delta <= prob_tol,
-                      f"{qid} stateless probabilities unchanged by sessions (delta {delta:.4f})")
-                if "choice" in control[qid]:
-                    check(after[qid]["choice"] == control[qid]["choice"], f"{qid} stateless winner unchanged by sessions")
+        # models that restore is exact in the winner but drifts within a producer bound. A
+        # session churns the cache harder than a plain repeat, so this comparison carries the
+        # wider bound; the winner, the option set and the key set stay pinned either way.
+        check_answers_agree(control, after, "stateless unchanged by sessions", tol=0.1)
     except Exception as e:  # noqa: BLE001
         server.stop()
         print(f"FAIL: session checks: {e}")
@@ -576,6 +568,28 @@ def run_session_handle_checks(model):
         # the file backend needs a writable directory; without one it is a capability refusal, 501
         status, text = ses("POST", "/v1/session", json.dumps({"id_slot": 0, "policy": {"backend": "file"}}))
         check(status == 501, f"the file backend without a directory is refused: {status} {text}")
+
+        # the token store keeps one snapshot per slot, so a per-session turn cap has nothing to
+        # count: a positive max_turns is refused by name, and 0 or absent still work
+        prefill_slot(server, 0, LETTER_SYSTEM, user)
+        status, text = ses("POST", "/v1/session",
+                           json.dumps({"id_slot": 0, "policy": {"max_turns": 5}}))
+        check(status == 422, f"an unsupported max_turns is a 422: {status} {text}")
+        check("max_turns" in text, f"the refusal names max_turns: {text}")
+        for policy in ({}, {"max_turns": 0}, {"pinned": True, "max_turns": 0, "ttl_ms": 60000}):
+            status, text = ses("POST", "/v1/session", json.dumps({"id_slot": 0, "policy": policy}))
+            check(status == 200, f"a create with policy {policy} is accepted: {status} {text}")
+            if status == 200:
+                sid_policy = json.loads(text)["session_id"]
+                status, text = ses("GET", f"/v1/session/{sid_policy}")
+                body = json.loads(text)
+                check(body.get("pinned") is bool(policy.get("pinned", False)),
+                      f"pinned is honoured for {policy}")
+                check(body.get("ttl_ms") == policy.get("ttl_ms", 0),
+                      f"ttl_ms is honoured for {policy}")
+                ses("DELETE", f"/v1/session/{sid_policy}")
+        status, text = ses("POST", "/v1/session", json.dumps({"id_slot": 0}))
+        check(status == 200, f"a create with no policy is unchanged: {status} {text}")
     except Exception as e:  # noqa: BLE001
         server.stop()
         print(f"FAIL: session handle checks: {e}")
@@ -663,6 +677,106 @@ def build_test_lora(model):
 def max_prob_delta(p1, p2):
     keys = set(p1) | set(p2)
     return max(abs(p1.get(k, 0.0) - p2.get(k, 0.0)) for k in keys) if keys else 0.0
+
+
+# The concentration bound a recurrent model may drift by when the same question set is scored
+# twice. A cached prefix is restored through the engine's host-state warm path, so a cold call
+# and a warm call land the recurrent cells at different rows and the label logits differ in the
+# last bits; on a near-tie the reported concentration moves while the winner does not. The bound
+# is the one API.md documents for the qwen hybrid warm restore. It is a producer-numerics bound,
+# not a task-value one: it never licenses a different winner, a different option set, or a
+# different answer key.
+PRODUCER_DRIFT_TOL = 0.05
+
+
+def winner_key(answer):
+    """The decision a client acts on: an option key for a distribution, a polarity for a noul."""
+    if "noul" in answer:
+        return ("noul", answer["noul"] >= 0.5)
+    return ("dist", max(answer["probabilities"], key=answer["probabilities"].get))
+
+
+DIAGNOSTICS_ADDITIVE_KEYS = ("certainty", "median", "interval_p10_p90")
+
+
+def check_answers_agree(a, b, label, tol=PRODUCER_DRIFT_TOL, additive=()):
+    """Two answers to the same question set must agree on every decision and on the envelope.
+
+    The winner is pinned exactly. The concentration is compared with the documented
+    producer-numerics bound because a recurrent prefix restore is exact in the answer and
+    approximate in the float. `tol` widens the concentration bound only; a caller that needs a
+    looser comparison (a session replay churns the cache harder than a plain repeat) says so,
+    and still gets the winner, the option set and the key set pinned. `additive` names the keys
+    the contract lets one side carry and the other not; `diagnostics: true` is the only such
+    case, and it must be named rather than assumed.
+    """
+    check(sorted(a) == sorted(b), f"{label}: the same answers are returned ({sorted(a)} vs {sorted(b)})")
+    extra = set(additive)
+    for qid in sorted(a):
+        x, y = a[qid], b[qid]
+        check(x.get("type") == y.get("type"), f"{label}: {qid} keeps its type ({x.get('type')} vs {y.get('type')})")
+        check(set(x) - extra == set(y) - extra,
+              f"{label}: {qid} carries the same keys ({sorted(set(x) - extra)} vs {sorted(set(y) - extra)})")
+        if "noul" in x:
+            delta = abs(x["noul"] - y["noul"])
+            check(winner_key(x) == winner_key(y), f"{label}: {qid} keeps its polarity")
+            check(delta <= tol,
+                  f"{label}: {qid} noul within the producer bound ({delta:.4f} > {tol})")
+            continue
+        check(sorted(x["probabilities"]) == sorted(y["probabilities"]),
+              f"{label}: {qid} covers the same options")
+        check(winner_key(x) == winner_key(y),
+              f"{label}: {qid} picks the same winner ({winner_key(x)[1]} vs {winner_key(y)[1]})")
+        delta = max_prob_delta(x["probabilities"], y["probabilities"])
+        check(delta <= tol,
+              f"{label}: {qid} probabilities within the producer bound ({delta:.4f} > {tol})")
+
+
+def check_answers_agree_teeth():
+    """Negative control: the agreement check must reject every shape of disagreement.
+
+    A bound a check cannot fail is not a check. Each case below is a real way two answers can
+    disagree, and each must raise.
+    """
+    base = {
+        "dept": {"type": "choice", "choice": "billing", "confidence": 0.9,
+                 "probabilities": {"billing": 0.8, "technical": 0.2}},
+        "refund": {"type": "noul", "noul": 0.7},
+    }
+
+    def copy():
+        return json.loads(json.dumps(base))
+
+    check_answers_agree(base, copy(), "control: an identical pair agrees")
+
+    inside = copy()
+    inside["dept"]["probabilities"] = {"billing": 0.8 + PRODUCER_DRIFT_TOL / 2, "technical": 0.2 - PRODUCER_DRIFT_TOL / 2}
+    check_answers_agree(base, inside, "control: drift just inside the bound agrees")
+
+    for label, mutate in (
+        ("a flipped winner", lambda d: d["dept"]["probabilities"].update(billing=0.1, technical=0.9)),
+        ("a delta past the bound", lambda d: d["dept"]["probabilities"].update(billing=0.9, technical=0.1)),
+        ("a dropped question", lambda d: d.pop("dept")),
+        ("a renamed option", lambda d: d["dept"]["probabilities"].pop("technical")),
+        ("a flipped noul polarity", lambda d: d["refund"].update(noul=0.3)),
+        ("a noul past the bound", lambda d: d["refund"].update(noul=0.7 + PRODUCER_DRIFT_TOL * 2)),
+        ("a changed key set", lambda d: d["refund"].update(confidence=0.5)),
+        ("a changed type", lambda d: d["dept"].update(type="score")),
+        ("an additive key one side does not name", lambda d: d["dept"].update(certainty=0.8)),
+    ):
+        broken = copy()
+        mutate(broken)
+        try:
+            check_answers_agree(base, broken, "control")
+        except AssertionError:
+            continue
+        raise AssertionError(f"the agreement control accepted {label}")
+
+    # a caller that names the documented additive keys is comparing the same decision, so the
+    # additive difference alone must pass
+    diag = copy()
+    diag["dept"]["certainty"] = 0.8
+    check_answers_agree(base, diag, "control: a named additive field", additive=DIAGNOSTICS_ADDITIVE_KEYS)
 
 
 def run_adapter_checks(model, p_base_full):
@@ -885,7 +999,7 @@ def run_permutations_profile_checks(model):
 
 
 def run_routing_checks(model):
-    """M5: the routing matrix for an untargeted stateless decision.
+    """The routing matrix for an untargeted stateless decision.
 
     The sidecar is the only decision executor: the model field is echo-only and never decides
     placement, so every stateless decision is served by the sidecar (bare pool id, Jev alias,
@@ -923,6 +1037,14 @@ def run_routing_checks(model):
 
 
 def main():
+    # the cross-path agreement bound is pure logic, so prove it has teeth before spending a
+    # server on it: a tolerance that can accept everything catches nothing
+    try:
+        check_answers_agree_teeth()
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL: {e}")
+        return 1
+
     if not os.path.isfile(SERVER_BIN):
         print(f"SKIP: server binary not found at {SERVER_BIN}")
         return 0
@@ -989,7 +1111,7 @@ def main():
         if not run_permutations_profile_checks(model):
             return 1
 
-        # M5: routing matrix for an untargeted stateless decision in a pool (target_specified rework)
+        # routing matrix for an untargeted stateless decision in a pool
         if not run_routing_checks(model):
             return 1
 

@@ -53,13 +53,13 @@ struct compiled_schema {
 // Pure: tokenizes nothing and touches no context. Throws semantic_error on a malformed schema.
 compiled_schema compile_schema(const common_json & schema, const std::string & instructions);
 
-// The typed record for one scored field: value, probability, scored_nodes, tree. A numeric field
-// also reports the value-space interval_p10_p90 and the applied aggregate (additive: the value
-// stays the winner). Pure.
-common_json generic_field_record(const generic_field_spec & spec, const field_result & fr);
+// One scored field as a Jev-shaped answer: type, value, confidence, a full probabilities map keyed
+// by value, the value-space legend, and the `scored` mode. Under `diagnostics` a numeric field also
+// reports interval_p10_p90 and the applied aggregate. Pure.
+common_json generic_field_record(const generic_field_spec & spec, const field_result & fr, bool diagnostics);
 
-// {"decision": {...}, "fields": {...}} from a scored result. Pure.
-common_json assemble(const compiled_schema & cs, const result & r);
+// One context's fields as a Jev `answers` map keyed by field name. Pure.
+common_json assemble(const compiled_schema & cs, const result & r, bool diagnostics);
 
 // Renders the schema prompt with the chat template (thinking off) and splits it into the static
 // prefix and the per-request part: the context, the user-turn close, the assistant open and the
@@ -84,6 +84,7 @@ struct generic_request {
     size_t              tree_max = 128;
     bool                allow_cache = true;
     std::string         fork = "auto"; // auto | copy | restore | hybrid
+    bool                diagnostics = false; // opt-in additive fields, as on the Jev path
 };
 
 // Parses and validates a generic request body. Throws semantic_error on invalid content.

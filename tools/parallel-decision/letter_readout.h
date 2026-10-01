@@ -1,8 +1,8 @@
 #pragma once
 
-// Letter readout: score each decision question as one next-token choice over the
-// verified label pool, sharing one framed state prefix across all questions.
-// Built on the same engine and the same branch scorer as the trie path.
+// The readout for the Jev `questions` shape: it scores each question as one next-token choice over
+// the verified label pool, sharing one framed state prefix across all questions. It is built on the
+// same engine and the same branch scorer as the trie readout the generic front-end uses.
 
 #include "decision-engine.h"
 #include "decision-protocol.h"
@@ -43,7 +43,7 @@ const char * letter_system_text();
 // definition, so the framer, the per-request gate and the server cannot drift apart.
 std::string letter_answer_tail(const std::string & after);
 
-struct letter_metrics {
+struct readout_metrics {
     bool   cache_hit      = false;
     bool   warm_hit       = false; // a resident warm prefix was forked instead of a cold replay
     size_t shared_tokens  = 0;
@@ -73,9 +73,13 @@ std::pair<std::string, std::string> render_letter_prompt(const common_chat_templ
 std::pair<std::string, std::string> split_user_turn(const common_chat_templates * tmpls, bool use_jinja,
                                                     bool enable_thinking = false);
 
-// The one option-line formatter (`label: key`, plus ` - description` only when the rendered
-// description is non-empty). The framer builds every scored option line through this, so the
-// prompt layout has a single source and an empty description never leaves a trailing separator.
+// The one option-value formatter (`key`, plus ` - description` only when the rendered description
+// is non-empty), so an empty description can never leave a trailing separator that would change the
+// prompt layout.
+std::string format_option_value(const decision_option & opt);
+
+// The one option-line formatter (`label: ` plus the formatted value). The framer builds every scored
+// line through this, so the prompt layout has a single source.
 std::string format_option_line(const label & l, const decision_option & opt);
 
 // Startup vocabulary probe: every pooled label must be the single non-special token the answer
@@ -91,24 +95,19 @@ void verify_label_pool(const label_vocab & vocab, const std::vector<label> & lab
 void verify_letter_request(const label_vocab & vocab, const std::string & tail,
                            const decision_request & req, const std::vector<label> & labels);
 
-// A live chat sequence to answer about instead of a stateless prompt. The readout forks `seq` at
-// `base_pos` and appends only the decision turn, so the transcript is never re-prefilled and the
-// source sequence is never mutated. Session forks run full logits on the shared context.
-// `tokens` is the token-replay alternative (sidecar executor): the caller owns the completed
-// turn's token list, so the readout re-prefills it and continues from its end; `seq`/`base_pos`
-// are unused. Exactly one of the two is set.
+// A session to answer about instead of a stateless prompt: the caller owns the completed turn's
+// token list (the sidecar executor's token snapshot), so the readout re-prefills it and continues
+// from its end; the source instance is never touched.
 struct session_source {
-    llama_seq_id seq      = -1;
-    llama_pos    base_pos = -1;
-    const tokens_t * tokens = nullptr; // owned token snapshot to replay; null for a sequence fork
+    const tokens_t * tokens = nullptr; // owned token snapshot to replay
     std::string warm_tag;              // resident warm identity (session content hash); empty = cold replay
 };
 
 // The context a letter request runs on: the shared full-logits engine. When `session` is set the
-// readout forks the live sequence on `full` and ignores the state text.
+// readout replays the owned token snapshot and ignores the state text.
 struct readout_sources {
     engine *    full       = nullptr;  // shared context (full-vocabulary logits)
-    const session_source * session = nullptr; // live-session fork source, null for a stateless readout
+    const session_source * session = nullptr; // token-snapshot session source, null for a stateless readout
 };
 
 // The multi-context form: the same questions scored against every context of a `contexts`
@@ -122,6 +121,6 @@ std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_
                                                                   const decision_request & req,
                                                                   const std::vector<label> & labels,
                                                                   const options & opt,
-                                                                  letter_metrics * metrics = nullptr);
+readout_metrics * metrics = nullptr);
 
 } // namespace llama_decision

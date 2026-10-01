@@ -5,7 +5,6 @@
 // reload cannot leave a stale vocab or contract pointing at dead memory.
 
 #include "letter_readout.h"
-#include "session-registry.h"
 
 #include "common.h"
 #include "llama.h"
@@ -37,23 +36,10 @@ struct server_decision_state {
     bool            decision_temp_loaded = false;
     llama_decision::temperature_profile   decision_temp_profile;
 
-    // Retained-turn registry for live-session decisions: one owned reference per chat slot, so a
-    // decision about a slot survives the slot's KV being cleared by cache_idle_slots. The registry
-    // sequences sit above the engine's pool; it is created on first use and reset with the rest.
-    std::unique_ptr<llama_decision::session_registry> decision_sessions;
-
-    // The memory epoch: a monotonically increasing counter that identifies the current KV/memory
-    // generation. Every retained-turn capture records the epoch it was taken under, and a resolve
-    // refuses a capture from a different generation (HTTP 409 stale). It is bumped by reset()
-    // (model free/reload) and by server_context::on_memory_invalidated() on a whole-context
-    // replace/load; the registry is created lazily with the current value.
-    uint64_t memory_epoch = 0;
-
     // Total reset: every member that is a function of the loaded model is dropped, so a fresh
     // model after a reload rebuilds the vocab, labels and contract from scratch. Any member added
     // here is covered by construction.
     void reset() {
-        ++memory_epoch; // a reload is a new memory generation: every capture from the old one is stale
         decision_letter_engine.reset();
         decision_label_vocab.reset();
         decision_labels.clear();
@@ -61,17 +47,5 @@ struct server_decision_state {
         decision_contract.clear();
         decision_temp_loaded = false;
         decision_temp_profile = {};
-        decision_sessions.reset();
-    }
-
-    // The whole context was replaced or loaded without a model free/reload (a whole-context
-    // restore or memory clear): bump the memory epoch and tell the live registry, so every retained
-    // capture from the previous generation is refused as stale (409) instead of served from old
-    // state. A registry created after this call starts at the current epoch.
-    void on_memory_invalidated() {
-        ++memory_epoch;
-        if (decision_sessions) {
-            decision_sessions->on_memory_epoch(memory_epoch);
-        }
     }
 };

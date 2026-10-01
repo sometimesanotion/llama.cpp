@@ -95,6 +95,67 @@ std::string render_text(const common_json & v) {
 
 namespace {
 
+// The member, if it is supplied. Absent and JSON null are both "not supplied"; a present value of
+// the wrong JSON kind is the caller's reader to reject, never a silent default.
+const common_json * supplied_member(const common_json & obj, const std::string & key) {
+    if (!obj.contains(key) || obj.at(key).is_null()) {
+        return nullptr;
+    }
+    return &obj.at(key);
+}
+
+std::string member_name(const std::string & where, const std::string & key) {
+    return where.empty() ? key : where + key;
+}
+
+} // namespace
+
+std::optional<std::string> read_string(const common_json & obj, const std::string & key, const std::string & where) {
+    const common_json * v = supplied_member(obj, key);
+    if (v == nullptr) {
+        return std::nullopt;
+    }
+    if (!v->is_string()) {
+        throw semantic_error(member_name(where, key) + " must be a string");
+    }
+    return v->get<std::string>();
+}
+
+std::optional<bool> read_bool(const common_json & obj, const std::string & key, const std::string & where) {
+    const common_json * v = supplied_member(obj, key);
+    if (v == nullptr) {
+        return std::nullopt;
+    }
+    if (!v->is_boolean()) {
+        throw semantic_error(member_name(where, key) + " must be a boolean");
+    }
+    return v->get<bool>();
+}
+
+std::optional<long long> read_integer(const common_json & obj, const std::string & key, const std::string & where) {
+    const common_json * v = supplied_member(obj, key);
+    if (v == nullptr) {
+        return std::nullopt;
+    }
+    if (!v->is_number_integer()) {
+        throw semantic_error(member_name(where, key) + " must be an integer");
+    }
+    return v->get<long long>();
+}
+
+std::optional<double> read_number(const common_json & obj, const std::string & key, const std::string & where) {
+    const common_json * v = supplied_member(obj, key);
+    if (v == nullptr) {
+        return std::nullopt;
+    }
+    if (!v->is_number()) {
+        throw semantic_error(member_name(where, key) + " must be a number");
+    }
+    return v->get<double>();
+}
+
+namespace {
+
 bool is_textual(const common_json & v) {
     return v.is_string() || v.is_object() || v.is_array();
 }
@@ -340,11 +401,9 @@ decision_question parse_question(const std::string & id, const common_json & spe
     }
 
     if (q.type == "integer" || q.type == "number") {
-        if (spec.contains("aggregate") && !spec.at("aggregate").is_null()) {
-            if (!spec.at("aggregate").is_string()) {
-                throw semantic_error("question \"" + id + "\": aggregate must be a string");
-            }
-            q.aggregate = spec.at("aggregate").get<std::string>();
+        const std::optional<std::string> agg = read_string(spec, "aggregate", "question \"" + id + "\": ");
+        if (agg) {
+            q.aggregate = *agg;
             if (q.aggregate != "mode" && q.aggregate != "median" && q.aggregate != "mean") {
                 throw semantic_error("question \"" + id + "\": aggregate must be mode, median or mean");
             }
@@ -421,11 +480,8 @@ temperature_profile parse_temperature_profile(const common_json & doc) {
             throw semantic_error("provenance must be an object");
         }
         auto read = [&prov](const char * key, std::string & out) {
-            if (prov.contains(key)) {
-                if (!prov.at(key).is_string()) {
-                    throw semantic_error(std::string("provenance.") + key + " must be a string");
-                }
-                out = prov.at(key).get<std::string>();
+            if (const std::optional<std::string> v = read_string(prov, key, "provenance.")) {
+                out = *v;
             }
         };
         read("model", profile.provenance.model);
@@ -477,39 +533,27 @@ session_ref parse_session_ref(const common_json & body) {
         ref.session_id = v.get<std::string>();
         ref.present    = true;
     }
-    if (body.contains("id_slot") && !body.at("id_slot").is_null()) {
-        const common_json & v = body.at("id_slot");
-        if (!v.is_number_integer()) {
-            throw semantic_error("id_slot must be an integer");
-        }
+    if (const std::optional<long long> slot = read_integer(body, "id_slot")) {
         if (!ref.session_id.empty()) {
             throw semantic_error("provide either session_id or id_slot, not both");
         }
-        ref.id_slot = (int) v.get<long long>();
-        if (ref.id_slot < 0) {
+        if (*slot < 0) {
             throw semantic_error("id_slot must be >= 0");
         }
+        ref.id_slot = (int) *slot;
         ref.present = true;
     }
-    if (body.contains("session_pos") && !body.at("session_pos").is_null()) {
-        const common_json & v = body.at("session_pos");
-        if (!v.is_number_integer()) {
-            throw semantic_error("session_pos must be an integer");
-        }
-        ref.session_pos = (int) v.get<long long>();
-        if (ref.session_pos < 0) {
+    if (const std::optional<long long> pos = read_integer(body, "session_pos")) {
+        if (*pos < 0) {
             throw semantic_error("session_pos must be >= 0");
         }
         if (!ref.present) {
             throw semantic_error("session_pos requires id_slot or session_id");
         }
+        ref.session_pos = (int) *pos;
     }
-    if (body.contains("turn") && !body.at("turn").is_null()) {
-        const common_json & v = body.at("turn");
-        if (!v.is_string()) {
-            throw semantic_error("turn must be a string");
-        }
-        ref.turn = v.get<std::string>();
+    if (const std::optional<std::string> turn = read_string(body, "turn")) {
+        ref.turn = *turn;
     }
     return ref;
 }
@@ -582,13 +626,11 @@ decision_request parse_decision_request(const common_json & body) {
 
     // The model is required: an external router in front of this server selects the model, and
     // the response echoes it back. Jev requires it too, so a missing field is a 422 naming it.
-    if (!body.contains("model") || body.at("model").is_null()) {
+    const std::optional<std::string> model = read_string(body, "model");
+    if (!model) {
         throw semantic_error("model is required");
     }
-    if (!body.at("model").is_string()) {
-        throw semantic_error("model must be a string");
-    }
-    req.model = body.at("model").get<std::string>();
+    req.model = *model;
 
     if (body.contains("contexts") && !body.at("contexts").is_null()) {
         if (!body.at("contexts").is_array() || body.at("contexts").empty() ||
@@ -624,14 +666,11 @@ decision_request parse_decision_request(const common_json & body) {
         req.questions.push_back(parse_question(e.key(), e.value()));
     }
 
-    if (body.contains("temperature") && !body.at("temperature").is_null()) {
-        if (!body.at("temperature").is_number()) {
-            throw semantic_error("temperature must be a number");
-        }
-        req.temperature = body.at("temperature").get<double>();
-        if (!(req.temperature > 0.0)) {
+    if (const std::optional<double> t = read_number(body, "temperature")) {
+        if (!(*t > 0.0)) {
             throw semantic_error("temperature must be > 0");
         }
+        req.temperature = *t;
     }
 
     if (body.contains("temperatures") && !body.at("temperatures").is_null()) {
@@ -639,12 +678,8 @@ decision_request parse_decision_request(const common_json & body) {
         req.temperatures = body.at("temperatures");
     }
 
-    if (body.contains("permutations") && !body.at("permutations").is_null()) {
-        const common_json & v = body.at("permutations");
-        if (!v.is_number_integer()) {
-            throw semantic_error("permutations must be an integer");
-        }
-        req.permutations = (int) v.get<long long>();
+    if (const std::optional<long long> perms = read_integer(body, "permutations")) {
+        req.permutations = (int) *perms;
         if (req.permutations < 1) {
             throw semantic_error("permutations must be >= 1");
         }
@@ -653,18 +688,12 @@ decision_request parse_decision_request(const common_json & body) {
         }
     }
 
-    if (body.contains("diagnostics") && !body.at("diagnostics").is_null()) {
-        if (!body.at("diagnostics").is_boolean()) {
-            throw semantic_error("diagnostics must be a boolean");
-        }
-        req.diagnostics = body.at("diagnostics").get<bool>();
+    if (const std::optional<bool> diag = read_bool(body, "diagnostics")) {
+        req.diagnostics = *diag;
     }
 
-    if (body.contains("confidence_profile") && !body.at("confidence_profile").is_null()) {
-        if (!body.at("confidence_profile").is_string()) {
-            throw semantic_error("confidence_profile must be a string");
-        }
-        req.confidence_profile = body.at("confidence_profile").get<std::string>();
+    if (const std::optional<std::string> profile = read_string(body, "confidence_profile")) {
+        req.confidence_profile = *profile;
         if (req.confidence_profile != "local" && req.confidence_profile != "jev") {
             throw semantic_error("confidence_profile must be local or jev");
         }

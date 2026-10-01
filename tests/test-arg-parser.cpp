@@ -351,7 +351,7 @@ static void test(void) {
     {
         common_params sc_params;
 
-        // the sidecar executor needs --decision-seqs
+        // the removed --decision-sidecar flag is unknown; the sidecar executor needs --decision-seqs
         argv = {"binary_name", "--decision-sidecar"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
         argv = {"binary_name", "--decision-sidecar-ctx", "4096"};
@@ -359,17 +359,17 @@ static void test(void) {
 
         // with the decision endpoint enabled they parse with or without a pool: a single-context
         // server gets the sidecar too
-        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar"};
+        argv = {"binary_name", "--decision-seqs", "8"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
         assert(sc_params.decision_sidecar == true);
 
         // with the pool they parse and land in params
-        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar", "--decision-sidecar-ctx", "4096", "--instance", "a:ctx=512"};
+        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar-ctx", "4096", "--instance", "a:ctx=512"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
         assert(sc_params.decision_sidecar == true);
         assert(sc_params.decision_sidecar_ctx == 4096);
 
-        // M5.5: the sidecar prebuild, decision timeout and max-queue flags parse and land in params
+        // the sidecar prebuild, decision timeout and max-queue flags parse and land in params
         argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar-prebuild",
                 "--decision-timeout-ms", "30000", "--decision-max-queue", "8", "--instance", "sc:ctx=512"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
@@ -377,7 +377,7 @@ static void test(void) {
         assert(sc_params.decision_timeout_ms == 30000);
         assert(sc_params.decision_max_queue == 8);
 
-        // M7: the resident warm-prefix budget flag parses and lands; a negative budget is rejected
+        // the resident warm-prefix budget flag parses and lands; a negative budget is rejected
         argv = {"binary_name", "--decision-seqs", "8", "--decision-warm-budget-mb", "256", "--instance", "w:ctx=512"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
         assert(sc_params.decision_warm_budget_mb == 256);
@@ -393,13 +393,9 @@ static void test(void) {
         // a negative ctx is rejected
         argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar-ctx", "-1", "--instance", "a:ctx=512"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
-
-        // the sidecar and a named decision instance are two placements for the same decisions
-        argv = {"binary_name", "--decision-seqs", "8", "--decision-sidecar", "--decision-instance", "a", "--instance", "a:ctx=512"};
-        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sc_params, LLAMA_EXAMPLE_SERVER));
     }
 
-    printf("test-arg-parser: test decision sidecar default (M3)\n\n");
+    printf("test-arg-parser: test decision sidecar default\n\n");
 
     {
         // the sidecar is the only decision executor, with or without a pool
@@ -408,7 +404,7 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), m3_params, LLAMA_EXAMPLE_SERVER));
         assert(m3_params.decision_sidecar == true);
 
-        // M4: the temporary hidden --no-decision-sidecar flag is gone; the sidecar is the only
+        // the temporary hidden --no-decision-sidecar flag is gone; the sidecar is the only
         // executor, so an unknown flag is rejected rather than reviving a legacy path
         common_params m3_off;
         argv = {"binary_name", "--decision-seqs", "8", "--no-decision-sidecar", "--instance", "a:ctx=512"};

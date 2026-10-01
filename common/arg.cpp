@@ -894,23 +894,18 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     // the decision endpoint is enabled by --decision-seqs alone; the other decision flags tune it
-    // and have no effect without it. the sidecar is the only executor, so only an explicit
-    // --decision-sidecar counts as a flag that requires --decision-seqs.
+    // and have no effect without it.
     if (params.n_seq_decision == 0 &&
         (!params.decision_temperature.empty() || !params.decision_contract.empty() ||
-         params.n_decision_permutations != 1 ||
-         (params.decision_sidecar_explicit && params.decision_sidecar) || params.decision_sidecar_ctx != 0 ||
+         params.n_decision_permutations != 1 || params.decision_sidecar_ctx != 0 ||
          params.decision_warm_budget_mb > 0)) {
         throw std::invalid_argument("error: --decision-* flags require --decision-seqs (the decision endpoint is disabled without it)\n");
     }
 
     // a decision never shares a chat context: the sidecar executor owns every decision, so
     // decision traffic cannot perturb a chat decode. a single-context server gets a sidecar
-    // instance like any other and sizes it with --decision-sidecar-ctx. --decision-sidecar is
-    // a presence-only flag, so it can only name this executor, never select another one.
-    if (!params.decision_sidecar_explicit) {
-        params.decision_sidecar = params.n_seq_decision > 0;
-    }
+    // instance like any other and sizes it with --decision-sidecar-ctx.
+    params.decision_sidecar = params.n_seq_decision > 0;
 
     // decision branches fork from the prompt with llama_memory_seq_cp, which needs one unified
     // KV cache; an explicit --no-kv-unified conflicts with --decision-seqs instead of being overridden
@@ -2609,16 +2604,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_DECISION_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
-            {"--decision-arena-seqs"}, "N",
-            string_format("sequences reserved for decision session snapshots, above the decision pool (default: %d = n_parallel when --decision-seqs is set)", params.n_seq_arena),
-            [](common_params & params, int value) {
-                if (value < 0) {
-                    throw std::invalid_argument("--decision-arena-seqs needs a non-negative count");
-                }
-                params.n_seq_arena = value;
-            }
-        ).set_env("LLAMA_ARG_DECISION_ARENA_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
-        add_opt(common_arg(
             {"--decision-temperature"}, "FILE",
             "JSON file with calibrated decision temperatures and provenance; refused if the provenance does not match",
             [](common_params & params, const std::string & value) {
@@ -2643,16 +2628,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_DECISION_PERMUTATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
-            {"--decision-session-backend"}, "NAME",
-            string_format("default retained-turn backend for created sessions: host | clone | file (default: %s; clone is selectable only on dense unified attention or recurrent/hybrid models, file needs a writable --slot-save-path or --decision-session-persist directory)", params.decision_session_backend.empty() ? "host" : params.decision_session_backend.c_str()),
-            [](common_params & params, const std::string & value) {
-                if (value != "host" && value != "clone" && value != "file") {
-                    throw std::invalid_argument("--decision-session-backend needs host, clone or file");
-                }
-                params.decision_session_backend = value;
-            }
-        ).set_env("LLAMA_ARG_DECISION_SESSION_BACKEND").set_examples({LLAMA_EXAMPLE_SERVER}));
-        add_opt(common_arg(
             {"--decision-session-ttl"}, "MS",
             string_format("default time-to-live for created sessions, milliseconds (default: %d = no expiry)", (int) params.decision_session_ttl_ms),
             [](common_params & params, int value) {
@@ -2672,21 +2647,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.decision_session_budget_mb = value;
             }
         ).set_env("LLAMA_ARG_DECISION_SESSION_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
-        add_opt(common_arg(
-            {"--decision-session-persist"}, "DIR",
-            string_format("writable directory for the file retained-turn backend (default: the --slot-save-path directory, when set)"),
-            [](common_params & params, const std::string & value) {
-                params.decision_session_persist = value;
-            }
-        ).set_env("LLAMA_ARG_DECISION_SESSION_PERSIST").set_examples({LLAMA_EXAMPLE_SERVER}));
-        add_opt(common_arg(
-            {"--decision-sidecar"},
-            string_format("run decisions on an internal sidecar executor instance (its own context and scheduler thread, undeletable, built on first decision demand). this is the only decision executor (default: %s)", params.decision_sidecar ? "on" : "off"),
-            [](common_params & params) {
-                params.decision_sidecar = true;
-                params.decision_sidecar_explicit = true;
-            }
-        ).set_env("LLAMA_ARG_DECISION_SIDECAR").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
             {"--decision-sidecar-ctx"}, "N",
             string_format("context size for the decision sidecar executor (default: %d = the largest configured instance window; 0 = inherit the model default)", params.decision_sidecar_ctx),
@@ -2716,7 +2676,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_DECISION_WARM_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
             {"--decision-timeout-ms"}, "N",
-            string_format("server-side deadline for a whole decision, milliseconds (default: %d, calibrated as max(30 s, 4x p99 cold-prefill) on the reference GPU from the M8 measurement; 0 = none; on expiry the request answers 503 + Retry-After, never a partial answer)", params.decision_timeout_ms),
+            string_format("server-side deadline for a whole decision, milliseconds (default: %d, calibrated as max(30 s, 4x p99 cold-prefill) on the reference GPU; 0 = none; on expiry the request answers 503 + Retry-After, never a partial answer)", params.decision_timeout_ms),
             [](common_params & params, int value) {
                 if (value < 0) {
                     throw std::invalid_argument("--decision-timeout-ms needs a non-negative count");

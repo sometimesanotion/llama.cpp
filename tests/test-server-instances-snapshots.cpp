@@ -635,6 +635,80 @@ static void test_envelope_snapshot_row_shape() {
     fs::remove_all(root, ec);
 }
 
+// the pool keeps the error class typed across the instance boundary: the status comes
+// from format_error_response's table, not from any field a result rendered. every
+// error_type maps to its documented status; a result that is not an error is a pool
+// bug (500); a successful slot copy never reaches the helper and keeps 200 + its bytes.
+static void test_result_error_response() {
+    struct {
+        error_type  type;
+        int         status;
+    } cases[] = {
+        { ERROR_TYPE_INVALID_REQUEST, 400 },
+        { ERROR_TYPE_AUTHENTICATION, 401 },
+        { ERROR_TYPE_PERMISSION, 403 },
+        { ERROR_TYPE_NOT_FOUND, 404 },
+        { ERROR_TYPE_SERVER, 500 },
+        { ERROR_TYPE_NOT_SUPPORTED, 501 },
+        { ERROR_TYPE_UNAVAILABLE, 503 },
+        { ERROR_TYPE_EXCEED_CONTEXT_SIZE, 400 },
+        { ERROR_TYPE_INVALID_REQUEST_SEMANTIC, 422 },
+        { ERROR_TYPE_PAYLOAD_TOO_LARGE, 413 },
+        { ERROR_TYPE_RATE_LIMIT, 429 },
+        { ERROR_TYPE_CLIENT_CLOSED, 499 },
+        { ERROR_TYPE_OVERLOADED, 529 },
+    };
+    for (const auto & c : cases) {
+        server_task_result_error err;
+        err.err_type = c.type;
+        err.err_msg  = "pool boundary";
+        auto res = server_instances::make_error_from_result(err);
+        assert(res->status == c.status);
+        const json body = json::parse(res->data);
+        assert(body["error"]["code"] == c.status);
+        assert(body["error"]["message"] == "pool boundary");
+        // the class is what chose the status: the type string matches the same table
+        assert(body["error"]["type"] == format_error_response("x", c.type)["type"]);
+    }
+
+    // a payload that claims a status cannot choose it: the rendered body's code and
+    // the response status are both the table's answer for the typed class
+    {
+        server_task_result_error err;
+        err.err_type = ERROR_TYPE_UNAVAILABLE;
+        err.err_msg  = "retriable";
+        auto res = server_instances::make_error_from_result(err);
+        assert(res->status == 503);
+        assert(json::parse(res->data)["error"]["code"] == 503);
+    }
+
+    // a result that is not an error means the caller reached an error branch by mistake
+    {
+        server_task_result_slot_save_load ok;
+        ok.n_tokens = 7;
+        auto res = server_instances::make_error_from_result(ok);
+        assert(res->status == 500);
+        assert(json::parse(res->data)["error"]["code"] == 500);
+    }
+}
+
+// control group: the success path is untouched. a slot copy is not an error result, so
+// the pool never routes it to the error helper (both call sites gate on is_error()), and
+// the bytes it carries are what the success path consumes.
+static void test_result_success_path_unaffected() {
+    server_task_result_slot_copy copy;
+    copy.id_slot = 0;
+    copy.tokens  = { 1, 2, 3, 4 };
+    copy.buffer  = { 0xAA, 0xBB, 0xCC };
+    assert(!copy.is_error());
+    assert(copy.buffer.size() == 3 && copy.tokens.size() == 4);
+
+    // the copy's own render still carries the copied sizes, so the success branch keeps
+    // reporting them (a save answers from these numbers, not from an error body)
+    const json rendered = copy.to_json();
+    assert(rendered["n_tokens"] == 4 && rendered["n_bytes"] == 3);
+}
+
 // the internal decision sidecar executor: reserved name, internal marker in the envelope,
 // undeletable, unresizable, not createable, and VRAM reported like any other window.
 static void test_sidecar_registration_and_guards() {
@@ -776,6 +850,8 @@ int main(int argc, char ** argv) {
     test_envelope_canonical_stable();
     test_merge_exact_shape();
     test_envelope_snapshot_row_shape();
+    test_result_error_response();
+    test_result_success_path_unaffected();
     test_sidecar_registration_and_guards();
     test_sidecar_build_once_concurrent(model_path);
     return 0;

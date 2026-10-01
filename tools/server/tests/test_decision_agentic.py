@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Agentic-load harness for the decision sidecar executor (M3.4).
+"""Agentic-load harness for the decision sidecar executor.
 
 Runs one llama-server with the sidecar executor default and a realistic mixed
 load on a single GPU: 4 chat agents streaming, 4 stateless decision workers,
-1 session worker, and 2 churn workers, all concurrent. It asserts the M3
+1 session worker, and 2 churn workers, all concurrent. It asserts the sidecar
 concurrency contract:
 
   * chat on the chat instance is NOT gated on a decision: the largest chat

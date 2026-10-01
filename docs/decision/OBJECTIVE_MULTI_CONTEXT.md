@@ -140,10 +140,9 @@ batch geometry. It is removed: the sidecar is the only executor, and
 `--decision-instance` is gone. A single-context server now gets a sidecar
 instance of its own.
 
-The retained-turn registry, the host/clone/file session backends, and the arena
-(`--decision-arena-seqs`) only ever served this lane. They are no longer
-reachable from any request path, but they are still present in the tree and
-should be removed in a follow-up.
+The retained-turn registry, the host/clone/file session backends, the session
+arena (`--decision-arena-seqs`), and the flags that configured them only ever
+served this lane. They are removed from the tree.
 
 ### 3.3 Session decisions
 
@@ -163,9 +162,9 @@ turn the slot already decoded, instead of re-prefilling the transcript.
   token snapshot is model-epoch independent (a reload does not stale it).
 - The source slot is read-only; the source slot's KV is never written by the
   decision.
-- The legacy single-context lane still uses the `host`/`clone`/`file` session
-  backends and the session arena; the sidecar executor offers only the `tokens`
-  backend (`clone`/`file` are a 501 capability refusal).
+- The sidecar executor offers only the `tokens` backend; the retired
+  `clone`/`file` backends are a 501 capability refusal. The in-context session
+  store (arena, memory epoch, retained-turn registry) has been removed.
 
 ---
 
@@ -273,9 +272,6 @@ request. See `API.md` section 2.6.
   qwen's recurrent warm-restore can move the reported concentration by up to ~0.05.
 - Session limits: `--decision-session-ttl`, `--decision-session-budget-mb`
   (token-snapshot byte budget for the sidecar store; 0 = unlimited).
-- Session arena / backends: `--decision-arena-seqs`, `--decision-session-backend`,
-  `--decision-session-persist DIR` (legacy single-context lane only; slated for
-  removal with the session-registry/store deletion).
 - Template and metrics: `--jinja`, `--metrics` (the latter is required for
   `/metrics`; without it the endpoint is 501 by design).
 - Tests require GPU offload: `-ngl 99`.
@@ -330,8 +326,10 @@ suspecting a leak.
 
 Verified working at the merge commit:
 
-- The decision suites, admission, session concurrency, and accuracy harness pass
-  on all three models.
+- The decision suites, admission and session concurrency pass on all three
+  models. The accuracy harness measures the labeled corpus on all three and
+  gates the holdout split against per-model floors, so "passes" says something
+  about answer quality here; see the quality gap below for what it does not fix.
 - `test-decision-engine` passes (lfm 1850, qwen 1845, gemma 1768 assertions).
 - The instance and snapshot C++ suites, and save/load (126/126), pass.
 - Cross-context host-format state transfer (a capture from one context loading
@@ -348,21 +346,47 @@ Verified working at the merge commit:
 > (`--decision-timeout-ms`, `--decision-max-queue`) are calibrated; per-instance
 > and sidecar VRAM are reported in both `/instances` and `/props`. The old
 > shared-context machinery (`session_registry`/`session_store`, the arena/backend
-> flags) is retained only for the still-green legacy single-context lane and is
-> deleted with the pool-level decode re-home (roadmap M4.6/M5.3, deferred). The
+> flags) has been removed from the tree. The
 > gates in the checklist are green on all three models; `--cache-ram 0` soak shows
 > flat RSS and no sequence drift.
 
 Known gaps, in rough priority order:
 
-1. `--decision-session-persist DIR` concatenates `DIR` and the filename without
-   a path separator, so files land next to the directory. `--slot-save-path` is
-   normalized; this flag is not. (Legacy single-context lane only; slated for
-   removal with the session-registry/store deletion.)
-2. A failed session materialize pins one arena sequence until the session is
-   deleted (the error path does not free the sequence). Low severity, but it can
-   accumulate under hostile or corrupt inputs. (Legacy single-context lane only.)
-3. `test-recurrent-state-rollback` fails on lfm2.5-350m and qwen3.5-2b on CPU
+0. **Jev answer quality on the lfm2.5 family is at chance, and the letter
+   readout's framing is why it cannot be fixed from outside.** On the frozen
+   240-case corpus (`tests/decision-baseline/accuracy_corpus.json`) the letter
+   readout's holdout `winner_agreement` is **0.377** on `lfm2.5-350m`, against
+   **0.746** (`qwen3.5-2b`) and **0.754** (`gemma-4-e4b`) on the same cases. A
+   uniform guesser over the same option spaces scores **0.372**, so lfm2.5 is
+   indistinguishable from chance while the control band is not: this is the
+   model family, not the corpus or the path. The numbers are measured against
+   ground truth and are gated - `GATE_FLOORS` in
+   `tools/server/tests/test_decision_accuracy.py` freezes each model's holdout
+   agreement (0.35 / 0.72 / 0.73), so a regression fails instead of passing
+   quietly.
+
+   **What was measured and rejected.** Scoring the answer *values* through the
+   generic schema framing (one enum field per question over the wire values,
+   reusing `compiled_schema` / `field_input`) instead of one letter label per
+   option. On the same 122 holdout cases it scored **0.270 / 0.680 / 0.730** -
+   worse on every model, including the two controls - at 1.4x the warm p50
+   latency. The non-inferiority margin was frozen from the control models'
+   calibration-split bootstrap intervals before any holdout number was read; the
+   decision record is `READOUT_DECISION` in that harness and `readout_decision`
+   in `tests/decision-baseline/accuracy_report.json`. So the earlier note that
+   "the generic front-end scores 0.75 and 1.0 on the same two lfm models" does
+   not survive a 240-case corpus - it came from four cases in a 12-case one, and
+   no old accuracy figure on this branch is comparable to a new one.
+
+   The mechanism is positional, not an implementation defect: the two framings
+   compile to byte-identical scoring fields and the same engine scores them, but
+   the schema framing puts the question in the shared prefix and shows only
+   `"q0":` at the answer position, while the letter framing puts the question and
+   its options immediately before `Answer:`. A future attempt has to beat 0.377
+   on lfm2.5 on this corpus; it cannot be reasoned about from the framing
+   "value scoring is more principled", because that framing is the one that
+   measured worse.
+1. `test-recurrent-state-rollback` fails on lfm2.5-350m and qwen3.5-2b on CPU
    and GPU. The identical failure reproduces on upstream master, so it is a
    pre-existing upstream bug, not a regression from this merge. Do not treat it
    as a green gate until it is fixed upstream.
@@ -383,11 +407,9 @@ eagerly, and sessions run on the sidecar as token snapshots.
 4. `docs/decision/README.md`, for how the decision engine uses KV.
 5. `docs/decision/OBJECTIVE.md`, for the engine tradeoffs and fork strategy.
 6. Source entry points: `tools/server/server-instances.{h,cpp}`,
-   `tools/server/server-context.{h,cpp}` (yield, handles, sequence layout),
-   `tools/parallel-decision/decision-engine.{h,cpp}`. The legacy-lane
-   `tools/parallel-decision/session-registry.{h,cpp}` and
-   `session-store.{h,cpp}` remain for the single-context lane (deferred
-   deletion).
+   `tools/server/server-context.{h,cpp}` (handles, sequence layout),
+   `tools/parallel-decision/decision-engine.{h,cpp}`. The legacy-lane session
+   registry and store have been deleted.
 
 ---
 
@@ -505,8 +527,8 @@ persistence.
 
 #### 12.2.1 Reproduction run (M0 gate)
 
-Harness: `tools/parallel-decision/bench-snapshot.cpp` (build with
-`-DLLAMA_BUILD_DECISION_BENCH=ON`), GPU-only (`-ngl 99`), one chat context and
+Harness (removed after the experiment; the recorded results below are kept):
+`tools/parallel-decision/bench-snapshot.cpp`, GPU-only (`-ngl 99`), one chat context and
 one sidecar context with identical params (`kv_unified`, `swa_full=false`,
 flash attention off for bit-exactness). The turn is tokenized from a fixed
 synthetic paragraph; the 16-token question head is tokenized from a fixed

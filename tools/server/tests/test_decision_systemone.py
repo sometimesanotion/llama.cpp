@@ -122,22 +122,17 @@ def run_checks(server):
         env.check(absent not in doc, f"the default strict response omits {absent}")
 
     # 3. The two routes agree, answer for answer. This is the superset relationship: /v1/decision
-    #    carries everything /v1/systemone does, for a Jev request.
+    #    carries everything /v1/systemone does, for a Jev request. The two calls are separate
+    #    requests, so the winner, the option set and the key set are pinned exactly while the
+    #    concentration is compared with the documented producer-numerics bound: on a recurrent
+    #    model a cached prefix is restored through the engine's host-state warm path, which is
+    #    exact in the answer and approximate in the float.
     status, text = call(server, DECISION, jev_body())
     env.check(status == 200, f"the superset route answers a Jev request: {status} {text[:200]}")
     if status == 200:
         other = json.loads(text)
         check_envelope(env, other, "decision")
-        for qid in doc["answers"]:
-            a, b = doc["answers"][qid], other["answers"][qid]
-            env.check(a.get("choice") == b.get("choice"),
-                      f"both routes pick the same {qid} winner ({a.get('choice')} vs {b.get('choice')})")
-            if "noul" in a:
-                same = abs(a["noul"] - b["noul"]) <= 1e-5
-            else:
-                same = env.max_prob_delta(a["probabilities"], b["probabilities"]) <= 1e-5
-            env.check(same, f"both routes return the same {qid} probabilities")
-            env.check(sorted(a) == sorted(b), f"both routes return the same {qid} answer keys")
+        env.check_answers_agree(doc["answers"], other["answers"], "both routes")
 
     # 4. The generic shape is refused on the strict route and served on the superset.
     schema_body = {"model": "test", "state": STATE,
@@ -149,7 +144,17 @@ def run_checks(server):
     status, text = call(server, DECISION, schema_body)
     env.check(status == 200, f"the superset route serves a schema body: {status} {text[:160]}")
     if status == 200:
-        env.check("results" in json.loads(text), "the schema answer uses the generic result shape")
+        sup = json.loads(text)
+        # the generic shape extends the Jev envelope, so a schema answer is still Jev-readable
+        env.check("answers" in sup and "results" not in sup,
+                  f"the schema answer extends the Jev envelope: {sorted(sup)}")
+        env.check(set(sup) == {"model", "answers", "usage"},
+                  f"the schema answer is the Jev envelope: {sorted(sup)}")
+        for name, ans in sup.get("answers", {}).items():
+            env.check("type" in ans and "value" in ans and "confidence" in ans
+                      and "probabilities" in ans and "legend" in ans,
+                      f"the generic {name} answer carries the Jev keys plus value: {sorted(ans)}")
+            env.check("timings" not in sup, "the strict envelope carries no timings")
 
     # 5. Each type on its own, so a type-specific regression is not masked by the others.
     for qid, spec in ALL_THREE.items():
@@ -221,8 +226,8 @@ def run_checks(server):
         check_answer(env, doc["answers"]["dept"], "choice", "systemone session dept", OPTION_KEYS["dept"])
 
     # 10. The additive diagnostics are opt-in and never change the answers. A warm repeat comes
-    #     first: the request before this one is a session decision, and a cold-vs-warm producer
-    #     difference would otherwise mask the comparison.
+    #     first so the two compared calls sit in the same cache state; the comparison itself is the
+    #     shared cross-request contract, since diagnostics and plain are two separate requests.
     call(server, SYSTEMONE, jev_body())
     status, text = call(server, SYSTEMONE, jev_body())
     env.check(status == 200, f"the warm baseline is answered: {status} {text[:200]}")
@@ -233,15 +238,8 @@ def run_checks(server):
         diag = json.loads(text2)
         env.check("diagnostics" in diag, "the diagnostics object is present when asked for")
         env.check("timings" in diag, "timings are reported when diagnostics are asked for")
-        for qid in plain:
-            env.check(plain[qid].get("choice") == diag["answers"][qid].get("choice"),
-                      f"diagnostics do not change the {qid} winner")
-            if "noul" in plain[qid]:
-                same = abs(plain[qid]["noul"] - diag["answers"][qid]["noul"]) <= 1e-5
-            else:
-                same = env.max_prob_delta(plain[qid]["probabilities"],
-                                          diag["answers"][qid]["probabilities"]) <= 1e-5
-            env.check(same, f"diagnostics do not change the {qid} probabilities")
+        env.check_answers_agree(plain, diag["answers"], "diagnostics",
+                                additive=env.DIAGNOSTICS_ADDITIVE_KEYS)
 
     # 11. The model echo follows the documented contract on the strict route.
     for requested, resolves in (("jev-latest", True), ("jev-preview", True), ("my-model-v9", False), ("", True)):

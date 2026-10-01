@@ -15,7 +15,7 @@ own axis).
 ```
 speed           -> prefill_ms, scoring_ms, total_ms, cache_hit, rounds, rows
 task value      -> winner agreement, Brier, ECE, fork byte equality, framing choice
-reproducibility -> frozen readout/session baselines, calibration ledger, frozen backend flags
+reproducibility -> frozen readout baselines, calibration ledger, frozen backend flags
 coexistence     -> /slots and chat latency bounds, chat byte-stability, source invariance
 ```
 
@@ -77,6 +77,8 @@ GPU is live by watching for `ROCm0` in the context logs when a model is loaded.
 | `LLAMA_SERVER_TEST_NGL` | server scripts | GPU layers (default `99`) |
 | `LLAMA_SERVER_TEST_CTX` | accuracy | context size (default `8192`) |
 | `LLAMA_DECISION_CORPUS` / `_MAX` | accuracy | override corpus dir/file and the case cap (default 100; 0 = all) |
+| `LLAMA_DECISION_ACCURACY_GATE` | accuracy | set `1` to fail the run when the holdout is below the pre-registered floors |
+| `LLAMA_DECISION_ACCURACY_SPLIT` | accuracy | narrow the run to `calibration` or `holdout` |
 | `LLAMA_DECISION_ACCURACY_REPORT` | accuracy | where to upsert the report block |
 | `LLAMA_DECISION_SESSION_FRAMING` | accuracy | set `1` to add the slot-session framing |
 | `LLAMA_DECISION_MAX_BODY` / `_MAX_QUEUE` | admission | override the tiny admission caps |
@@ -139,8 +141,6 @@ before you compare.
 ./build/bin/test-decision-engine --write-calibration-rows
 ./build/bin/test-decision-engine --record-readout   cpu|gpu
 ./build/bin/test-decision-engine --check-readout    cpu|gpu
-./build/bin/test-decision-engine --record-session   cpu|gpu
-./build/bin/test-decision-engine --check-session    cpu|gpu
 ```
 
 The GPU lanes skip with a reason when no GPU backend is present or when
@@ -169,7 +169,10 @@ run on another is the classic false-regression trap.
 ## 5. Accuracy and framing
 
 The labeled corpus is `tests/decision-baseline/accuracy_corpus.json` (letter
-cases with an `expected` answer). It can optionally be replaced by a
+cases with an `expected` answer, and with a `calibration` / `holdout` `split`
+fixed by a hash of the case id). The split is a property of the fixture, not of
+the run, so adding cases never moves an existing case between splits and any
+reader reproduces the same assignment. It can optionally be replaced by a
 Jev-distill corpus: point `LLAMA_DECISION_CORPUS` at a `.jsonl` file (or a
 directory of them) whose rows carry `id/kind/options/target/state/question`.
 Each line is one self-contained row, so `shuf -n2000 file.jsonl` per file yields
@@ -193,8 +196,18 @@ LLAMA_DECISION_CORPUS_MAX=1000 \
 python3 tools/server/tests/test_decision_accuracy.py
 ```
 
-The harness is measurement only. It never asserts a minimum accuracy, so a weak
-model cannot fail the suite; with no model or server binary it skips (exit 0).
+The harness has two modes. The default run is measurement only: it reports
+numbers and gates nothing, so a weak model cannot fail the suite; with no model
+or server binary it skips (exit 0). With `LLAMA_DECISION_ACCURACY_GATE=1` it
+additionally evaluates the **holdout** split against `GATE_FLOORS`, the
+pre-registered per-model winner-agreement floors in the harness, and fails the
+run when a model is below its floor. The floors are frozen from the letter
+readout's own measured holdout agreement on the committed corpus, two
+percentage points below each measurement; Brier and ECE are reported and are
+never part of a floor. `LLAMA_DECISION_ACCURACY_SPLIT` narrows a run to one
+split (`calibration` or `holdout`) so a floor can be derived on the calibration
+cases and then checked on the holdout.
+
 It reports, per model:
 
 - `winner_agreement`: fraction of cases whose argmax equals `expected`.
@@ -207,6 +220,10 @@ It reports, per model:
 - `session`: the same evidence prefilled on a chat slot and answered through the
   session fork, plus `framing_winner` chosen by winner agreement, Brier as the
   tie-break. Confidence never chooses the framing.
+- `readout.letter` and `readout.delta`: the per-case raw results of the readout
+  that produced the numbers, and the paired readout comparison. A server that
+  answered under a different readout than the harness expects is refused, not
+  measured.
 
 Update the committed report only with a matching experiment; each run upserts
 that model's block and preserves the others.
@@ -239,18 +256,17 @@ run only on recurrent/hybrid.
 
 ## 7. Session substrate validation (C++)
 
-The live-session path has its own oracle, independent of the server:
+The engine's fork path has its own oracle, independent of the server:
 
 | Test | What it asserts |
 |---|---|
 | `test_session_fork` | a session fork of a prefilled context matches a full re-prefill |
-| `test_session_registry` | owned turn references: capture, reuse, turn advance/release, epoch staleness |
-| `test_session_handle` | the first-class create/query/pin/erase lifecycle |
-| `test_clone_backend` | metadata-only shared cells: origin clear leaves the clone pinned; shift refuses |
-| `test_file_backend` | on-disk capture, fingerprint, restore refusal on mismatch |
-| `test_window_persistence` | whole-context save/clear/load survival |
-| `test_budget_eviction` | byte-budget LRU eviction and leases |
-| `test_pool_seq_lifecycle` | arena sequences are released after a decision |
+| `test_pool_seq_lifecycle` | engine pool sequences are released after a decision |
+
+The server's session path (the sidecar token snapshot: capture, eager store,
+turn advance/release, TTL/budget eviction) is covered by the HTTP suites
+(`tools/server/tests/test_decision_session_concurrency.py` and
+`test_decision_envelope.py`).
 
 Source invariance is structural, not just asserted: `llama_memory_seq_rm` removes
 only the caller's membership, `find_slot` never reuses a non-empty non-SWA cell,
@@ -258,36 +274,31 @@ and a recurrent partial load does `seq_rm(dst)` first. The oracle records the
 source bytes before and after a fork and requires equality.
 
 ```sh
-# session/registry/backends, both lanes
+# engine fork/session behavior
 LLAMA_DECISION_TEST_MODEL=<model.gguf> \
   ./build/bin/test-decision-engine "decision engine harness(\..*session.*)?"
 ```
 
-## 8. Readout and session reproducibility baselines
+## 8. Readout reproducibility baselines
 
 The frozen readout baseline is the deterministic core of the committed corpus:
 per-question probabilities, winners, `confidence = 1 - H/log K`, `certainty =
 max p`, and label-pool size. Timing is recorded for context and excluded from
-the byte diff. The session baseline records the assembled session response, the
-scripted trigger counters, and what survives a whole-context save/clear/load.
+the byte diff.
 
 ```sh
 # record (GPU needs LLAMA_DECISION_TEST_MODEL; CPU uses the generated model)
 ./build/bin/test-decision-engine --record-readout gpu
 ./build/bin/test-decision-engine --record-readout cpu
-./build/bin/test-decision-engine --record-session gpu
-./build/bin/test-decision-engine --record-session cpu
 
 # check: recompute and fail on any deterministic byte change
 ./build/bin/test-decision-engine --check-readout gpu
 ./build/bin/test-decision-engine --check-readout cpu
-./build/bin/test-decision-engine --check-session gpu
-./build/bin/test-decision-engine --check-session cpu
 ```
 
-The in-suite gates (`test_readout_baseline`, `test_session_baseline`) choose
-whichever frozen baseline matches the model available in the lane; a mismatch
-prints the first differing line.
+The in-suite gate (`test_readout_baseline`) chooses whichever frozen baseline
+matches the model available in the lane; a mismatch prints the first differing
+line.
 
 ## 9. Coexistence with chat (what is asserted)
 
@@ -354,8 +365,6 @@ baseline to make a test pass without understanding the drift.
 | `baseline.json` CPU oracle | `test-decision-engine --write-cpu-oracle` | needs the generated model |
 | `readout_gpu_baseline.json` | `LLAMA_DECISION_TEST_MODEL=... test-decision-engine --record-readout gpu` | GPU lane |
 | `readout_cpu_baseline.json` | `test-decision-engine --record-readout cpu` | CPU lane |
-| `session_gpu_baseline.json` | `LLAMA_DECISION_TEST_MODEL=... test-decision-engine --record-session gpu` | GPU lane |
-| `session_cpu_baseline.json` | `test-decision-engine --record-session cpu` | CPU lane |
 | `decision_letter.golden.json` | `LLAMA_DECISION_TEST_MODEL=... test-decision-engine --write-decision-golden` | letter readout |
 | `decision_basic.golden.json` | `test-decision-engine --write-golden` | shape/assemble |
 | `accuracy_report.json` | `LLAMA_DECISION_ACCURACY_REPORT=... test_decision_accuracy.py` | accuracy |
@@ -435,9 +444,11 @@ present.
   result.
 - A changed `template_hash`, quantization, or any frozen backend flag
   invalidates every prior parity, calibration, and accuracy claim. Re-measure.
-- The accuracy harness is not a gate. Read `winner_agreement`, `Brier`, and `ECE`
-  as measurements; do not turn one into a pass/fail threshold without a
-  pre-registered bound equivalent to `fairness.json`.
+- The accuracy harness measures by default and gates only under
+  `LLAMA_DECISION_ACCURACY_GATE=1`, against floors pre-registered in
+  `GATE_FLOORS`. A floor for a new model or a new corpus is derived on the
+  calibration split first; never set one from a holdout run, and never read
+  `winner_agreement`, `Brier`, or `ECE` from a producer `confidence`.
 - The server scripts are standalone; `pytest`/`tests.sh` do not execute them.
   Run them directly, or wire them into CI.
 
@@ -457,9 +468,8 @@ MODEL=/path/to/model.gguf
 LLAMA_DECISION_TEST_MODEL=$MODEL ./build-rocm/bin/test-decision-engine "decision engine harness(\..*fork.*)?"
 LLAMA_DECISION_TEST_MODEL=$MODEL ./build-rocm/bin/test-decision-engine "decision engine harness(\..*session.*)?"
 
-# frozen readout + session baselines
+# frozen readout baselines
 LLAMA_DECISION_TEST_MODEL=$MODEL ./build-rocm/bin/test-decision-engine --check-readout gpu
-LLAMA_DECISION_TEST_MODEL=$MODEL ./build-rocm/bin/test-decision-engine --check-session gpu
 
 # --- server suites ---
 export LLAMA_SERVER_BIN=$PWD/build-rocm/bin/llama-server

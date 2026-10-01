@@ -48,7 +48,6 @@ struct field_input {
 struct options {
     std::string mode           = "auto"; // auto: tree up to tree_max values, else greedy; tree; greedy
     size_t      tree_max       = 128;
-    bool        split_boundary = false;  // legacy: tokenise suffix and values separately
     bool        allow_cache    = true;   // reuse the cached static prefix when it matches
     std::string cache_tag;               // optional: cache is only reused when the tag also matches
     std::string fork           = "auto"; // auto | copy | restore | hybrid: how branches fork the prefix
@@ -137,6 +136,25 @@ class engine {
   public:
     engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, int n_warm = 0);
 
+    // The most resident warm prefixes an engine keeps. The engine owns the number, so a caller that
+    // sizes sequences above the pool asks for a count here instead of inventing a second limit.
+    static constexpr int WARM_MAX_SLOTS = 8;
+
+    // Resident warm slots a KV budget buys, from the model KV geometry and the cache types. The
+    // engine owns the derivation as well as the limit, so a caller passes geometry and never clamps
+    // the result again. Each slot is charged one whole window of cells, which is an upper bound:
+    // decode_keep clears the sequence and decodes from pos 0, so a filled slot holds only that
+    // turn's tokens. A budget below one full window still yields one slot so the tier stays usable,
+    // and a budget of 0, an unsized window, or a model with no KV geometry disables the tier.
+    static int warm_slots_for_budget(int n_layer, int n_embd, int n_head, int n_kv, int n_ctx, int budget_mb,
+                                     ggml_type type_k, ggml_type type_v);
+
+    // KV cells the resident warm prefixes hold, skipping `except`: the sequence a fork reads from,
+    // whose own cells that fork's peak already counts (pass -1 to charge every slot). The prefixes
+    // stay resident for the whole decision, so both capacity preflights subtract them from the
+    // window.
+    size_t resident_warm_cells(llama_seq_id except) const;
+
     // The single constructor for the flags a save writes and a load uses. Pure: it reads only the
     // requested format and scope, never the engine capability, so a capability downgrade can only
     // change how a state is saved, never how saved bytes are read.
@@ -163,9 +181,6 @@ class engine {
     // Compiles field inputs into the scoring plan. Pure: it tokenizes (through the per-engine
     // cache) and lays out the trie, but never touches the context or the KV cache.
     compiled_fields compile_fields(const std::vector<field_input> & inputs, const options & opt) const;
-
-    result decide(const std::string & shared_text, const std::string & context_text,
-                  const std::vector<field_input> & fields, const options & opt);
 
     // Contexts are prefilled together and their branches scored together, in groups sized to fit
     // the sequence budget; results keep the order of the contexts.
@@ -274,7 +289,6 @@ class engine {
     };
     std::vector<warm_slot> warm_slots_;
     int64_t warm_clock_ = 0;
-    static constexpr int WARM_MAX_SLOTS = 8;
 
     mutable std::unordered_map<std::string, tokens_t> token_cache_;
     static constexpr size_t                           token_cache_limit_ = 1024;

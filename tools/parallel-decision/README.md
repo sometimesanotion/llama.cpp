@@ -209,29 +209,23 @@ with it (a body carrying both is a 400), with a create/query/pin/erase lifecycle
 `POST/GET/PATCH/DELETE /v1/session`. The slot must exist and hold state; a `session_pos` that does
 not exactly continue it is a 422. The generic shape scores one context per session request; the Jev
 shape appends the questions as a fresh user turn through the slot's chat template and runs full
-logits on the shared context. The server answers through an owned reference: on the first decision
-for the slot's current turn it captures the slot's decoded state (`host`: host-format bytes in RAM,
-loaded into a `--decision-arena-seqs` sequence only while the decision runs, so the sequence
-returns to the pool afterwards; `clone`: metadata-only shared cells on dense unified attention or
-recurrent/hybrid models; `file`: state on disk under `--slot-save-path` or
-`--decision-session-persist`), later decisions in the same turn fork the reference, and the
-reference is released when the slot decodes past it (a new completed turn). One retained turn per
-slot; the opaque `turn` tag pins it, and a mismatched `turn` is a 422. A decision on an in-flight
-slot is a 422. The source slot is never mutated, and the response reports `session_fork`,
-`source_slot` and `session_pos` additively. A session decision decodes under the slot's adapter
-scope (the scope that conditioned its K/V); a stateless decision stays base-scoped. References are
-bound to a memory epoch: a whole-context replace/load or model reload makes every capture stale
-(HTTP 409), and a clear plus a same-length re-prefill of different content is refused instead of
-answered. A slot save co-writes a session manifest sidecar bound to the slot file by its content
-hash; a slot restore rebinds a matching manifest, marks a mismatched one unresolvable, and drops
-any retained reference the restore does not account for. Under a configured byte budget or TTL, the
-registry evicts the least-recently-used unpinned, unleased reference and reaps expired unpinned
+logits on the sidecar executor. The pool answers through an owned token snapshot: on the first
+decision for the slot's current turn it copies the completed turn's tokens and adapter scope out of
+the owning instance through a read-only op, and the sidecar re-prefills them into its own context
+(`tokens` is the only backend; the retired `clone`/`file` backends are a 501). Later decisions in
+the same turn reuse the snapshot instead of the slot, and the reference is released when the slot
+decodes past it (a new completed turn). One retained turn per slot; the opaque `turn` tag pins it,
+and a mismatched `turn` is a 422. A decision on an in-flight slot is a 422. The source slot is
+never mutated, and the response reports `session_fork`, `source_slot` and `session_pos` additively.
+A session decision decodes under the snapshot's captured adapter scope; a stateless decision stays
+base-scoped. A slot save or restore carries only the slot's token and KV state; a retained session
+is a live sidecar handle and is not part of a slot file. Under a configured byte budget or TTL, the
+store evicts the least-recently-used unpinned, unleased reference and reaps expired unpinned
 references; the defaults never evict.
 
 In multi-instance mode (`--instance`), `/v1/decision` and `/v1/session` route through the same
-`instance`/`model` fields chat uses. A stateless decision is dispatched like any generation
-request; `--decision-instance NAME` pins untargeted stateless decisions to that instance's own
-context and scheduler. A live-session decision is pinned to the instance that owns its slot and is
+`instance`/`model` fields chat uses. A stateless decision always runs on the internal decision
+sidecar executor. A live-session decision is pinned to the instance that owns its slot and is
 never group-routed; the same slot id in another instance is a different, empty slot.
 
 ### Limits and errors
@@ -345,12 +339,6 @@ output: probability distributions only, output_tokens always 0, closed over the 
 confidence: Jev value (N*p_max-1)/(N-1) by default, opt-in 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy
 calibration: deployment-specific; valid only under the recorded model, quantization, template hash and backend flags
 ```
-
-## CLI
-
-`llama-parallel-decision` runs the same engine from a worker process (stdin/stdout protocol, one JSON request per
-line). Environment: `DECIDE_TREE`, `DECIDE_TREE_MAX`, `DECIDE_NSEQ`, `DECIDE_SPLIT_BOUNDARY`.
-It is a developer tool and is off by default; build it with `-DLLAMA_BUILD_DECISION_CLI=ON`.
 
 ## A UI for it
 

@@ -68,15 +68,39 @@ def label_pool_size(server):
     return json.loads(text).get("diagnostics", {}).get("label_pool_size")
 
 
-def check_record(record, values, numeric, label):
-    """The shape and the invariants every scored field must satisfy, whatever its type."""
+def check_record(record, values, numeric, label, diagnostics=False):
+    """The shape and invariants every scored field must satisfy, whatever its type.
+
+    The generic path extends the Jev answer rather than replacing it, so a record carries the Jev
+    keys (type, confidence, a full probabilities map, a legend) plus the generic `value`. The
+    spread summaries are diagnostics-only, matching the Jev score discipline.
+    """
     env.check(isinstance(record, dict), f"{label}: the field record is an object")
-    for key in ("value", "probability", "scored_nodes", "tree"):
+    for key in ("type", "value", "confidence", "probabilities", "legend", "scored"):
         env.check(key in record, f"{label}: the field record carries {key}")
     env.check(any(v == record["value"] for v in values),
               f"{label}: the value is one of the allowed values ({record['value']})")
-    env.check(0.0 <= record["probability"] <= 1.0, f"{label}: the probability is in [0,1]")
-    if not numeric:
+    env.check(0.0 <= record["confidence"] <= 1.0, f"{label}: confidence is in [0,1]")
+
+    # Jev probability discipline: a map over every allowed value that sums to 1
+    probs = record["probabilities"]
+    env.check(isinstance(probs, dict) and len(probs) == len(values),
+              f"{label}: the probability map covers every allowed value ({sorted(probs)})")
+    env.check(abs(sum(probs.values()) - 1.0) < 1e-6, f"{label}: the probabilities sum to 1")
+    env.check(all(0.0 <= p <= 1.0 for p in probs.values()), f"{label}: every probability is in [0,1]")
+    env.check(record["scored"] in ("tree", "argmax"), f"{label}: the scored mode is reported")
+    if record["scored"] == "argmax":
+        env.check(sum(1 for p in probs.values() if p > 0.0) == 1,
+                  f"{label}: a greedily scored field is the point mass it chose")
+
+    # the legend is the Jev ScoreAnswer shape: the same keys, mapped to their values
+    env.check(set(record["legend"]) == set(probs), f"{label}: the legend covers the same keys")
+
+    # off-envelope fields never appear unless asked for
+    for key in ("interval_p10_p90", "aggregate"):
+        if not diagnostics:
+            env.check(key not in record, f"{label}: {key} is diagnostics-only")
+    if not numeric or not diagnostics:
         return record
     env.check("interval_p10_p90" in record, f"{label}: a numeric field carries interval_p10_p90")
     env.check("aggregate" in record, f"{label}: a numeric field carries aggregate")
@@ -90,8 +114,9 @@ def check_record(record, values, numeric, label):
 
 
 def run_checks(server):
-    # 1. The response envelope: a results list, one entry per context, with the token accounting
-    #    and timings the Jev shape also reports.
+    # 1. The response envelope. The generic path extends the Jev envelope, so the default answer is
+    #    exactly the Jev shape: model + answers + a reduced usage, with no timings and no
+    #    off-envelope counters. The additive counters and timings are opt-in.
     status, text = post_schema(server, {
         "active":   {"type": "boolean", "description": "is the incident active"},
         "severity": {"type": "enum", "description": "incident severity", "enum": ["low", "medium", "high"]},
@@ -100,24 +125,31 @@ def run_checks(server):
     if status != 200:
         return
     doc = json.loads(text)
-    env.check("model" in doc and "results" in doc, f"the envelope carries model and results: {list(doc)}")
-    env.check(isinstance(doc["results"], list) and len(doc["results"]) == 1, "one result per context")
-    for key in ("input_tokens", "output_tokens", "cached_tokens", "state_cache_hit"):
-        env.check(key in doc["usage"], f"usage carries {key}")
+    env.check(set(doc) == {"model", "answers", "usage"},
+              f"the default envelope is the Jev envelope: {sorted(doc)}")
+    env.check(isinstance(doc["answers"], dict), "answers is a map keyed by field name")
+    env.check(set(doc["answers"]) == {"active", "severity"}, "every declared field is answered")
+    env.check(set(doc["usage"]) == {"input_tokens", "output_tokens"},
+              f"the strict usage is input/output only: {sorted(doc['usage'])}")
     env.check(doc["usage"]["output_tokens"] == 0, "a decision still generates nothing")
-    for key in ("prefill_ms", "scoring_ms", "total_ms", "rounds", "rows", "per_decision_ms"):
-        env.check(key in doc["timings"], f"timings carry {key}")
-    result = doc["results"][0]
-    env.check("decision" in result and "fields" in result, "a result carries decision and fields")
-    for key in ("context_tokens", "scored_rows"):
-        env.check(key in result["usage"], f"the per-result usage carries {key}")
 
-    # 2. A boolean and an enum: the value is echoed into the decision and typed in the record.
-    env.check(result["decision"]["active"] in (True, False), "the decision holds the boolean value")
-    env.check(result["fields"]["active"]["value"] == result["decision"]["active"],
-              "the decision echoes the field record")
-    check_record(result["fields"]["active"], [True, False], False, "boolean")
-    check_record(result["fields"]["severity"], ["low", "medium", "high"], False, "enum")
+    # the opt-in carries the additive counters, timings, and the per-field spread summaries
+    status, text = post_schema(server, {
+        "active":   {"type": "boolean", "description": "is the incident active"},
+        "severity": {"type": "enum", "description": "incident severity", "enum": ["low", "medium", "high"]},
+        "sev":      {"type": "integer", "description": "severity", "minimum": 0, "maximum": 4},
+    }, diagnostics=True)
+    env.check(status == 200, f"the diagnostics status {status}: {text[:200]}")
+    if status == 200:
+        ddoc = json.loads(text)
+        for key in ("prefill_ms", "scoring_ms", "total_ms", "rounds", "rows", "per_decision_ms"):
+            env.check(key in ddoc["timings"], f"timings carry {key}")
+        for key in ("input_tokens", "output_tokens", "cached_tokens", "state_cache_hit"):
+            env.check(key in ddoc["usage"], f"the diagnostics usage carries {key}")
+
+    # 2. A boolean and an enum, in the Jev answer shape.
+    check_record(doc["answers"]["active"], [True, False], False, "boolean")
+    check_record(doc["answers"]["severity"], ["low", "medium", "high"], False, "enum")
 
     # 3. Numeric grids: the inclusive integer range and the stepped number grid.
     status, text = post_schema(server, {
@@ -127,34 +159,35 @@ def run_checks(server):
     })
     env.check(status == 200, f"numeric schema status {status}: {text[:200]}")
     if status == 200:
-        fields = json.loads(text)["results"][0]["fields"]
+        fields = json.loads(text)["answers"]
         rec = check_record(fields["count"], list(range(1, 5)), True, "integer")
         env.check(isinstance(rec["value"], int), f"an integer field yields an integer value ({rec['value']})")
         rec = check_record(fields["impact"], [0.0, 0.5, 1.0], True, "number")
         env.check(isinstance(rec["value"], (int, float)) and not isinstance(rec["value"], bool),
                   f"a number field yields a numeric value ({rec['value']})")
 
-    # 4. The aggregates. `mode` is the default and leaves the aggregate on the winning value;
-    #    `median` and `mean` are value-space reductions, so they stay inside the value range and
-    #    keep reporting the band.
+    # 4. The aggregates, which are diagnostics-only, so the default numeric answer stays on the
+    #    envelope. `mode` is the default and leaves the aggregate on the winning value; `median` and
+    #    `mean` are value-space reductions, so they stay inside the value range.
     for aggregate, in (("mode",), ("median",), ("mean",)):
         status, text = post_schema(server, {
             "sev": {"type": "integer", "description": "severity", "minimum": 0, "maximum": 4,
                     "aggregate": aggregate},
-        })
+        }, diagnostics=True)
         env.check(status == 200, f"the {aggregate} aggregate status {status}: {text[:200]}")
         if status != 200:
             continue
-        rec = check_record(json.loads(text)["results"][0]["fields"]["sev"], list(range(5)), True, aggregate)
+        rec = check_record(json.loads(text)["answers"]["sev"], list(range(5)), True, aggregate,
+                           diagnostics=True)
         env.check(0 <= rec["aggregate"] <= 4, f"the {aggregate} aggregate is inside the value range")
         if aggregate == "mode":
             env.check(rec["aggregate"] == rec["value"], "the mode aggregate is the winning value")
     status, text = post_schema(server, {
         "sev": {"type": "integer", "description": "severity", "minimum": 0, "maximum": 4},
-    })
+    }, diagnostics=True)
     env.check(status == 200, f"the default aggregate status {status}: {text[:200]}")
     if status == 200:
-        rec = json.loads(text)["results"][0]["fields"]["sev"]
+        rec = json.loads(text)["answers"]["sev"]
         env.check(rec["aggregate"] == rec["value"], "the default aggregate is mode")
 
     # 5. The capability that earns this front-end its place: a field wider than the tokenizer's
@@ -175,7 +208,7 @@ def run_checks(server):
     env.check(status == 200, f"a {len(wide)}-value enum is served with only {pool} labels: "
                              f"{status} {text[:200]}")
     if status == 200:
-        rec = json.loads(text)["results"][0]["fields"]["wide"]
+        rec = json.loads(text)["answers"]["wide"]
         env.check(rec["value"] in wide, f"the wide field's value is one of its choices ({rec['value']})")
     # the same domain as a Jev choice is refused for want of labels: this is the whole contrast
     jev = {"q": {"type": "choice", "instructions": "which one?",
@@ -198,7 +231,7 @@ def run_checks(server):
     })
     env.check(status == 200, f"the JSON Schema body status {status}: {text[:200]}")
     if status == 200:
-        fields = json.loads(text)["results"][0]["fields"]
+        fields = json.loads(text)["answers"]
         env.check(set(fields) == {"active", "level", "grade"},
                   f"the properties object is the catalogue: {sorted(fields)}")
         check_record(fields["level"], [0, 1, 2], True, "json-schema integer")
@@ -208,7 +241,7 @@ def run_checks(server):
     status, text = post_schema(server, many)
     env.check(status == 200, f"a 16-field schema status {status}: {text[:200]}")
     if status == 200:
-        env.check(len(json.loads(text)["results"][0]["fields"]) == 16, "all 16 fields are scored")
+        env.check(len(json.loads(text)["answers"]) == 16, "all 16 fields are scored")
 
     # 8. Several contexts in one request: one result per context, in request order.
     contexts = ["The service was unreachable for ten minutes.",
@@ -219,11 +252,19 @@ def run_checks(server):
     }, contexts=contexts)
     env.check(status == 200, f"the multi-context status {status}: {text[:200]}")
     if status == 200:
-        results = json.loads(text)["results"]
-        env.check(len(results) == len(contexts),
-                  f"one result per context ({len(results)} vs {len(contexts)})")
-        env.check(all(set(r["fields"]) == {"severity"} for r in results),
+        # several contexts use the documented Jev `contexts` array, not a second list shape
+        mdoc = json.loads(text)
+        env.check(set(mdoc) == {"model", "contexts"},
+                  f"the multi-context envelope is the Jev one: {sorted(mdoc)}")
+        ctxts = mdoc["contexts"]
+        env.check(len(ctxts) == len(contexts),
+                  f"one entry per context ({len(ctxts)} vs {len(contexts)})")
+        env.check(all(set(c) == {"answers", "usage"} for c in ctxts),
+                  "each context entry carries answers and usage")
+        env.check(all(set(c["answers"]) == {"severity"} for c in ctxts),
                   "every context scores the whole catalogue")
+        env.check(all(set(c["usage"]) == {"input_tokens", "output_tokens"} for c in ctxts),
+                  "each context carries the strict usage")
 
     # 9. The echoed model follows the same contract as the Jev shape.
     for requested, resolves in (("jev-latest", True), ("jev-preview", True), ("my-model-v9", False), ("", True)):
@@ -260,6 +301,53 @@ def run_checks(server):
     env.check(status == 400, f"a body carrying both shapes is a 400: {status} {text[:160]}")
     env.check("not both" in text, f"the refusal names the mutual exclusion: {text[:160]}")
 
+    # 10b. A field of the wrong JSON type is invalid decision content, not malformed syntax: it
+    #     answers 422 with the field's own name in the message. The control below proves the
+    #     syntax class is untouched: a truncated body is still 400.
+    for schema, needle in (
+        ({"a": {"type": 5, "description": "d"}}, "type must be a string"),
+        ({"a": {"type": "enum", "description": 7}}, "description must be a string"),
+        ({"a": {"type": "boolean", "description": "d", "aggregate": 3}}, "aggregate must be a string"),
+        ({"a": {"type": "boolean", "description": "d", "x-aggregate": []}}, "x-aggregate must be a string"),
+        ({"a": {"type": "integer", "description": "d", "minimum": "0", "maximum": 2}},
+         "minimum must be an integer"),
+        ({"a": {"type": "integer", "description": "d", "minimum": 0, "maximum": 2.5}},
+         "maximum must be an integer"),
+        ({"a": {"type": "number", "description": "d", "minimum": "0", "maximum": 1, "step": 0.5}},
+         "minimum must be a number"),
+        ({"a": {"type": "number", "description": "d", "minimum": 0, "maximum": "1", "step": 0.5}},
+         "maximum must be a number"),
+        ({"a": {"type": "number", "description": "d", "minimum": 0, "maximum": 1, "step": True}},
+         "step must be a number"),
+    ):
+        status, text = post_schema(server, schema)
+        env.check(status == 422, f"a wrong-typed field is a 422: {status} {text[:160]}")
+        env.check(needle in text, f"the refusal names the field {needle!r}: {text[:160]}")
+
+    for payload, needle in (
+        ({"model": 5, "state": STATE, "schema": {"a": {"type": "boolean", "description": "d"}}},
+         "model must be a string"),
+        ({"model": "t", "state": STATE, "instructions": 7,
+          "schema": {"a": {"type": "boolean", "description": "d"}}}, "instructions must be a string"),
+        ({"model": "t", "state": STATE, "schema": {"a": {"type": "boolean", "description": "d"}},
+          "mode": 1}, "mode must be a string"),
+        ({"model": "t", "state": STATE, "schema": {"a": {"type": "boolean", "description": "d"}},
+          "tree_max": "8"}, "tree_max must be an integer"),
+        ({"model": "t", "state": STATE, "schema": {"a": {"type": "boolean", "description": "d"}},
+          "cache_prompt": "yes"}, "cache_prompt must be a boolean"),
+        ({"model": "t", "state": STATE, "schema": {"a": {"type": "boolean", "description": "d"}},
+          "diagnostics": "yes"}, "diagnostics must be a boolean"),
+    ):
+        status, text = server.post("/v1/decision", json.dumps(payload))
+        env.check(status == 422, f"a wrong-typed request field is a 422: {status} {text[:160]}")
+        env.check(needle in text, f"the refusal names the field {needle!r}: {text[:160]}")
+
+    status, text = server.post("/v1/decision", '{"model": "t", "state":')
+    env.check(status == 400, f"a truncated body stays a 400: {status} {text[:160]}")
+
+    status, text = post_schema(server, {"a": {"type": "boolean", "description": "d"}})
+    env.check(status == 200, f"the control body still answers 200: {status} {text[:160]}")
+
     for payload, needle in (
         ({"state": STATE, "schema": {"a": {"type": "boolean", "description": "d"}}}, "model is required"),
         ({"model": "t", "schema": "nope"}, "must be an object"),
@@ -276,7 +364,9 @@ def run_checks(server):
     status, text = post_schema(server, schema, id_slot=0)
     env.check(status == 200, f"a schema session decision status {status}: {text[:200]}")
     if status == 200:
-        env.check(len(json.loads(text)["results"]) == 1, "a session scores exactly one context")
+        sdoc = json.loads(text)
+        env.check("answers" in sdoc, "a session answer is the Jev envelope")
+        env.check("contexts" not in sdoc, "a session scores exactly one context")
     status, text = post_schema(server, schema, id_slot=1)
     env.check(status in (400, 422), f"an empty slot is refused: {status} {text[:160]}")
 

@@ -4,15 +4,15 @@ Status: implemented. This is the normative contract: routes, request, response,
 errors, and limits. Non-normative design notes, the backend survey, and the
 benchmark narrative live in `README.md`.
 
-The endpoint naming is the one deliberate difference from Jev, and it is
-settled:
+The endpoint naming is settled:
 
-- `POST /v1/decision` is the canonical route.
+- `POST /v1/decision` is the canonical route and the superset: it serves both
+  the Jev `questions` shape and the generic `schema` shape.
 - `POST /decision` is a deprecated alias for the same handler.
-- `/v1/systemone` is Jev's own public path. It is NOT registered on this
-  server. "Jev-compatible" means the request and response fields and their
-  semantics match, so a client written for Jev is pointed here with only a
-  base-URL/path change.
+- `POST /v1/systemone` is also served, as the strict Jev contract alone: it
+  accepts the `questions` shape and refuses a `schema` body with a 400 naming
+  `/v1/decision`. A client written for Jev can therefore keep its path and only
+  swap the base URL. `/v1/decision` answers a Jev request identically.
 
 Other locked shapes: dual readout (letter labels for Jev, trie for generic
 schemas); adapters strictly optional; temperature `T=1.0` default with a
@@ -37,13 +37,13 @@ state + N questions -> N answer distributions
 ```
 
 Route policy:
-- `POST /v1/decision` is the canonical route, `POST /decision` a deprecated
-  alias for the same handler (`tools/server/server.cpp`).
-- Do NOT serve `POST /v1/systemone` from this branch. Jev compatibility is
-  achieved through request and response FIELD names and semantics, not the URL
-  path. A thin client-side base-URL swap (for example `TYPESAFE_BASE_URL`) plus
-  path rewrite is the supported migration; JevBench `typesafe` adapters
-  otherwise talk unchanged.
+- `POST /v1/decision` is the canonical route and the superset; `POST /decision`
+  a deprecated alias for the same handler (`tools/server/server.cpp`).
+- `POST /v1/systemone` is served as the strict Jev contract alone. It shares the
+  decision handler, so the two routes cannot drift: a Jev body is answered
+  identically on both, and only the generic `schema` shape is refused there
+  (400, naming `/v1/decision`). This is the drop-in path for a Jev client
+  (a `TYPESAFE_BASE_URL` swap, no path rewrite required).
 
 Coexistence: the same model/server also serves the OpenAI-compatible API
 (`/v1/chat/completions`, `/v1/models`, `/health`). Decision traffic must not
@@ -162,11 +162,12 @@ Reject empty `criteria` where required. Structured `instructions`/`criteria`
 values are rendered into the prompt, never silently stringified; `legend`
 echoes the ORIGINAL structured values so they round-trip.
 
-Each option line is rendered by `format_option_line` (one function) as
-`label: <key> - <description>`, where the label is the single letter the model
-answers with; when the rendered description is empty the line is
-`label: <key>` only (no trailing separator). Keys are `false`/`true` for noul,
-the option names for choice, and `"0".."K-1"` for score.
+Each option's text is rendered by `format_option_value` (`<key>`, plus
+` - <description>` only when the rendered description is non-empty) and its
+scored line by `format_option_line` (`<label>: ` plus that text); when the
+rendered description is empty the line is `label: <key>` only (no trailing
+separator). Keys are `false`/`true` for noul, the option names for choice, and
+`"0".."K-1"` for score.
 
 ### 2.3 Unified shape: questions + state or contexts
 
@@ -254,15 +255,18 @@ A client may create a server-side session that outlives the slot's current turn
 and survives the slot's KV being cleared and reused:
 
 - `POST /v1/session` - create. Body: `{"id_slot": N, "turn": "...",
-  "policy": {"pinned": bool, "ttl_ms": N, "max_turns": N}}`. Returns
+  "policy": {"pinned": bool, "ttl_ms": N}}`. Returns
   `session_id`, `id_slot`, `turn`, `backend` (`"tokens"`), and `captured`.
   `id_slot` alone keeps working byte-identically; `session_id` is additive.
   Capture is eager: the completed turn's tokens and adapter scope are copied out
   of the owning instance at create, so there is no lazy window for an idle-slot
   purge to invalidate. `capture_on_turn_complete` is accepted as always true.
-  The legacy `host`/`clone`/`file` backends are not available on the sidecar
-  executor: `clone` and `file` are a 501 capability refusal, never a silent
-  fallback, and `host` is accepted as the token snapshot.
+  `policy.max_turns` is accepted only as `0` or absent: the store keeps one
+  snapshot per slot, so there is no per-session turn count to cap, and a
+  positive value is refused with 422 naming the field rather than accepted and
+  silently ignored. The retired `clone`/`file` backends are a 501 capability
+  refusal, never a silent fallback; any other `backend` value is accepted as the
+  token snapshot.
 - `GET /v1/session/{id}` - status: `session_id`, `id_slot`, `turn`, `backend`
   (`"tokens"`), `pinned`, `ttl_ms`, `captured`, `bytes`, `created_ms`,
   `last_used_ms`, and the trigger counters (`n_snapshots`, `n_reuses`,
@@ -314,14 +318,12 @@ per retained turn:
   least-recently-used unpinned, unleased reference. A pinned or in-flight
   reference is never evicted. The default budget is unlimited and the default TTL
   is 0 (no expiry), so a deployment that never sets them sees no eviction.
-- Window persistence: `POST /slots/{id}?action=save` co-writes a session manifest
-  sidecar next to the slot file when a session exists. The manifest is bound to
-  the slot file by its content hash and carries the session identity, policy,
-  backend, and the reference state. `POST /slots/{id}?action=restore` reads the
-  sidecar: a matching manifest rebinds the session to the restored window, a
-  mismatched or foreign one is unresolvable (dropped, never served), and a slot
-  restored without a sidecar drops any retained reference - a restore never
-  leaves a stale retained turn. The slot file format is unchanged.
+- Window persistence: `POST /slots/{id}?action=save`/`restore` carry only the
+  slot's token and KV state. A retained session is a live sidecar handle keyed by
+  (instance, slot, turn); it is not part of a slot file and is not rebound by a
+  restore. A client that restores a slot and wants to keep answering about a
+  captured turn must create a new session from the restored slot. The slot file
+  format is unchanged.
 
 ### 2.5 Generic typed-schema front-end (`schema`)
 
@@ -344,10 +346,32 @@ Schema object with `properties`:
   `multipleOf` in a JSON Schema). Each field is compiled to the same
   `field_input` the Jev front-end produces, and scored by the same engine.
   Numeric fields take `aggregate` (`mode` default, `median`, `mean`).
-* Response: `{model, results: [...], usage, timings}`. Each result matches one
-  context (or the single `state`): `{decision: {field: value, ...},
-  fields: {field: {value, probability, scored_nodes, tree}}, usage}`. Numeric
-  fields add `interval_p10_p90` and `aggregate` to their field record.
+* Response: the **Jev envelope, extended**. A single context answers
+  `{model, answers, usage}`; several use the same `contexts` array as Section
+  2.4. `answers` is keyed by field name, and each answer carries the Jev keys
+  plus one generic key:
+
+  | key | meaning |
+  |---|---|
+  | `type` | the declared field type (`boolean`/`enum`/`integer`/`number`) |
+  | `value` | the selected typed value - the generic extension over a Jev `choice`/`score` |
+  | `confidence` | the Jev winner-share confidence, same helper as the Jev path |
+  | `probabilities` | the Jev map: every allowed value keyed by its value, summing to 1 |
+  | `legend` | the value space, as a Jev `ScoreAnswer` legend |
+  | `scored` | `tree` for a real distribution, `argmax` for a greedy-scored field |
+  | `scored_nodes` | the trie nodes the field cost |
+
+  So a Jev client reads the same keys, and `value` is the only addition. Under
+  `diagnostics: true` a numeric field adds `interval_p10_p90` and `aggregate`,
+  the same diagnostics-only discipline the Jev `score` answer follows, and the
+  top level adds `timings` and the full `usage` counters.
+
+  A field wider than `tree_max` is scored greedily (or `mode: "greedy"` forces
+  it). It has no distribution over its value space, only the winning path's
+  share, so `probabilities` reports the point mass it chose: every allowed value
+  is still keyed and the map still sums to 1 (non-winners are 0), and `scored`
+  says `argmax`. The `probabilities` map therefore always covers every allowed
+  value, whether the field was scored by the trie or greedily.
 * Options: `mode` (`auto` default, `tree`, `greedy`), `tree_max` (default 128),
   `cache_prompt` (default true). Evidence (`state`, `contexts`, or a session
   `id_slot`/`turn`) is orthogonal to the front-end and behaves as in Section 2.3.
@@ -395,12 +419,17 @@ Sidecar executor flags (server side):
 * `--decision-warm-budget-mb N` - KV budget (mebibytes) for the sidecar's resident
   session warm prefixes (default 0 = the warm tier is off). With a positive budget
   the sidecar reserves warm sequences (roughly `budget / (per-cell bytes x n_ctx)`,
-  capped at 8); the first decision on a session turn cold-prefills it into a kept
+  floored at 1, so a budget below one full window still yields one slot, and capped
+  at 8); `n_ctx` per slot is an upper bound, since a filled slot holds only that
+  turn's tokens. The first decision on a session turn cold-prefills it into a kept
   resident sequence and a follow-up decision on the same turn forks that prefix
   instead of re-prefilling. A hit is wire-identical to a miss on every model; on the
   qwen hybrid the recurrent warm-restore can drift the reported score concentration
-  by up to ~0.05 (the documented producer-numerics matter), never the winner. The
-  budget is a rough VRAM cap, not exact accounting.
+  by up to ~0.05 (the documented producer-numerics matter), never the winner; see
+the repeatability rule in Section 3.1 for what "the same answer" means there. The
+budget is a rough VRAM cap, not exact accounting. A warm fork is admitted only
+if its peak fits beside every *other* resident warm prefix; one that does not is
+a 422 before the cache is touched, never a failure discovered at decode time.
 
 ---
 
@@ -472,6 +501,18 @@ either way.
   distribution; they are not
   calibrated correctness and never gate admission, caching, routing, or
   persistence on their own.
+* **Repeatability.** Repeating a request that asks the same question set MUST
+  return the same answer keys, the same option set, and the same winner. It is
+  NOT bit-reproducible on a recurrent or hybrid model: the engine places a
+  cached prefix by restoring a host-format sequence state, which lands the
+  recurrent cells at different rows than a live prefill does, so the gathered
+  label logits differ in the last bits. On a near-tie that moves the reported
+  concentration. The drift is bounded and transient: it is largest on the first
+  two or three decisions after the sidecar is built, then settles into a
+  bit-stable steady state, and on a mid-size reference model it measured 0.015 at
+  most. A dense model, which never round-trips its prefix, is bit-reproducible
+  from the first call. Clients MUST compare a repeated answer on the winner and
+  the key set, never on the last bits of a probability.
 * Score `median` and `interval_p10_p90` (skew-robust spread summaries) are
   additive and only present when `diagnostics: true`; the default score answer
   is the strict Jev `{type, score, probabilities, legend, confidence}` shape.
@@ -548,13 +589,17 @@ the extra usage counters:
 
 `handle_decision` (`tools/server/server-context.cpp`) distinguishes the error
 classes by exception type, and the server maps each through
-`format_error_response` (`tools/server/server-common.cpp`) to an HTTP status.
-Malformed JSON and unusable values/types are 400; well-formed but semantically
-invalid decision content is 422 (including an unknown field inside a question
-object); unknown top-level fields are ignored; over-limit capacity is 413 or
-422; a full queue is 429 or 529 with `Retry-After`; a cancel or client
-disconnect is 499; an unavailable model (no usable labels, contract mismatch)
-is 501. The full contract follows.
+`error_status` / `format_error_response` (`tools/server/server-common.cpp`) to
+an HTTP status. That table is the only owner of the class-to-status mapping: the
+instance pool renders an instance-side failure through the same one, so the
+status a client sees is derived from the error class and never from a rendered
+body. Malformed JSON, and a body the route or the request shape cannot serve at
+all, are 400; a well-formed body with semantically invalid decision content is
+422 (including an unknown field inside a question object and a field of the
+wrong JSON type, whose own name is in the message); unknown top-level fields
+are ignored; over-limit capacity is 413 or 422; a full queue is 429 or 529 with
+`Retry-After`; a cancel or client disconnect is 499; an unavailable model (no
+usable labels, contract mismatch) is 501. The full contract follows.
 
 ### 4.1 Full target error contract
 
@@ -565,23 +610,32 @@ is 501. The full contract follows.
 | 403 | `permission_error` | authenticated but not allowed | |
 | 404 | `not_found_error` | unknown model/route | in router mode the decision route follows the existing proxy behavior, like the other routes |
 | 413 | `payload_too_large` | request body over the configured cap | must reject before decode |
-| 415 | `unsupported_media_type` | `Content-Type` is not `application/json` | enforced by the shared HTTP layer |
-| 422 | `invalid_request_error` (semantic) | valid JSON but invalid decision schema: bad question type, `DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` questions, `DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` options, `DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` score levels, duplicate keys, missing `instructions`, missing required `criteria`, unknown field inside a question | Jev semantic-failure code; never downgrade to 400. Unknown top-level fields are ignored, not rejected |
+| 422 | `invalid_request_error` (semantic) | valid JSON but invalid decision schema: bad question type, `DECISION_MIN_QUESTIONS`-`DECISION_MAX_QUESTIONS` questions, `DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` options, `DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` score levels, duplicate keys, missing `instructions`, missing required `criteria`, unknown field inside a question, a field of the wrong JSON type (its own name is in the message), an unsupported `policy.max_turns` on session create | Jev semantic-failure code; never downgrade to 400. Unknown top-level fields are ignored, not rejected |
 | 429 | `rate_limit_error` | decision queue full | include `Retry-After` |
 | 499 | `client_closed_request` | client disconnected / cancelled mid-evaluation | cancel siblings; never report as a normal answer |
 | 500 | `server_error` | inference/engine failure | reset engine state |
+| 507 | `insufficient_memory_error` | the sidecar could not be built or resized: a weight or adapter reload failed, or the host is out of memory | the executor is unavailable until it is rebuilt |
 | 501 | `not_supported_error` | feature not enabled/available | existing enum value |
 | 503 | `unavailable_error` | shutting down / no service | include `Retry-After` when transient |
 | 529 | `overloaded_error` | server overloaded | include `Retry-After`; Jev uses this |
+
+Two codes this table deliberately omits. **409** is not produced: it existed only
+for the in-context session registry's memory-epoch check (`stale_error`), and
+that whole path has been removed. The sidecar's equivalent condition is the
+**422** row above ("session ... is stale: the source slot's turn ended").
+**415** is not produced by any JSON route either: no route checks
+`Content-Type`; the only 415 in the server is the static-asset check, so a
+decision sent with the wrong content type is a 400 (malformed body).
 
 Error body shape (unchanged from existing server):
 `{"code": <http int>, "message": <string>, "type": <string>}`.
 
 Type-string provenance: the `type` strings live in `format_error_response`
 (`tools/server/server-common.cpp`). 400/401/403/404/500/501/503 predate this
-work; 413/422/429/499/529 were added for the decision contract. The HTTP code
-is normative; if a future implementation uses a different `type` string it must
-document the mapping.
+work; 413/422/429/499/529 were added for the decision contract; 507 is emitted
+from the instance pool (`tools/server/server-instances.cpp`) with its own type
+string. The HTTP code is normative; if a future implementation uses a different
+`type` string it must document the mapping.
 
 Notes:
 - 422 vs 400 is a deliberate split: malformed syntax is 400, semantically
@@ -708,9 +762,6 @@ Rules:
   uses the single `tokens` backend: the owned token list plus adapter scope,
   replayed into the executor's context on demand. `clone`/`file` are a 501
   capability refusal; a non-selectable backend is never a silent fallback.
-- **session manifest**: the sidecar a slot save co-writes, bound to the slot file
-  by its content hash, that a slot restore uses to rebind or refuse the retained
-  reference - a restore never answers from a stale turn.
 - **decision sidecar executor**: the internal pool instance that owns every
   decision, stateless and session, on its own context and scheduler thread; chat
   contexts are never written, stalled, or resized by decision work.

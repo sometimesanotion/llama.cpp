@@ -82,7 +82,6 @@ enum error_type {
     ERROR_TYPE_RATE_LIMIT,        // custom error: decision queue full (429)
     ERROR_TYPE_CLIENT_CLOSED,     // custom error: client disconnected mid-evaluation (499)
     ERROR_TYPE_OVERLOADED,        // custom error: server overloaded (529)
-    ERROR_TYPE_CONFLICT,          // custom error: a stale session reference (409)
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions
@@ -112,6 +111,11 @@ struct server_grammar_trigger {
 };
 
 json format_error_response(const std::string & message, const enum error_type type);
+
+// the HTTP status an error class maps to, read from the same table
+// format_error_response renders. a caller holding a typed error uses this instead
+// of re-parsing a rendered body, so the class -> status mapping stays in one place.
+int error_status(const enum error_type type);
 
 // The strict-Jev decision route. /v1/decision is the superset and also serves the generic `schema`
 // shape; this one serves the Jev contract alone, so a `schema` body is refused there.

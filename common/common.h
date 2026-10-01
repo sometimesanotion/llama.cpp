@@ -466,21 +466,17 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_seq_decision        =     0; // sequences reserved for llama-server's /decision endpoint (0 = disabled)
-    int32_t n_seq_arena           =     0; // sequences reserved for decision session snapshots (0 = derive from n_parallel when decisions are enabled)
-    int32_t n_seq_warm            =     0; // sidecar sequences reserved for resident session warm prefixes (M7; 0 = warm tier off)
+    int32_t n_seq_warm            =     0; // sidecar sequences reserved for resident session warm prefixes (0 = warm tier off)
     int32_t decision_warm_budget_mb = 0;  // KV budget for the sidecar's resident session warm prefixes, mebibytes (0 = warm tier off)
     std::string decision_temperature;      // optional calibrated per-type decision temperatures with provenance
     std::string decision_contract;         // optional expected contract hash; the decision path refuses a mismatch
     int32_t n_decision_permutations = 1;   // default order-de-bias passes when a request omits "permutations"
-    std::string decision_session_backend;  // default retained-turn backend for created sessions: host (default) | clone | file
     int64_t decision_session_ttl_ms = 0;   // default ttl for created sessions, ms (0 = no expiry)
     int32_t decision_session_budget_mb = 0;// byte budget for all retained references (0 = unlimited)
-    std::string decision_session_persist;  // writable directory for the file backend; else slot_save_path
-    bool        decision_sidecar    = true;  // the decision sidecar executor instance is the only decision executor
-    bool        decision_sidecar_explicit = false; // the user passed --decision-sidecar (distinguishes the default from an explicit choice)
+    bool        decision_sidecar    = true;  // the decision sidecar executor instance is the only decision executor (set from n_seq_decision)
     int32_t     decision_sidecar_ctx = 0;    // sidecar context size (0 = the largest configured instance window)
     bool        decision_sidecar_prebuild = false; // eagerly build the sidecar context at startup instead of on first decision
-    int32_t     decision_timeout_ms = 60000; // server-side deadline for a whole decision, ms; default = max(30 s, 4x p99 cold-prefill) from the M8 calibration (0 = none)
+    int32_t     decision_timeout_ms = 60000; // server-side deadline for a whole decision, ms; default = max(30 s, 4x p99 cold-prefill) from the recorded calibration (0 = none)
     int32_t     decision_max_queue  = 4;     // concurrent decision cap; beyond it 429, above twice it 529
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)

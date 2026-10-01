@@ -456,12 +456,11 @@ common_params common_instance_params(const common_params & base, const common_in
     params.n_parallel = inst.parallel > 0 ? inst.parallel : 1;
 
     // sidecar mode: chat instances return to stock behavior - they never host a decision
-    // decode, so they reserve no decision/arena sequences and are not forced into the unified
+    // decode, so they reserve no decision/warm sequences and are not forced into the unified
     // KV cache. the decision sidecar executor restores its own sizing and unified KV when it is
-    // registered. a named --decision-instance legacy executor keeps the shared-context sizing.
+    // registered.
     if (params.decision_sidecar) {
         params.n_seq_decision = 0;
-        params.n_seq_arena    = 0;
         params.n_seq_warm     = 0;
         if (!params.kv_unified_explicit) {
             params.kv_unified = false;
@@ -2083,7 +2082,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel + params.n_seq_decision + params.n_seq_arena + params.n_seq_warm; // decision + arena + warm sequences sit above the slots
+    cparams.n_seq_max         = params.n_parallel + params.n_seq_decision + params.n_seq_warm; // decision + warm sequences sit above the slots
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);

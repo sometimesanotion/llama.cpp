@@ -34,7 +34,6 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_ADAPTERS, // replace the whole adapter list (path+scale+ptr), used by per-instance attach/detach
     SERVER_TASK_TYPE_INSTANCE_OP, // manager-invoked lifecycle op, runs on the scheduler thread
     SERVER_TASK_TYPE_DECISION,
-    SERVER_TASK_TYPE_SESSION,
     SERVER_TASK_TYPE_DECISION_SNAPSHOT, // manager-requested read-only token copy of a completed turn
 };
 
@@ -201,15 +200,6 @@ struct server_task {
     std::shared_ptr<std::atomic<bool>> decision_cancel; // set when the HTTP client disconnects
     // sidecar executor only: an owned token snapshot that replaces the in-context session source
     std::shared_ptr<server_decision_snapshot> decision_snapshot;
-
-    // used by SERVER_TASK_TYPE_SESSION: the session action
-    struct session_action {
-        enum action_t { create, get, erase, patch };
-        action_t    action = create;
-        std::string session_id;
-        json        body; // create/patch payload
-    };
-    session_action session;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
@@ -543,15 +533,6 @@ struct server_task_result_error : server_task_result {
 
 // the /v1/decision response payload
 struct server_task_result_decision : server_task_result {
-    json data;
-
-    virtual json to_json() override {
-        return data;
-    }
-};
-
-// the /v1/session response payload
-struct server_task_result_session : server_task_result {
     json data;
 
     virtual json to_json() override {

@@ -67,8 +67,8 @@ def answer_of(text):
 
 
 # sidecar executor mode: the pool registers a default chat instance and a lazily-registered second
-# instance (used by the cross-instance refusal), plus the internal __decision__ executor. M3: the
-# sidecar is the default executor when --decision-seqs is set, so no --decision-sidecar is passed.
+# instance (used by the cross-instance refusal), plus the internal __decision__ executor. The
+# sidecar is the only executor when --decision-seqs is set, so no extra flag is passed.
 def sidecar_args():
     import tempfile
     return ["--instance", "main:ctx=8192:parallel=2:default",
@@ -88,7 +88,6 @@ def run_checks(model, extra_args=None):
     sidecar_mode = extra_args is not None
     srv = env.Server(model, extra_args if extra_args is not None
                      else ["--parallel", "2", "--slots", "--jinja",
-                           "--decision-arena-seqs", "4",
                            "--slot-save-path", tempfile.mkdtemp()])
     try:
         srv.start()
@@ -155,7 +154,7 @@ def run_checks(model, extra_args=None):
               f"quiet decision {q_dec_ms:.0f}ms, concurrent {d_ms:.0f}ms "
               f"(quiet sum {q_chat_ms + q_dec_ms:.0f}ms)")
 
-        # M3.2: on the sidecar executor a decision does not stall chat on the chat instance. The
+        # On the sidecar executor a decision does not stall chat on the chat instance. The
         # decision runs on its own context, so the concurrent chat must stay near its quiet latency
         # instead of being serialized behind the full decision duration. Machine dependent, so the
         # assertion is a generous factor of the quiet chat latency, not an absolute budget.
@@ -221,7 +220,7 @@ def run_checks(model, extra_args=None):
 
 def run_sidecar_specific_checks(model):
     """Sidecar executor mode: sessions are eager token snapshots replayed on the internal
-    executor, never the owning chat context. Pins the M2 behaviors: F1 regression (another
+    executor, never the owning chat context. Pins the eager-snapshot behaviors: F1 regression (another
     slot's chat does not invalidate a session), identity mismatch 422, cross-instance refusal
     400, and the clone/file backends being a 501 capability refusal.
     """
@@ -316,7 +315,7 @@ def run_sidecar_specific_checks(model):
         srv.stop()
 
 
-# M7 resident warm-prefix calibration lane: the sidecar keeps a bounded set of resident session
+# Resident warm-prefix calibration lane: the sidecar keeps a bounded set of resident session
 # prefixes; the first decision on a turn cold-prefills (warm_hit false), a repeat forks the resident
 # prefix (warm_hit true) and must be bit-identical to its own miss. The control group (never-repeated
 # sessions) must show zero warm hits; the repeated group must show hits.
@@ -324,9 +323,9 @@ def answers_close(a, b, tol):
     """The answers agree within `tol` on every numeric field and exactly on every non-numeric one.
     The winners (choice key, noul value, score index) must be unchanged; only the reported
     concentration (probabilities and the derived diagnostics) may move within `tol`. This is the
-    documented M7.5 tolerance: on the qwen hybrid model the recurrent warm-restore drifts the score
-    probabilities and their derived interval/median by up to ~0.05 between a cold miss and a warm hit
-    (the M2/M3 recorded qwen producer-numerics matter, flaky from ~0 to ~0.05 run to run). A hit never
+    documented warm-restore tolerance: on the qwen hybrid model the recurrent warm-restore drifts the
+    score probabilities and their derived interval/median by up to ~0.05 between a cold miss and a
+    warm hit (a known producer-numerics matter, flaky from ~0 to ~0.05 run to run). A hit never
     changes a winner, only the reported concentration; lfm and gemma are effectively wire-identical."""
     if set(a) != set(b):
         return False
@@ -385,7 +384,7 @@ def run_warm_cache_checks(model):
         return json.loads(text)["session_id"]
 
     try:
-        # M7.3 control group: never-repeated sessions show zero warm hits on first use
+        # control group: never-repeated sessions show zero warm hits on first use
         control_hits = 0
         for i in range(3):
             sid = new_session("Distinct evidence sentence number %d for the warm control." % i)
@@ -394,7 +393,7 @@ def run_warm_cache_checks(model):
             control_hits += 1 if json.loads(text).get("warm_hit") else 0
         env.check(control_hits == 0, f"control group never-repeated sessions show zero warm hits: {control_hits}")
 
-        # M7.4/M7.5 repeated group: the repeat forks the resident prefix and is bit-identical
+        # repeated group: the repeat forks the resident prefix and is within the documented tolerance
         sid = new_session("The customer was charged twice on May 3 and wants a refund.")
         def warm_decision():
             status, text = decision(dict(env.DECISION_VALID, session_id=sid, diagnostics=True))
@@ -408,9 +407,7 @@ def run_warm_cache_checks(model):
         env.check(hit0 is False, f"repeated group first decision is cold: {hit0}")
         env.check(hit1 is True, f"repeated group second decision is warm: {hit1}")
         env.check(hit2 is True, f"repeated group third decision is warm: {hit2}")
-        # M7.5: a warm hit never changes a winner; probabilities stay within the documented qwen
-        # recurrent warm-restore tolerance (measured up to ~0.05 in the derived diagnostics, bound 0.1)
-        # M7.5: a warm hit never changes a winner; probabilities stay within the documented qwen
+        # a warm hit never changes a winner; probabilities stay within the documented qwen
         # recurrent warm-restore tolerance (measured up to ~0.05 in the derived diagnostics, bound 0.1)
         env.check(answers_close(ans1, ans0, 0.1), "warm hit answer matches the cold miss within the documented tolerance")
         env.check(answers_close(ans2, ans0, 0.1), "warm repeat answer matches the cold miss within the documented tolerance")

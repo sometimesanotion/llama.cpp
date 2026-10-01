@@ -1,4 +1,4 @@
-"""M13 aggregate parity E2E: two live background servers (one window each) plus
+"""Aggregate parity E2E: two live background servers (one window each) plus
 a mock router child advertising adapter bytes.
 
 The merged contract (the same shape the router's production merge implements,

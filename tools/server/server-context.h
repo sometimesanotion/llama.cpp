@@ -95,13 +95,6 @@ struct server_context {
     // instance's context + compute buffers are created
     bool load_model(common_params & params, llama_model * shared_model = nullptr);
 
-    // The whole context was replaced or loaded (model reload, whole-context state load/clear):
-    // bump the decision memory epoch so every retained session reference from the previous
-    // generation is refused as stale (HTTP 409) instead of answered from old state. Called by the
-    // server on any whole-context replace/load; session references re-created after the call start
-    // at the current epoch.
-    void on_memory_invalidated();
-
     // this function will block main thread until termination
     void start_loop();
 

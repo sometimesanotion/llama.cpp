@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -36,13 +37,14 @@ struct semantic_error : std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
-// A retained-turn reference outlived the memory epoch it was captured under (a model reload or a
-// whole-context load/clear). The server maps this to HTTP 409 (stale session); it is NEVER a
-// semantic_error (422): "stale" and "invalid request" are different outcomes, and a stale
-// reference is never answered from old state.
-struct stale_error : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
+// Typed readers for one member of a request object, one per JSON kind. A member that is absent or
+// null reads as "not supplied" (nullopt); a member that is present with the wrong JSON type throws
+// semantic_error naming it, so a wrong-typed decision field is semantic invalidity (422) and never
+// a malformed body (400). `where` prefixes the name in the message ("field \"priority\": ").
+std::optional<std::string> read_string(const common_json & obj, const std::string & key, const std::string & where = "");
+std::optional<bool>        read_bool(const common_json & obj, const std::string & key, const std::string & where = "");
+std::optional<long long>   read_integer(const common_json & obj, const std::string & key, const std::string & where = "");
+std::optional<double>      read_number(const common_json & obj, const std::string & key, const std::string & where = "");
 
 // FNV-1a 64 over the bytes of `s` (offset basis 1469598103934665603, prime 1099511628211).
 // The single hash primitive behind the decision prefix tag and the permutation seed.

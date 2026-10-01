@@ -453,7 +453,7 @@ def run_capacity_sweep(model):
         bounded.stop()
 
 
-# M4.5: a decision fired while a chat is generating must not evict or corrupt chat cells. The chat
+# A decision fired while a chat is generating must not evict or corrupt chat cells. The chat
 # completes byte-for-byte like a no-decision reference, and the decision matches a quiet reference.
 # A fixed seed keeps chat generation deterministic on the CPU backend.
 def run_chat_decision_integrity(model):
@@ -507,7 +507,7 @@ def run_chat_decision_integrity(model):
         srv.stop()
 
 
-# M3: on the sidecar default, a decision runs on its own context, so chat on a chat instance is
+# On the sidecar default, a decision runs on its own context, so chat on a chat instance is
 # not gated on the decision. A concurrent chat must finish near its quiet latency instead of being
 # serialized behind the decision duration. The fairness bound is read from the same ledger as the
 # shared-context lane; the decision term is not added because the executor is a different context.
@@ -610,7 +610,7 @@ def run_recurrent_kv_integrity(model):
         srv.stop()
 
 
-# M8: server-side deadline. A decision that exceeds --decision-timeout-ms answers 503 +
+# Server-side deadline. A decision that exceeds --decision-timeout-ms answers 503 +
 # Retry-After and never a partial answer, and the server stays usable afterwards. The control
 # group proves that under the calibrated default timeout a normal decision is never cancelled.
 def run_deadline_control(model):
@@ -750,7 +750,7 @@ def main():
         else:
             print("decision capacity sweep passed")
 
-        # KV integrity while a chat is generating (M4.5)
+        # KV integrity while a chat is generating
         try:
             integrity = run_chat_decision_integrity(model)
         except Exception as e:  # noqa: BLE001
@@ -772,7 +772,7 @@ def main():
         else:
             print("recurrent chat/decision integrity passed")
 
-        # M3 sidecar default: a decision on the sidecar does not stall chat on a chat instance
+        # sidecar default: a decision on the sidecar does not stall chat on a chat instance
         try:
             no_stall = run_sidecar_no_stall(model)
         except Exception as e:  # noqa: BLE001
@@ -783,7 +783,7 @@ def main():
         else:
             print("sidecar no-stall passed")
 
-        # M8: deadline (503 + Retry-After, server stays usable) and control group under the default timeout
+        # deadline (503 + Retry-After, server stays usable) and control group under the default timeout
         try:
             deadline = run_deadline_control(model)
         except Exception as e:  # noqa: BLE001
