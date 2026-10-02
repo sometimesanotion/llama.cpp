@@ -77,7 +77,7 @@ interface ScoreQuestion {
 Field rules [Doc]:
 - `state`: plain string for text, or JSON object/array (chat logs, records, application state). Text only: no images/audio/video. Arrays are arrays of text values.
 - `model`: required over HTTP. Use `"jev-latest"` (SDK default) or a versioned id (`"jev-1.13.0"`). See [Models](#5-models).
-- `questions` keys: chosen by the caller, returned verbatim as the answer keys. **The key is not sent to the model and not used in inference.** (Keys can be code-generated, e.g. `same_as_record_18`.)
+- `questions` keys: chosen by the caller, returned verbatim as the answer keys. [Doc] **The key is not sent to the model and not used in inference.** (Keys can be code-generated, e.g. `same_as_record_18`.) [Local] The "not used in inference" half holds on this server's default path only: with `permutations: 1` the key reaches nothing but the answer map, and renaming a key is byte-identical down to `diagnostics.suffix_tokens`. At `permutations >= 2` the key seeds the option order (`permutation_order(k, qid, o)`), so a renamed key can reorder the options and change the answer - measured on the reference ROCm build, up to 0.216 of reported concentration on a hybrid model at two passes. A client that never sets `permutations` gets the Jev behaviour exactly; see `docs/decision/API.md` section 2.1 for `permutations`.
 - `instructions`: required on all three types. Docs' shared type table lists `null` as allowed for `EntryType`, while the API page marks `instructions` required. [Undocumented] whether `null` instructions is accepted; treat as required non-null.
 - Noul `criteria`: optional. `true` = what a yes (value near 1) means; `false` = what a no (near 0) means.
 - Choice `criteria`: option name -> description; use `null` when the option name needs no extra detail. Descriptions may be nested objects/arrays (e.g. taxonomy subtrees).
@@ -396,7 +396,7 @@ Additional statuses the Python SDK maps to typed errors [Doc, SDK]: 400 Bad Requ
 
 1. Accept `POST /v1/systemone` with Bearer auth; validate `state`, `model`, `questions` as required (422 on failure with a body naming the field).
 2. Accept `state` as string | object | array; accept `instructions`/criteria descriptions as string | object | array | null.
-3. Echo answers under the caller's keys; never leak/require the keys inside the model prompt.
+3. Echo answers under the caller's keys; never leak/require the keys inside the model prompt. [Local] This is exact at the default `permutations: 1`; a multi-pass request additionally seeds the option order from the key, which is an opt-in local extension (see 3.1).
 4. Return `model` as the resolved versioned id (map aliases like `jev-latest` -> your resolved id), `answers`, and `usage.{input_tokens, output_tokens}` (integers).
 5. Noul: `{type, noul}` only. Choice: `{type, choice, probabilities (all options, sums to 1), confidence}`. Score: `{type, score, legend, probabilities, confidence}` with string level keys `"0".."n-1"`.
 6. `score = sum(i * p_i)`; `choice = argmax(p)`; `legend[i]` = original level description object (unchanged, including objects).

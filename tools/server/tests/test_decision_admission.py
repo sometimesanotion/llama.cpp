@@ -102,11 +102,14 @@ def http(method, url, body=None, content_type="application/json", api_key=API_KE
 
 
 class Server:
-    def __init__(self, model, extra_args=None, max_body=MAX_BODY, ctx=8192):
+    def __init__(self, model, extra_args=None, max_body=MAX_BODY, ctx=8192, decision_seqs=8):
         self.model = model
         self.extra_args = extra_args or []
         self.max_body = max_body
         self.ctx = ctx
+        # None runs the server with no decision executor, which is a deployment a client can
+        # reach and the decision routes have to answer on
+        self.decision_seqs = decision_seqs
         self.port = free_port()
         self.proc = None
         self._log = None
@@ -118,12 +121,14 @@ class Server:
             "-m", self.model,
             "-c", str(self.ctx),
             "-ngl", os.environ.get("LLAMA_SERVER_TEST_NGL", "99"),
-            "--decision-seqs", "8",
             "--slots",
             "--api-key", API_KEY,
             "--port", str(self.port),
             "--host", "127.0.0.1",
-        ] + self.extra_args
+        ]
+        if self.decision_seqs is not None:
+            cmd += ["--decision-seqs", str(self.decision_seqs)]
+        cmd += self.extra_args
         env = dict(os.environ)
         build_bin = os.path.dirname(os.path.abspath(SERVER_BIN))
         env["LD_LIBRARY_PATH"] = build_bin + (os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
@@ -698,6 +703,188 @@ def run_deadline_control(model):
             control_srv.stop()
 
 
+def _chat(srv, prompt, max_tokens=24, seed=42):
+    status, _, text = http("POST", f"http://127.0.0.1:{srv.port}/v1/chat/completions", json.dumps({
+        "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "seed": seed}))
+    check(status == 200, f"chat completion: {status} {text[:160]}")
+    return json.loads(text)
+
+
+def _pool_snapshot(srv, instance, name, id_slot=0):
+    """Bind a slot to a pool snapshot name, which is what arms a later snapshot switch.
+
+    This is the only route that both writes the instance-scoped file apply_snapshot looks for and
+    records the binding, so a `snapshot` field in a later request reaches its KV-persisting step
+    instead of being refused earlier for a missing file.
+    """
+    status, _, text = http("POST", f"http://127.0.0.1:{srv.port}/instances/{instance}/snapshot",
+                          json.dumps({"name": name, "id_slot": id_slot}))
+    check(status in (200, 201), f"bind the instance snapshot {name!r}: {status} {text[:160]}")
+
+
+def _slot_tokens(srv, filename):
+    """The number of tokens the target slot currently retains, read through the chat save route.
+
+    `n_saved` is the slot's decoded token count, which is exactly what a snapshot switch would
+    replace, and reading it does not depend on any internal field name of GET /slots.
+    """
+    status, _, text = http("POST", f"http://127.0.0.1:{srv.port}/slots/0?action=save",
+                          json.dumps({"filename": filename}))
+    check(status == 200, f"read the slot state as {filename!r}: {status} {text[:160]}")
+    return json.loads(text)["n_saved"]
+
+
+# A pool-side transient failure is a 503 the client is meant to retry: an instance being
+# reconfigured, a busy snapshot I/O worker, a group that stayed full past its wait. A client that
+# does not know a 503 is retriable either spins or picks its own backoff, so the contract says every
+# 503 carries Retry-After. This exercises the pool's own error constructor, which is the single
+# place those statuses are built.
+def run_pool_transient_retry_after(model):
+    srv = Server(model, ["--instance", "main:ctx=8192:parallel=1:group=g:default",
+                         "--instance-wait", "0",
+                         "--slot-save-path", tempfile.mkdtemp()])
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        print(f"skip pool transient 503 on {os.path.basename(model)}: {e}")
+        return "skip"
+    base = f"http://127.0.0.1:{srv.port}"
+    try:
+        # control group: the pool answers normally before anything is saturated, so a 503 below
+        # is a consequence of the saturation and not of the fixture
+        status, _, _ = http("POST", base + "/v1/chat/completions", json.dumps(
+            {"messages": [{"role": "user", "content": "Say hello"}], "max_tokens": 8, "seed": 42}))
+        check(status == 200, f"an idle pool answers chat: {status}")
+
+        # a group-targeted request whose members are all busy waits --instance-wait seconds and
+        # then answers 503. Saturate the single member first, then ask for the group.
+        busy = []
+
+        def hold_slot(i):
+            http("POST", base + "/v1/chat/completions", json.dumps({
+                "instance": "main",
+                "messages": [{"role": "user", "content": f"Count slowly from 1 to 200, item by item. ({i})"}],
+                "max_tokens": 512, "seed": i, "temperature": 0.0}))
+
+        for i in range(4):
+            busy.append(threading.Thread(target=hold_slot, args=(i,), daemon=True))
+            busy[i].start()
+        try:
+            seen_503 = False
+            for _ in range(40):
+                status, headers, text = http("POST", base + "/v1/chat/completions", json.dumps({
+                    "instance": "g",
+                    "messages": [{"role": "user", "content": "Say hello"}], "max_tokens": 8, "seed": 7}))
+                if status == 503:
+                    seen_503 = True
+                    check(headers.get("Retry-After") is not None,
+                          f"a pool transient 503 carries Retry-After: {headers}")
+                    check(json.loads(text)["error"]["type"] == "unavailable_error",
+                          f"a pool transient 503 is an unavailable_error: {text[:160]}")
+                    break
+                if status == 200:
+                    # the saturated members drained before the probe landed; the saturation is
+                    # timing-dependent on a small model, so retry rather than fail here
+                    time.sleep(0.25)
+                    continue
+                check(status in (429, 529, 503),
+                      f"a group request while members are busy is not an unrelated failure: {status} {text[:160]}")
+                time.sleep(0.25)
+            check(seen_503, "a saturated group past its wait answers a transient 503")
+        finally:
+            for t in busy:
+                t.join(timeout=180)
+
+        # the control group again: once the pool drains, it answers 200, so the refusal above was
+        # the transient condition and not a broken instance
+        status, _, _ = http("POST", base + "/v1/chat/completions", json.dumps(
+            {"messages": [{"role": "user", "content": "Say hello"}], "max_tokens": 8, "seed": 42}))
+        check(status == 200, f"the pool recovers after a transient 503: {status}")
+        return "pass"
+    finally:
+        srv.stop()
+
+
+# Decisions need an executor. A server started without --decision-seqs has none, so every
+# decision route refuses - and the refusal has to be inert: it must not reach a chat context
+# on its way out.
+def run_decisions_disabled(model):
+    srv = Server(model, ["--instance", "main:ctx=8192:parallel=1:default",
+                         "--slot-save-path", tempfile.mkdtemp()],
+                 decision_seqs=None)
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        print(f"skip decisions-disabled on {os.path.basename(model)}: {e}")
+        return "skip"
+    base = f"http://127.0.0.1:{srv.port}"
+    try:
+        # 1. every decision route refuses, with the documented status for a feature that is off
+        probes = [
+            ("POST", "/v1/decision", json.dumps(DECISION_VALID)),
+            ("POST", "/v1/session", json.dumps({"instance": "main", "id_slot": 0})),
+            ("GET", "/v1/session/anything", None),
+            ("PATCH", "/v1/session/anything", json.dumps({"policy": {"pinned": True}})),
+            ("DELETE", "/v1/session/anything", None),
+        ]
+        messages = set()
+        for method, path, body in probes:
+            status, _, text = http(method, base + path, body)
+            check(status == 501, f"{method} {path} with decisions off is a 501: {status} {text[:160]}")
+            check(json.loads(text)["error"]["type"] == "not_supported_error",
+                  f"{method} {path} is a not_supported_error: {text[:160]}")
+            messages.add(json.loads(text)["error"]["message"])
+
+        # 2. control group: the refusal is scoped to the decision routes, and the pool is healthy
+        status, _, _ = http("GET", base + "/health")
+        check(status == 200, f"health with decisions off: {status}")
+        chat = _chat(srv, "Write a short paragraph about spring weather.")
+        check(bool(chat["choices"]), "chat still works with decisions off")
+        status, _, slots_text = http("GET", base + "/slots")
+        check(status == 200 and isinstance(json.loads(slots_text), list),
+              f"slots still listed with decisions off: {status} {slots_text[:160]}")
+
+        # 3. the refusal is inert. A `snapshot` field is the one request field that makes a routed
+        #    request mutate a chat slot, so it is the one that proves the refusal happens before any
+        #    dispatch: without that, the switch replaces the slot's KV and the refusal follows.
+        _chat(srv, "Name three rivers in Europe.", max_tokens=32)
+        tokens_a = _slot_tokens(srv, "probe_a")
+        _pool_snapshot(srv, "main", "state_a")
+        _chat(srv, "Now name three rivers in Asia, and describe each one in a full sentence.",
+              max_tokens=96)
+        tokens_b = _slot_tokens(srv, "probe_b")
+        _pool_snapshot(srv, "main", "state_b")
+        check(tokens_b > tokens_a,
+              f"the probe needs two distinct slot states ({tokens_a} then {tokens_b})")
+
+        status, _, text = http("POST", base + "/v1/session",
+                               json.dumps({"instance": "main", "id_slot": 0, "snapshot": "state_a"}))
+        check(status == 501, f"a session create naming a snapshot is a 501: {status} {text[:160]}")
+
+        tokens_after = _slot_tokens(srv, "probe_c")
+        check(tokens_after == tokens_b,
+              f"the refused request left the chat slot's KV untouched "
+              f"(the slot held {tokens_b} tokens, it holds {tokens_after})")
+
+        # 4. negative control: a server with no pool answers the same way, so the two components
+        #    that each build this response cannot drift apart
+        plain = Server(model, decision_seqs=None)
+        try:
+            plain.start()
+            status, _, text = http("POST", f"http://127.0.0.1:{plain.port}/v1/session",
+                                   json.dumps({"id_slot": 0}))
+            check(status == 501, f"a session create without a pool is a 501: {status} {text[:160]}")
+            check(json.loads(text)["error"]["message"] in messages,
+                  f"the pool and the single context share the refusal message: {text[:160]}")
+        finally:
+            plain.stop()
+        return "pass"
+    finally:
+        srv.stop()
+
+
 def main():
     if not os.path.isfile(SERVER_BIN):
         print(f"FAIL: server binary not found at {SERVER_BIN}")
@@ -793,6 +980,28 @@ def main():
             print("SKIP: deadline/control (no usable answer labels)")
         else:
             print("deadline/control passed")
+
+        # pool transient 503s are retriable and say so
+        try:
+            transient = run_pool_transient_retry_after(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: pool transient 503: {e}")
+            return 1
+        if transient == "skip":
+            print("SKIP: pool transient 503 (server did not start)")
+        else:
+            print("pool transient 503 checks passed")
+
+        # decisions off: every decision route refuses, and the refusal is inert
+        try:
+            disabled = run_decisions_disabled(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: decisions-disabled: {e}")
+            return 1
+        if disabled == "skip":
+            print("SKIP: decisions-disabled (server did not start)")
+        else:
+            print("decisions-disabled checks passed")
 
         print("decision admission checks passed")
         return 0

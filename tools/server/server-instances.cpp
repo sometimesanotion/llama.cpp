@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -18,11 +19,39 @@
 #define IST_INF(fmt, ...) LOG_INF("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define IST_WRN(fmt, ...) LOG_WRN("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define IST_ERR(fmt, ...) LOG_ERR("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define IST_DBG(fmt, ...) LOG_DBG("inst %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 
 // wall-clock ms for the decision session store's created/last-used stamps
 static int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// the payload the drain posts; the scheduler only cares that a result came back, so any JSON works
+static json decision_drain_ack() {
+    return json{
+        { "drain", true }
+    };
+}
+
+// One budget for every "a scheduler must acknowledge what I posted" wait on an HTTP thread.
+// The env override exists so a test can drive the expiry branch deterministically; a deployment
+// has no reason to set it, and it is never read together with any reported distribution measure.
+static int64_t scheduler_ack_budget_ms() {
+    // the override is a test switch, not a per-request knob, so it is read once per process rather
+    // than on every drain. A positive value is the wait; a negative value drives the fail-closed
+    // branch with no wait at all, which is how a test reaches that branch once release is async
+    // and an idle scheduler would otherwise always acknowledge.
+    static const int64_t budget = [] {
+        if (const char * e = std::getenv("LLAMA_DECISION_SCHEDULER_ACK_BUDGET_MS")) {
+            const int64_t v = std::atoll(e);
+            if (v != 0) {
+                return v;
+            }
+        }
+        return (int64_t) DECISION_SCHEDULER_ACK_BUDGET_MS;
+    }();
+    return budget;
 }
 
 // The number of resident warm-prefix slots for the decision sidecar, derived from
@@ -512,11 +541,6 @@ std::optional<size_t> server_instances::pick_best_available(const std::string & 
 //
 
 server_http_res_ptr server_instances::dispatch(const server_http_req & req, const forward_fn & forward) {
-    return dispatch(req, forward, dispatch_options{});
-}
-
-server_http_res_ptr server_instances::dispatch(const server_http_req & req, const forward_fn & forward,
-                                               const dispatch_options & opt) {
     std::string model_id;
     std::string instance_field;
     std::string snapshot;
@@ -559,10 +583,6 @@ server_http_res_ptr server_instances::dispatch(const server_http_req & req, cons
         case target_kind::INSTANCE:
             return dispatch_instance(req, target.inst, snapshot, id_slot, forward);
         case target_kind::GROUP:
-            if (opt.require_instance) {
-                return make_error("this request addresses one instance's slot; route it with the "
-                                  "'instance' or 'model' field, not a group", ERROR_TYPE_INVALID_REQUEST);
-            }
             return dispatch_group(req, target.group, snapshot, id_slot, forward);
         case target_kind::NONE:
             return make_error(error, ERROR_TYPE_INVALID_REQUEST);
@@ -2054,7 +2074,7 @@ server_http_res_ptr server_instances::handle_get_metrics(const server_http_req &
     }
     // the target window does not exist yet: render nothing rather than allocate
     // it as a scrape side effect. this is an exact outcome condition, not a
-    // health or confidence score. the guard is taken first so a concurrent
+    // health or quality score. the guard is taken first so a concurrent
     // destroy/resize cannot turn this read into a torn context dereference.
     active_route_guard guard(*this, *inst);
     if (!guard.acquired) {
@@ -2403,21 +2423,30 @@ static bool decision_request_is_session_pinned(const server_http_req & req) {
     return false;
 }
 
-server_http_res_ptr server_instances::handle_post_decision(const server_http_req & req) {
+server_http_res_ptr server_instances::handle_post_decision(const server_http_req & req, bool jev_only) {
     // the sidecar executor owns every decision, stateless and session; the pool resolves a token
     // snapshot for a session decision before routing it there (see handle_post_decision_sidecar)
-    return handle_post_decision_sidecar(req);
+    return handle_post_decision_sidecar(req, jev_only);
 }
 
 // sidecar executor mode: every decision runs on the internal executor instance. the model field
 // is echo-only (a decision never picks a placement target); a session-pinned request attaches an
 // owned token snapshot captured from the owning instance, then routes to the sidecar.
-server_http_res_ptr server_instances::handle_post_decision_sidecar(const server_http_req & req) {
+server_http_res_ptr server_instances::handle_post_decision_sidecar(const server_http_req & req, bool jev_only) {
     auto sidecar = get_instance(decision_sidecar_name());
     if (sidecar == nullptr) {
-        return make_error("the decision sidecar executor is not registered", ERROR_TYPE_SERVER);
+        return decision_unavailable();
     }
-    const auto forward = [](server_routes & routes, const server_http_req & req) { return routes.post_decision(req); };
+    // which shapes this request accepts belongs to the route that was invoked, so the route
+    // decides the instance handler. The instance's own handler is the single place that marks a
+    // strict request, which also means the mark cannot be lost to a body rewrite here.
+    const forward_fn forward_jev = [](server_routes & routes, const server_http_req & req) {
+        return routes.post_systemone(req);
+    };
+    const forward_fn forward_superset = [](server_routes & routes, const server_http_req & req) {
+        return routes.post_decision(req);
+    };
+    const forward_fn & forward = jev_only ? forward_jev : forward_superset;
 
     server_http_req routed = req;
     json body;
@@ -2426,10 +2455,6 @@ server_http_res_ptr server_instances::handle_post_decision_sidecar(const server_
     } catch (const std::exception &) {
         // a malformed body is reported by the sidecar's own handler
         return dispatch_instance(routed, sidecar, "", -1, forward);
-    }
-    if (body.is_object() && req.path == DECISION_JEV_PATH) {
-        body[DECISION_JEV_ONLY_KEY] = true;
-        routed.body                  = body.dump();
     }
     if (body.is_object() && decision_request_is_session_pinned(req)) {
         // the session fields may arrive in the query string (as chat routing allows); merge them
@@ -2453,56 +2478,40 @@ server_http_res_ptr server_instances::handle_post_decision_sidecar(const server_
         if (server_http_res_ptr err = attach_decision_snapshot(body, routed, lease_key)) {
             return err;
         }
-        // dispatch, then release the store lease once the (possibly cancelled) task is done
-        auto res = dispatch_instance(routed, sidecar, "", -1, forward);
         std::string snap_key;
         try {
             const json rb = json::parse(routed.body);
             snap_key = rb.value("__decision_snapshot_key", std::string());
         } catch (const std::exception &) {
         }
-        release_decision_snapshot_after_dispatch(snap_key, lease_key);
-        return res;
+        // the guard gives the store lease and the transient snapshot back when the dispatch returns
+        // or throws, so no path can strand a lease that nothing would ever reap
+        decision_lease_guard lease_guard(*this, snap_key, lease_key);
+        return dispatch_instance(routed, sidecar, "", -1, forward);
     }
     // stateless: the model field is echo-only and the sidecar parser validates it; the executor
     // is reached directly, so nothing needs to be rewritten for routing
     return dispatch_instance(routed, sidecar, "", -1, forward);
 }
 
+server_http_res_ptr server_instances::decision_unavailable() const {
+    return make_error(DECISION_DISABLED_MESSAGE, ERROR_TYPE_NOT_SUPPORTED);
+}
+
 server_http_res_ptr server_instances::handle_post_session(const server_http_req & req) {
-    if (params.decision_sidecar) {
-        return handle_post_session_sidecar(req);
-    }
-    dispatch_options opt;
-    opt.require_instance = true;
-    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.post_session(req); }, opt);
+    return params.decision_sidecar ? handle_post_session_sidecar(req) : decision_unavailable();
 }
 
 server_http_res_ptr server_instances::handle_get_session(const server_http_req & req) {
-    if (params.decision_sidecar) {
-        return handle_get_session_sidecar(req);
-    }
-    dispatch_options opt;
-    opt.require_instance = true;
-    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.get_session(req); }, opt);
+    return params.decision_sidecar ? handle_get_session_sidecar(req) : decision_unavailable();
 }
 
 server_http_res_ptr server_instances::handle_delete_session(const server_http_req & req) {
-    if (params.decision_sidecar) {
-        return handle_delete_session_sidecar(req);
-    }
-    dispatch_options opt;
-    opt.require_instance = true;
-    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.delete_session(req); }, opt);
+    return params.decision_sidecar ? handle_delete_session_sidecar(req) : decision_unavailable();
 }
 
 server_http_res_ptr server_instances::handle_patch_session(const server_http_req & req) {
-    if (params.decision_sidecar) {
-        return handle_patch_session_sidecar(req);
-    }
-    dispatch_options opt;
-    opt.require_instance = true;
-    return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.patch_session(req); }, opt);
+    return params.decision_sidecar ? handle_patch_session_sidecar(req) : decision_unavailable();
 }
 
 // --- sidecar executor session handlers (token-snapshot store, pool-level) ---
@@ -2598,16 +2607,30 @@ server_http_res_ptr server_instances::handle_post_session_sidecar(const server_h
         std::lock_guard<std::mutex> lock(mutex_decision_sessions);
         // expiry is proactive, so it runs here and not on the read path
         stale_loras = reap_expired_decision_sessions_locked();
-        // creating a session for a slot replaces any reference the slot already holds; its refs
-        // are released after this lock is dropped (never across the store lock)
-        auto replaced = finalize_decision_session_locked(key);
-        stale_loras.insert(stale_loras.end(), replaced.begin(), replaced.end());
-        // token-snapshot budget: --decision-session-budget-mb caps the total owned token bytes
-        // across all retained references (0 = unlimited). Under pressure the least-recently-used
-        // unpinned, unleased reference is evicted and this one is admitted; only when every
-        // remaining reference is pinned or in flight is the request refused, never truncated.
-        refusal = admit_decision_session_locked(key, op_res->tokens, "creating this session snapshot",
-                                                stale_loras);
+        // A create replaces the reference its slot already holds, and the replacement is an
+        // assignment into the store, so it cannot go through the retirement policy: overwriting a
+        // leased entry would drop its lease count and its adapter refs while an in-flight decision
+        // still points at them. Refuse instead. This is a task-validity gate - it measures whether
+        // the store is in a legal state to be mutated - and reads no answer, no distribution and no
+        // producer score.
+        auto existing = decision_sessions_.find(key);
+        if (existing != decision_sessions_.end() && existing->second.lease_count > 0) {
+            refusal = make_error("id_slot " + std::to_string(id_slot) +
+                                     " is being read by an in-flight decision; retry once it completes",
+                                 ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+        }
+        if (refusal == nullptr) {
+            // its refs are released after this lock is dropped (never across the store lock)
+            auto replaced = retire_decision_session_locked(key);
+            stale_loras.insert(stale_loras.end(), replaced.begin(), replaced.end());
+        }
+        if (refusal == nullptr) {
+            // token-snapshot budget: --decision-session-budget-mb caps the total owned token bytes
+            // across all retained references (0 = unlimited). Under pressure the least-recently-used
+            // unpinned, unleased reference is evicted and this one is admitted; only when every
+            // remaining reference is pinned or in flight is the request refused, never truncated.
+            refusal = admit_decision_session_locked(key, op_res->tokens, "creating this session snapshot", stale_loras);
+        }
         if (refusal == nullptr) {
             decision_session_entry entry;
             entry.instance      = inst->cfg.name;
@@ -2634,6 +2657,8 @@ server_http_res_ptr server_instances::handle_post_session_sidecar(const server_h
     // on the refusal path too: a refusal must not leak the references it collected
     release_decision_refs(stale_loras);
     if (refusal) {
+        // this request's own resolved scope is not in the store, so it is dropped here too
+        release_decision_refs(loras);
         return refusal;
     }
 
@@ -2664,6 +2689,22 @@ server_http_res_ptr server_instances::handle_get_session_sidecar(const server_ht
         }
         const decision_session_entry & entry = it->second;
         const decision_store_stats stats = decision_store_stats_locked();
+        release_stats                  rel;
+        release_stats_read(rel);
+        // the release worker's own liveness counters. A separate object because they belong to the
+        // worker, not to this reference. `jobs - retained` is what the worker finished, `retries` is
+        // the tail the shipped budget is supposed to keep at zero, and `bytes_pending` is the owned
+        // snapshot bytes held by unfinished jobs, so a fail-closed drain stays visible as bytes
+        // rather than only as a log line. None of them gates anything.
+        json release_counters = {
+            { "jobs",          (long long) rel.jobs            },
+            { "retries",       (long long) rel.retries         },
+            { "retained",      (long long) rel.retained        },
+            { "inline",        (long long) rel.inline_releases },
+            { "queue_high",    (long long) rel.queue_high      },
+            { "bytes_pending", (long long) rel.bytes_pending   },
+            { "bytes_high",    (long long) rel.bytes_high      },
+        };
         out["session_id"]   = sid;
         out["id_slot"]      = entry.id_slot;
         out["instance"]     = entry.instance;
@@ -2676,11 +2717,16 @@ server_http_res_ptr server_instances::handle_get_session_sidecar(const server_ht
         out["created_ms"]   = (long long) entry.created_ms;
         out["last_used_ms"] = (long long) entry.last_used_ms;
         out["counters"]     = {
-            { "n_snapshots", (long long) decision_n_snapshots_ },
-            { "n_reuses",    (long long) decision_n_reuses_ },
-            { "n_releases",  (long long) decision_n_releases_ },
-            { "n_sessions",  (long long) stats.n_sessions },
-            { "bytes_total", (long long) stats.bytes_total },
+            { "n_snapshots", (long long) decision_n_snapshots_             },
+            { "n_reuses",    (long long) decision_n_reuses_                },
+            { "n_releases",  (long long) decision_n_releases_              },
+            { "n_sessions",  (long long) stats.n_sessions                  },
+            { "bytes_total", (long long) stats.bytes_total                 },
+            // transient resolve keys still held for an in-flight or not-yet-released decision. It
+            // drops back when the release worker catches up, which is how a stranded lease is
+            // observable without a debug endpoint.
+            { "n_pending",   (long long) decision_snapshot_resolve_.size() },
+            { "release",     release_counters                              },
         };
     }
     return make_ok(out);
@@ -2715,6 +2761,12 @@ server_http_res_ptr server_instances::handle_delete_session_sidecar(const server
     }
     if (!leased) {
         erase_decision_session(key);
+    } else {
+        // An operator erase of a reference a decision still holds: the finalize waits for the last
+        // lease, so wake the release worker's parked job for this reference. Only an observed drain
+        // releases anything, so this asks the worker to try rather than releasing here, and the
+        // response does not wait for it - the reference's bytes clear shortly after, not during.
+        release_wake_retained(key);
     }
     json out;
     out["session_id"] = sid;
@@ -2777,12 +2829,12 @@ server_http_res_ptr server_instances::handle_patch_session_sidecar(const server_
 
 // --- decision session token store (sidecar executor) ---
 
-std::string server_instances::decision_session_key(const std::string & instance, int id_slot) {
-    return instance + ":" + std::to_string(id_slot);
+size_t server_instances::decision_token_bytes(size_t n_tokens) {
+    return n_tokens * sizeof(llama_token);
 }
 
 size_t server_instances::decision_session_bytes(const decision_session_entry & entry) {
-    return entry.tokens.size() * sizeof(llama_token);
+    return decision_token_bytes(entry.tokens.size());
 }
 
 std::string server_instances::mint_decision_handle_locked(const std::string & prefix) {
@@ -2802,13 +2854,10 @@ std::string server_instances::decision_adapter_scope_of(const std::vector<std::p
     return "adapter-scope-v1:" + llama_decision::sha256_hex(s);
 }
 
-// Warm identity for the sidecar, hashed with sha256 because it keys only this store's own warm
-// tier. The registry's manifest path hash (session-registry.cpp) is fnv1a64 and is deliberately a
-// different function over a different string. The two never exchange hashes: a warm_tag is compared
-// only against another warm_tag in this map, and a manifest hash only against another manifest hash,
-// so the split is currently harmless. Unifying them would change every warm tag and invalidate the
+// Warm identity for the sidecar, hashed with sha256. A warm_tag is compared only against another
+// warm_tag in this store's own warm map and is never exchanged with any other hash, so the choice of
+// function is local to this keyspace. Changing it would change every warm tag and invalidate the
 // resident tier.
-
 
 std::string server_instances::decision_content_hash_of(const std::vector<llama_token> & tokens,
                                                        const std::vector<std::pair<std::string, float>> & scope) {
@@ -2862,10 +2911,48 @@ std::vector<common_adapter_lora_info> server_instances::finalize_decision_sessio
         decision_session_index_.erase(entry.session_id);
     }
     decision_n_releases_++;
-    // the refs are released by the caller AFTER the store lock is dropped: releasing needs
-    // mutex_mgmt, and this store lock may be held on a scheduler thread (a release hook) where a
-    // management op waiting on this scheduler thread also holds mutex_mgmt
+    // the refs are released by the caller AFTER the store lock is dropped, on a pool-owned
+    // non-scheduler thread (an HTTP thread or the release worker): releasing needs mutex_mgmt, and
+    // this store lock may be held on a scheduler thread (a release hook) where a management op
+    // waiting on this scheduler thread also holds mutex_mgmt
     return entry.loras;
+}
+
+// The single owner of "can this reference die now". Every path that drops a reference comes
+// through here, so the lease rule cannot be re-derived - and mis-derived - at a call site.
+std::vector<common_adapter_lora_info> server_instances::retire_decision_session_locked(
+    const std::pair<std::string, int> & key) {
+    auto       it      = decision_sessions_.find(key);
+    const bool present = it != decision_sessions_.end();
+    switch (pick_decision_session_retirement(present, present && it->second.lease_count > 0)) {
+        case decision_session_retirement::absent:
+            return {};
+        case decision_session_retirement::deferred:
+            // an in-flight decision still points at these tokens and adapter refs. Mark it removed
+            // and leave it for the drain in release_decision_snapshot_after_dispatch, so the reader
+            // finishes first. Dropping the refs here is the use-after-free this rule prevents.
+            it->second.removed = true;
+            return {};
+        case decision_session_retirement::now:
+            return finalize_decision_session_locked(key);
+    }
+    return {};
+}
+
+server_instances::decision_lease_guard::decision_lease_guard(server_instances &          m,
+                                                             std::string                 key,
+                                                             std::pair<std::string, int> entry) :
+    mgr(m),
+    snap_key(std::move(key)),
+    entry_key(std::move(entry)) {}
+
+server_instances::decision_lease_guard::~decision_lease_guard() {
+    // the normal path hands the drain and the release to the pool worker so the client response is
+    // not delayed by the sidecar's queue. a stopped or full queue falls back inline, so a lease is
+    // never dropped on the floor.
+    if (!mgr.enqueue_decision_release(snap_key, entry_key)) {
+        mgr.release_decision_snapshot_after_dispatch(snap_key, entry_key);
+    }
 }
 
 // erase a store entry and release its adapter refs. call only from an HTTP thread (never a
@@ -2874,7 +2961,7 @@ void server_instances::erase_decision_session(const std::pair<std::string, int> 
     std::vector<common_adapter_lora_info> loras;
     {
         std::lock_guard<std::mutex> lock(mutex_decision_sessions);
-        loras = finalize_decision_session_locked(key);
+        loras = retire_decision_session_locked(key);
     }
     release_decision_refs(loras);
 }
@@ -2882,7 +2969,9 @@ void server_instances::erase_decision_session(const std::pair<std::string, int> 
 // Ref release needs mutex_mgmt, and a store mutation may hold the store lock on a scheduler
 // thread (a slot release hook) where a management op waiting on that thread already holds
 // mutex_mgmt. Every store mutation therefore collects the refs under the store lock and hands
-// them here, after it is dropped.
+// them here, after it is dropped. This runs on a pool-owned non-scheduler thread only - an HTTP
+// thread or the release worker - never on a scheduler thread, and never while
+// mutex_decision_sessions is held.
 void server_instances::release_decision_refs(std::vector<common_adapter_lora_info> & loras) {
     if (loras.empty()) {
         return;
@@ -2912,10 +3001,16 @@ std::vector<common_adapter_lora_info> server_instances::reap_expired_decision_se
     }
     std::vector<common_adapter_lora_info> loras;
     for (const auto & key : victims) {
-        auto refs = finalize_decision_session_locked(key);
+        auto refs = retire_decision_session_locked(key);
         loras.insert(loras.end(), refs.begin(), refs.end());
     }
     return loras;
+}
+
+// A reference the turn advanced past, or the one an incoming create is about to replace, is not
+// charged and is not counted: the store is on its way out of it in both cases.
+bool decision_session_live(const decision_session_ref & ref) {
+    return !ref.removed && !ref.replacing;
 }
 
 // --decision-session-budget-mb bounds the owned token bytes the store holds. Pressure evicts, in
@@ -2926,11 +3021,21 @@ std::vector<common_adapter_lora_info> server_instances::reap_expired_decision_se
 size_t decision_session_total_bytes(const std::vector<decision_session_ref> & refs) {
     size_t total = 0;
     for (const auto & ref : refs) {
-        if (!ref.removed && !ref.replacing) {
+        if (decision_session_live(ref)) {
             total += ref.bytes;
         }
     }
     return total;
+}
+
+size_t decision_session_live_count(const std::vector<decision_session_ref> & refs) {
+    size_t live = 0;
+    for (const auto & ref : refs) {
+        if (decision_session_live(ref)) {
+            live++;
+        }
+    }
+    return live;
 }
 
 std::optional<size_t> pick_decision_session_victim(const std::vector<decision_session_ref> & refs) {
@@ -2946,17 +3051,21 @@ std::optional<size_t> pick_decision_session_victim(const std::vector<decision_se
     return victim;
 }
 
-server_http_res_ptr server_instances::admit_decision_session_locked(const std::pair<std::string, int> & exclude,
-                                                                  const std::vector<llama_token> & incoming,
-                                                                  const std::string & subject,
-                                                                  std::vector<common_adapter_lora_info> & evicted) {
-    if (params.decision_session_budget_mb <= 0) {
-        return nullptr;
+// Retirement is a task-validity question: whether the store may be mutated right now. It is a
+// function of one reference's state alone, so it is expressed here without a pool, a thread or a
+// model - the same shape as the victim policy above.
+decision_session_retirement pick_decision_session_retirement(bool present, bool leased) {
+    if (!present) {
+        return decision_session_retirement::absent;
     }
-    // one view per store entry, in store order, with the key each one belongs to, so the pure policy
-    // above decides and this function only performs what it returns
-    std::vector<decision_session_ref> refs;
-    std::vector<std::pair<std::string, int>> keys;
+    return leased ? decision_session_retirement::deferred : decision_session_retirement::now;
+}
+
+void server_instances::project_decision_sessions_locked(const std::pair<std::string, int> *        exclude,
+                                                        std::vector<decision_session_ref> &        refs,
+                                                        std::vector<std::pair<std::string, int>> & keys) const {
+    refs.clear();
+    keys.clear();
     refs.reserve(decision_sessions_.size());
     keys.reserve(decision_sessions_.size());
     for (const auto & kv : decision_sessions_) {
@@ -2966,10 +3075,24 @@ server_http_res_ptr server_instances::admit_decision_session_locked(const std::p
         ref.pinned       = kv.second.pinned;
         ref.leased       = kv.second.lease_count > 0;
         ref.removed      = kv.second.removed;
-        ref.replacing    = kv.first == exclude;
+        ref.replacing    = exclude && kv.first == *exclude;
         refs.push_back(ref);
         keys.push_back(kv.first);
     }
+}
+
+server_http_res_ptr server_instances::admit_decision_session_locked(const std::pair<std::string, int> &     exclude,
+                                                                    const std::vector<llama_token> &        incoming,
+                                                                    const std::string &                     subject,
+                                                                    std::vector<common_adapter_lora_info> & evicted) {
+    if (params.decision_session_budget_mb <= 0) {
+        return nullptr;
+    }
+    // the store as one view, so the pure policies below decide and this function only performs
+    // what they return
+    std::vector<decision_session_ref>        refs;
+    std::vector<std::pair<std::string, int>> keys;
+    project_decision_sessions_locked(&exclude, refs, keys);
     const size_t budget = (size_t) params.decision_session_budget_mb * 1024u * 1024u;
     size_t total = incoming.size() * sizeof(llama_token) + decision_session_total_bytes(refs);
     while (total > budget) {
@@ -2980,7 +3103,10 @@ server_http_res_ptr server_instances::admit_decision_session_locked(const std::p
                               "delete sessions or raise the budget", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
         }
         total -= refs[*victim].bytes;
-        auto refs_out = finalize_decision_session_locked(keys[*victim]);
+        // the picker never returns a leased reference, which is the caller invariant the deferred
+        // branch of retire_decision_session_locked relies on; assert it instead of re-deriving it
+        assert(!refs[*victim].leased);
+        auto refs_out = retire_decision_session_locked(keys[*victim]);
         evicted.insert(evicted.end(), refs_out.begin(), refs_out.end());
         refs.erase(refs.begin() + *victim);
         keys.erase(keys.begin() + *victim);
@@ -2992,19 +3118,10 @@ server_instances::decision_store_stats server_instances::decision_store_stats_lo
     // the same view and the same charged-bytes rule the budget uses, so a client reading the
     // counters sees exactly what the budget is measuring
     std::vector<decision_session_ref> refs;
-    refs.reserve(decision_sessions_.size());
-    for (const auto & kv : decision_sessions_) {
-        decision_session_ref ref;
-        ref.bytes   = decision_session_bytes(kv.second);
-        ref.removed = kv.second.removed;
-        refs.push_back(ref);
-    }
+    std::vector<std::pair<std::string, int>> keys;
+    project_decision_sessions_locked(nullptr, refs, keys);
     decision_store_stats stats;
-    for (const auto & ref : refs) {
-        if (!ref.removed) {
-            stats.n_sessions++;
-        }
-    }
+    stats.n_sessions  = decision_session_live_count(refs);
     stats.bytes_total = decision_session_total_bytes(refs);
     return stats;
 }
@@ -3093,9 +3210,15 @@ server_http_res_ptr server_instances::decision_snapshot_op(const std::shared_ptr
     if (auto err = ensure_built_instance(inst)) {
         return err;
     }
-    auto res = inst->ctx_server->slot_decision_snapshot(id_slot);
+    // the capture is a read-only op on the chat instance's scheduler, but an unbounded wait on a
+    // stalled chat scheduler stalls the HTTP thread that asked for it, so it is bounded like every
+    // other scheduler acknowledgement. A late answer is still usable here, unlike a late drain: the
+    // capture hands back an owned copy that aliases nothing. There is no lease to leak on this path
+    // either, because the capture is not admitted to the store yet, so refusing is safe.
+    auto res = inst->ctx_server->slot_decision_snapshot(id_slot, ggml_time_ms() + scheduler_ack_budget_ms());
     if (res == nullptr) {
-        return make_error("the decision snapshot timed out on instance '" + inst->cfg.name + "'", ERROR_TYPE_UNAVAILABLE);
+        return make_error("the decision snapshot timed out on instance '" + inst->cfg.name + "'",
+                          ERROR_TYPE_UNAVAILABLE);
     }
     if (res->is_error()) {
         return make_error_from_result(*res);
@@ -3248,7 +3371,7 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
                 std::vector<common_adapter_lora_info> stale_loras;
                 auto it = decision_sessions_.find(key);
                 if (it != decision_sessions_.end() && it->second.removed) {
-                    stale_loras = finalize_decision_session_locked(key);
+                    stale_loras = retire_decision_session_locked(key);
                 }
                 // token-snapshot budget: the capture path holds the same --decision-session-budget-mb
                 // cap as the create path, so a client that only ever sends id_slot-pinned decisions
@@ -3320,12 +3443,45 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
 // cancelled) decision task, then drop the lease on the store entry so its adapter refs can be
 // released. The FIFO sync op runs after the decision task, so its return proves the task is done
 // even when the HTTP side returned early on a client cancel.
-void server_instances::release_decision_snapshot_after_dispatch(const std::string & snap_key,
-                                                                const std::pair<std::string, int> & entry_key) {
+//
+// The wait is bounded. Giving up does NOT authorise releasing anything: an unobserved task is
+// indistinguishable from a running one, so the lease, the entry's adapter refs and the transient
+// snapshot key all stay. That is the deliberate inversion of the usual timeout semantics, and it
+// costs a retained reference - clearable by DELETE or by an operator - instead of freeing adapter
+// memory a decode may still be reading.
+bool server_instances::drain_sidecar_bounded(int64_t budget) {
     auto sidecar = get_instance(decision_sidecar_name());
-    if (sidecar != nullptr && sidecar->built.load(std::memory_order_acquire)) {
-        sidecar->ctx_server->instance_op([]() { return json{{"drain", true}}; });
+    // an unbuilt sidecar cannot be decoding anything, so there is nothing to wait for
+    if (sidecar == nullptr || !sidecar->built.load(std::memory_order_acquire)) {
+        return true;
     }
+    // a non-positive budget is the test-only fail-closed sentinel: never post, never observe, so
+    // the caller takes the retry-then-keep branch deterministically
+    if (budget <= 0) {
+        return false;
+    }
+    const int64_t          start        = ggml_time_ms();
+    // a null result means this thread stopped waiting, not that the task was skipped: the drain op
+    // is already queued behind the decision task and may still run
+    server_task_result_ptr res          = sidecar->ctx_server->instance_op(decision_drain_ack, start + budget);
+    const int64_t          waited       = ggml_time_ms() - start;
+    // the op's own deadline is only consulted where the result queue's poll expires, so a busy
+    // scheduler can answer late and still hand back a result. the elapsed time is therefore the
+    // measurement that bounds this wait: an answer that arrived after the budget proves nothing
+    // about the reader having finished inside it.
+    const bool             acknowledged = res != nullptr && waited <= budget;
+    size_t                 pending      = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        pending = decision_snapshot_resolve_.size();
+    }
+    IST_DBG("decision drain took %" PRId64 "ms of a %" PRId64 "ms budget, %zu transient snapshot key(s) pending",
+            waited, budget, pending);
+    return acknowledged;
+}
+
+void server_instances::complete_decision_release(const std::string &                 snap_key,
+                                                 const std::pair<std::string, int> & entry_key) {
     std::vector<common_adapter_lora_info> removed_loras;
     {
         std::lock_guard<std::mutex> lock(mutex_decision_sessions);
@@ -3339,10 +3495,241 @@ void server_instances::release_decision_snapshot_after_dispatch(const std::strin
             --entry.lease_count;
         }
         if (entry.removed && entry.lease_count == 0) {
-            removed_loras = finalize_decision_session_locked(entry_key);
+            removed_loras = retire_decision_session_locked(entry_key);
         }
     }
     release_decision_refs(removed_loras);
+}
+
+void server_instances::release_decision_snapshot_after_dispatch(const std::string &                 snap_key,
+                                                                const std::pair<std::string, int> & entry_key) {
+    // the inline fallback: the queue is stopped or full, so the drain and the release run here on
+    // the HTTP thread instead. Counted so a calibration can see whether the fallback ever fires.
+    release_n_inline_.fetch_add(1, std::memory_order_relaxed);
+    const int64_t budget = scheduler_ack_budget_ms();
+    if (!drain_sidecar_bounded(budget)) {
+        IST_ERR("decision drain on instance '%s' slot %d exceeded its %" PRId64
+                "ms budget; keeping the lease and the adapter references, so this reference must be "
+                "erased by hand",
+                entry_key.first.c_str(), entry_key.second, budget);
+        return;
+    }
+    complete_decision_release(snap_key, entry_key);
+}
+
+void server_instances::release_stats_read(release_stats & out) const {
+    // a consistent-enough read of seven independent counters: each is monotonic except the gauges,
+    // and a calibration reads them after a workload has quiesced
+    out.jobs            = release_n_jobs_.load(std::memory_order_relaxed);
+    out.retries         = release_n_retries_.load(std::memory_order_relaxed);
+    out.retained        = release_n_retained_.load(std::memory_order_relaxed);
+    out.inline_releases = release_n_inline_.load(std::memory_order_relaxed);
+    out.queue_high      = release_queue_high_.load(std::memory_order_relaxed);
+    out.bytes_pending   = release_bytes_pending_.load(std::memory_order_relaxed);
+    out.bytes_high      = release_bytes_high_.load(std::memory_order_relaxed);
+}
+
+bool server_instances::enqueue_decision_release(const std::string &                 snap_key,
+                                                const std::pair<std::string, int> & entry_key) {
+    const size_t bytes = decision_snapshot_bytes(snap_key);
+    {
+        std::lock_guard<std::mutex> lock(mutex_release);
+        // no worker, no queue: before the single start or after the single stop a posted job would
+        // never run, so refuse and let the caller release inline instead of dropping the lease
+        if (!release_running || release_jobs.size() >= max_release_jobs) {
+            return false;
+        }
+        release_job_push_locked(release_job{ snap_key, entry_key, 0, false, bytes, 0 });
+        // a job holds its snapshot until it finishes, whether it is queued, in flight or backing
+        // off, so its bytes are charged here and credited exactly once on the way out. A retry
+        // re-pushes a job that is already charged, so only this first push charges.
+        const uint64_t pending = release_bytes_pending_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+        if (pending > release_bytes_high_.load(std::memory_order_relaxed)) {
+            release_bytes_high_.store(pending, std::memory_order_relaxed);
+        }
+    }
+    cond_release.notify_one();
+    return true;
+}
+
+// one push point for the queue, so every enqueue - a first post or a retry - updates the depth
+// high-water mark the same way. caller holds mutex_release.
+void server_instances::release_job_push_locked(release_job && job) {
+    release_jobs.push_back(std::move(job));
+    const uint64_t depth = release_jobs.size();
+    if (depth > release_queue_high_.load(std::memory_order_relaxed)) {
+        release_queue_high_.store(depth, std::memory_order_relaxed);
+    }
+}
+
+// The one selection rule. FIFO among runnable jobs, but a job still inside its backoff is skipped
+// rather than waited on: one job's backoff must not occupy the worker while the jobs behind it are
+// ready. A stopping worker ignores the deadlines, so shutdown drains everything.
+// trailing return type: the nested release_job is not in scope before the declarator
+auto server_instances::release_take_ready_locked() -> std::optional<release_job> {
+    const int64_t now = ggml_time_ms();
+    auto          it  = std::find_if(release_jobs.begin(), release_jobs.end(),
+                                     [&](const release_job & job) { return release_stop || job.ready_ms <= now; });
+    if (it == release_jobs.end()) {
+        return std::nullopt;
+    }
+    std::optional<release_job> taken(std::move(*it));
+    release_jobs.erase(it);
+    return taken;
+}
+
+// 0 when nothing is waiting on a backoff, which is also the case for an empty queue: the caller
+// waits on the condition variable instead of on a deadline.
+int64_t server_instances::release_next_deadline_locked() const {
+    const int64_t now  = ggml_time_ms();
+    int64_t       next = 0;
+    for (const release_job & job : release_jobs) {
+        if (job.ready_ms > now && (next == 0 || job.ready_ms < next)) {
+            next = job.ready_ms;
+        }
+    }
+    return next;
+}
+
+// the wait predicate's other half: whether release_take_ready_locked would return a job. Same rule,
+// so the worker cannot wake up to find nothing to do.
+bool server_instances::release_any_ready_locked() const {
+    const int64_t now = ggml_time_ms();
+    return std::any_of(release_jobs.begin(), release_jobs.end(),
+                       [&](const release_job & job) { return job.ready_ms <= now; });
+}
+
+void server_instances::release_wake_retained(const std::pair<std::string, int> & entry_key) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_release);
+        // a parked job is one whose short ladder is spent, so its entry is the only one that can be
+        // holding a lease the operator asked to clear
+        for (release_job & job : release_jobs) {
+            if (job.retained && job.entry_key == entry_key) {
+                job.ready_ms = 0;
+            }
+        }
+    }
+    cond_release.notify_one();
+}
+
+// the owned bytes the transient snapshot behind `snap_key` holds, or 0 once it has been erased.
+// An absent key contributes 0 rather than failing the enqueue: the release still has to run so the
+// lease it took is dropped.
+size_t server_instances::decision_snapshot_bytes(const std::string & snap_key) {
+    std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+    auto                        it = decision_snapshot_resolve_.find(snap_key);
+    if (it == decision_snapshot_resolve_.end()) {
+        return 0;
+    }
+    return decision_token_bytes(it->second->tokens.size());
+}
+
+// pool release worker: one FIFO thread owns every post-decision release, so the drain wait and the
+// adapter ref release never run on the client's HTTP thread. It copies io_loop: the loop drains any
+// pending jobs before it returns, so a lease enqueued before shutdown is still released.
+void server_instances::release_loop() {
+    while (true) {
+        release_job job;
+        {
+            std::unique_lock<std::mutex> lock(mutex_release);
+            for (;;) {
+                std::optional<release_job> taken = release_take_ready_locked();
+                if (taken) {
+                    job = std::move(*taken);
+                    break;
+                }
+                if (release_stop) {
+                    return;  // stop set and nothing runnable is left
+                }
+                // park on the condition variable while the queue is empty, and on the earliest
+                // backoff while it is not, so a re-queue never costs the worker a sleep
+                const int64_t next  = release_next_deadline_locked();
+                const auto    woken = [&]() {
+                    return release_stop || release_any_ready_locked();
+                };
+                if (next == 0) {
+                    cond_release.wait(lock, woken);
+                } else {
+                    cond_release.wait_for(lock, std::chrono::milliseconds(next - ggml_time_ms()), woken);
+                }
+            }
+        }
+
+        const int64_t budget = scheduler_ack_budget_ms();
+        if (drain_sidecar_bounded(budget)) {
+            release_n_jobs_.fetch_add(1, std::memory_order_relaxed);
+            complete_decision_release(job.snap_key, job.entry_key);
+            release_bytes_pending_.fetch_sub(job.bytes, std::memory_order_relaxed);
+            continue;
+        }
+
+        // The scheduler was not observed. A running decision is indistinguishable from a slow one,
+        // so nothing may be released: the lease, the adapter refs and the transient key all stay.
+        // The job goes back on the queue with a deadline instead of sleeping here, so the jobs behind
+        // it keep draining while this one waits.
+        bool stopping = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_release);
+            stopping = release_stop;
+        }
+        if (stopping) {
+            // the worker is going away, so re-queueing would hold shutdown for another budget
+            // attempt per job. The pool teardown drops the remaining references anyway; what is lost
+            // here is the drain proof, not the lease.
+            release_n_retained_.fetch_add(1, std::memory_order_relaxed);
+            IST_ERR(
+                "decision drain for snapshot '%s' was still unobserved at shutdown; its lease and "
+                "adapter references go with the process",
+                job.snap_key.c_str());
+            continue;
+        }
+        release_n_retries_.fetch_add(1, std::memory_order_relaxed);
+        if (!job.retained && ++job.attempts >= release_fast_attempts) {
+            // the short ladder is spent. report it once, then keep retrying on the long interval:
+            // the reference and the snapshot it holds are retained memory, so a job that stopped
+            // retrying here would keep them until the process restarted.
+            job.retained = true;
+            release_n_retained_.fetch_add(1, std::memory_order_relaxed);
+            IST_ERR("decision drain for snapshot '%s' exceeded its %" PRId64
+                    "ms budget after %d attempt(s); keeping the lease and the adapter references and "
+                    "retrying every %d ms until the scheduler is observed",
+                    job.snap_key.c_str(), budget, job.attempts, release_retained_retry_ms);
+        }
+        job.ready_ms = ggml_time_ms() + (job.retained ? release_retained_retry_ms : release_retry_backoff_ms);
+        {
+            std::lock_guard<std::mutex> lock(mutex_release);
+            release_job_push_locked(std::move(job));
+        }
+        cond_release.notify_one();
+    }
+}
+
+void server_instances::start_release_worker() {
+    std::lock_guard<std::mutex> lock(mutex_release);
+    if (release_running) {
+        return;
+    }
+    release_stop    = false;
+    release_running = true;
+    if (!release_thread.joinable()) {
+        release_thread = std::thread([this]() { release_loop(); });
+    }
+}
+
+void server_instances::stop_release_worker() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_release);
+        if (!release_running) {
+            return;
+        }
+        release_running = false;
+        release_stop    = true;
+        cond_release.notify_all();
+    }
+    if (release_thread.joinable()) {
+        release_thread.join();
+    }
 }
 
 server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http_req & req) {
@@ -3971,6 +4358,7 @@ void server_instances::start_loops() {
         start_instance_loop_locked(*inst);
     }
     start_io_worker();
+    start_release_worker();
 }
 
 server_instances::~server_instances() {
@@ -4003,6 +4391,11 @@ void server_instances::terminate() {
         // snapshot so teardown never iterates a vector that a management op may mutate
         live = instances;
     }
+
+    // join the release worker while the sidecar schedulers are still alive: a queued job drains
+    // against the live sidecar, and a job that cannot be observed there fails closed. stopping it
+    // after the sidecar would make every pending job fail closed and retain.
+    stop_release_worker();
 
     for (const auto & inst : live) {
         // unbuilt windows never started a scheduler and own no context
@@ -4141,6 +4534,12 @@ server_http_res_ptr server_instances::make_error(const std::string & message, er
     auto res          = std::make_unique<server_http_res>();
     res->status       = error_status(type);
     res->content_type = "application/json; charset=utf-8";
+    // a 503 here is always a transient condition (an instance being reconfigured, a busy snapshot I/O
+    // worker, an op that outran its deadline), so it is retriable. A retrying client needs to be told
+    // how long to wait; without the header it either spins or backs off by a guess.
+    if (res->status == 503) {
+        res->headers["Retry-After"] = "1";
+    }
     res->data         = safe_json_to_str({
         { "error", format_error_response(message, type) }
     });

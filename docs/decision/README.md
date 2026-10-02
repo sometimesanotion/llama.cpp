@@ -124,9 +124,10 @@ which also owns the store's byte budget and TTL policy.
 
 ## What it will refuse
 
-422 for a semantic or capacity error, 413 for an over-size body, 429/529 with
-`Retry-After` for a full queue, 499 when the client disconnects, 501 when the
-loaded model cannot serve decisions at all (no usable single-token answer
+422 for a semantic or capacity error, 413 for an over-size body, 429/529 and 503
+with `Retry-After` for a full queue or a transient failure, 499 when the
+client disconnects, 501 when decisions are not enabled or the
+loaded model cannot serve them at all (no usable single-token answer
 labels, or a pinned contract that does not match), and 500 for an internal
 failure. The path never truncates: an over-limit request is rejected, never
 silently clipped. `API.md` section 4 owns the full table.

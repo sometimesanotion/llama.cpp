@@ -7,6 +7,7 @@
 #include "server-snapshot.h"
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -115,12 +116,29 @@ struct decision_session_ref {
     bool    replacing    = false;    // the key the incoming reference is about to take
 };
 
+// whether the store still holds one reference. This is the single "is it live" rule: the byte
+// budget charges on it and the reported live count uses it, so bytes_total can never disagree with
+// what the budget actually charged.
+bool decision_session_live(const decision_session_ref & ref);
+
 // the owned token bytes the store charges against its budget: every reference still live, which is
 // the set the budget itself charges, so a client can read its own consumption
 size_t decision_session_total_bytes(const std::vector<decision_session_ref> & refs);
 
+// how many references the store still holds, from the same view and the same rule as the bytes
+size_t decision_session_live_count(const std::vector<decision_session_ref> & refs);
+
 // the least-recently-used evictable reference, or none when every remaining one is held
 std::optional<size_t> pick_decision_session_victim(const std::vector<decision_session_ref> & refs);
+
+// what retiring one stored reference would do right now. `absent`: the store holds no such
+// reference, so retiring it is a no-op. `now`: nothing holds it, so its adapter references can be
+// released immediately. `deferred`: an in-flight decision still holds it, so it is marked removed
+// and finalized when its last lease drops. A decision always outlives the reference it is reading.
+// This is task validity - whether the store may be mutated now - and reads no answer.
+enum class decision_session_retirement { absent, now, deferred };
+
+decision_session_retirement pick_decision_session_retirement(bool present, bool leased);
 
 struct server_instances {
     // context construction seam: fills ctx_server + routes for an instance from
@@ -243,16 +261,7 @@ struct server_instances {
     // route a request that carries model / instance / snapshot fields (body and/or query)
     // to the owning instance. `forward` runs on the chosen instance's server_routes.
     using forward_fn = std::function<server_http_res_ptr(server_routes &, const server_http_req &)>;
-
-    // placement contract for a routed request. A session-pinned request (any /v1/session call,
-    // or a decision naming a live slot) addresses state that lives in exactly one instance's
-    // context, so group routing (which picks any free member) is refused.
-    struct dispatch_options {
-        bool require_instance = false; // refuse group routing; address one instance's slot
-    };
     server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward);
-    server_http_res_ptr dispatch(const server_http_req & req, const forward_fn & forward,
-                                 const dispatch_options & opt);
 
     // Converts one instance-side task result into a response. The result is already
     // typed, so the error class travels with it: an error result renders through
@@ -301,7 +310,10 @@ struct server_instances {
     server_http_res_ptr handle_post_embeddings(const server_http_req & req);
     server_http_res_ptr handle_post_embeddings_oai(const server_http_req & req);
     server_http_res_ptr handle_post_rerank(const server_http_req & req);
-    server_http_res_ptr handle_post_decision(const server_http_req & req);
+    // jev_only selects the forward target: the strict-Jev contract for /v1/systemone, the
+    // superset for /v1/decision. It is passed in by the route binding rather than recovered from
+    // the request path, which a deployment controls through --api-prefix.
+    server_http_res_ptr handle_post_decision(const server_http_req & req, bool jev_only = false);
     server_http_res_ptr handle_post_session(const server_http_req & req);
     server_http_res_ptr handle_get_session(const server_http_req & req);
     server_http_res_ptr handle_delete_session(const server_http_req & req);
@@ -593,6 +605,88 @@ struct server_instances {
     bool                                   io_stop = false;
     static constexpr size_t                max_io_jobs = 4;
 
+    // --- decision release worker: one bounded FIFO of release jobs, consumed by one pool-owned
+    //     non-scheduler thread. A job carries the transient snapshot key and the store entry key it
+    //     must release, the bytes its snapshot holds until the job finishes, the backoff attempts
+    //     already spent, and the wall-clock time its backoff expires. The deadline is what keeps one
+    //     job's backoff off the whole queue: the worker runs the first job whose backoff has elapsed
+    //     rather than the first job in the queue. The queue cap bounds how many leases can be
+    //     pending; a full queue falls back to the inline release rather than dropping a lease.
+    struct release_job {
+        std::string                 snap_key;
+        std::pair<std::string, int> entry_key;
+        int                         attempts = 0;      // short-backoff attempts spent so far
+        bool                        retained = false;  // the short ladder is spent; retrying on the long one
+        size_t                      bytes    = 0;
+        int64_t                     ready_ms = 0;      // backoff expiry; 0 = runnable now
+    };
+
+    std::mutex              mutex_release;
+    std::condition_variable cond_release;
+    bool                    release_running = false;
+    std::deque<release_job> release_jobs;
+    std::thread             release_thread;
+    bool                    release_stop = false;
+
+    // Liveness telemetry for the worker, calibrated in BENCHMARKING.md. Every field counts executor
+    // work (queueing, draining, retrying) or bytes held; none is a reported distribution measure and
+    // no condition reads any of them. `retained` counts the jobs that have spent their short retry
+    // ladder and are now parked on the long one, and `bytes_pending` is the "still held right now"
+    // answer to "is anything retained". Atomics so GET /v1/session can report them without nesting
+    // mutex_release inside mutex_decision_sessions.
+    struct release_stats {
+        uint64_t jobs            = 0;  // leases whose drain was observed and whose refs were released
+        uint64_t retries         = 0;  // unobserved drains re-queued with a backoff
+        uint64_t retained        = 0;  // jobs that spent the short ladder and moved to the long one
+        uint64_t inline_releases = 0;  // leases released inline because the queue was stopped or full
+        uint64_t queue_high      = 0;  // deepest queue ever observed
+        uint64_t bytes_pending   = 0;  // snapshot bytes held by unfinished jobs right now
+        uint64_t bytes_high      = 0;  // deepest bytes_pending ever observed
+    };
+
+    void                       release_stats_read(release_stats & out) const;
+    // push one job onto the queue and update the depth high-water mark. caller holds mutex_release;
+    // the pending bytes are charged once per job at its first push, not here, because a retry
+    // re-pushes a job whose snapshot is already charged.
+    void                       release_job_push_locked(release_job && job);
+    // take the first job whose backoff has elapsed, or none when every queued job is still backing
+    // off. A stopping worker takes the front job regardless, so shutdown drains the queue instead of
+    // waiting out a backoff. caller holds mutex_release.
+    std::optional<release_job> release_take_ready_locked();
+    // the earliest backoff still pending, or 0 when no queued job is waiting on one. caller holds
+    // mutex_release.
+    int64_t                    release_next_deadline_locked() const;
+    // whether release_take_ready_locked would return a job. The wait predicate's other half, same
+    // rule, so the worker cannot wake to find nothing runnable. caller holds mutex_release.
+    bool                       release_any_ready_locked() const;
+    // make every parked job of `entry_key` runnable now. An operator erase calls it: only an
+    // observed drain may release anything, so this wakes the worker's retries rather than releasing
+    // here, and it never runs on the client's decision path.
+    void                       release_wake_retained(const std::pair<std::string, int> & entry_key);
+    // the owned bytes the transient snapshot behind `snap_key` still holds (0 once erased), read
+    // under the store lock. Reused so the release worker's pending-byte gauge charges the same unit
+    // the session byte budget charges, instead of a second copy of that formula.
+    size_t                     decision_snapshot_bytes(const std::string & snap_key);
+    std::atomic<uint64_t>      release_n_jobs_{ 0 };
+    std::atomic<uint64_t>      release_n_retries_{ 0 };
+    std::atomic<uint64_t>      release_n_retained_{ 0 };
+    std::atomic<uint64_t>      release_n_inline_{ 0 };
+    std::atomic<uint64_t>      release_queue_high_{ 0 };
+    std::atomic<uint64_t>      release_bytes_pending_{ 0 };
+    std::atomic<uint64_t>      release_bytes_high_{ 0 };
+
+    // Frozen thresholds. Each one bounds a liveness or capacity quantity; none is a quality gate and
+    // none is compared against a reported confidence or certainty. Rationale and measurements:
+    // BENCHMARKING.md, section "Release worker calibration".
+    // `release_fast_attempts` short-backoff attempts a job gets before it is reported and parked on
+    // the long interval, which is where it stays until the scheduler is observed (or an operator
+    // erase wakes it). Nothing is abandoned: a parked job keeps retrying, because a reference and
+    // the snapshot it holds are retained memory until something observes the reader finishing.
+    static constexpr int    release_fast_attempts     = 5;
+    static constexpr int    release_retry_backoff_ms  = 50;
+    static constexpr int    release_retained_retry_ms = 60000;
+    static constexpr size_t max_release_jobs          = 128;
+
     // per-pool cap on concurrent snapshot switches: bounds peak host-buffer memory
     std::mutex              mutex_switch;
     std::condition_variable cond_switch;
@@ -622,7 +716,6 @@ struct server_instances {
         int         lease_count = 0;            // >0: held by an in-flight sidecar decision
         bool        removed = false;            // turn advanced / erased; finalize when the lease drops
     };
-    static std::string decision_session_key(const std::string & instance, int id_slot);
     // per-slot monotonic turn counters and the session store, keyed by (instance, id_slot)
     std::map<std::pair<std::string, int>, uint64_t> decision_slot_turns_;
     std::map<std::pair<std::string, int>, decision_session_entry> decision_sessions_;
@@ -654,6 +747,10 @@ struct server_instances {
     static std::string decision_adapter_scope_of(const std::vector<std::pair<std::string, float>> & scope);
     static std::string decision_content_hash_of(const std::vector<llama_token> & tokens,
                                                 const std::vector<std::pair<std::string, float>> & scope);
+    // the owned host bytes one owned token list charges: tokens.size() * sizeof(llama_token). The
+    // single owner of that unit, so the store byte budget, the per-reference `bytes` field and the
+    // release worker's pending-byte gauge can never disagree about what a snapshot costs.
+    static size_t      decision_token_bytes(size_t n_tokens);
     // the owned host bytes one reference charges against the session byte budget
     static size_t decision_session_bytes(const decision_session_entry & entry);
     // mint a collision-free handle into the decision session store. the caller holds
@@ -663,10 +760,35 @@ struct server_instances {
     // caller holds mutex_mgmt. the caller owns the refs until release_adapter_set.
     std::vector<common_adapter_lora_info> resolve_decision_lora_scope(const std::vector<std::pair<std::string, float>> & scope);
     // release the refs of a store entry and erase it from every map; the returned refs must be
-    // released by the caller AFTER dropping the store lock. called only from HTTP threads.
+    // released by the caller AFTER dropping the store lock, on a pool-owned non-scheduler thread
+    // (an HTTP thread or the release worker).
     std::vector<common_adapter_lora_info> finalize_decision_session_locked(const std::pair<std::string, int> & key);
+    // retire one reference, applying the whole policy in one place: absent is a no-op, a reference
+    // an in-flight decision still holds is marked removed and finalized when its last lease drops,
+    // and anything else is finalized now. returns the adapter refs the caller must release AFTER
+    // dropping the store lock (never across it). every path that drops a reference goes through
+    // here, so a decision always outlives the reference it is reading.
+    std::vector<common_adapter_lora_info> retire_decision_session_locked(const std::pair<std::string, int> & key);
+
+    // RAII owner of one session decision's dispatch lease: the store entry lease taken by
+    // attach_decision_snapshot and the transient snapshot key it published. Releasing through the
+    // destructor means a dispatch that throws cannot strand the lease, which would never be reaped,
+    // never be a budget victim and would inflate the store's counters forever.
+    struct decision_lease_guard {
+        server_instances &          mgr;
+        std::string                 snap_key;
+        std::pair<std::string, int> entry_key;
+
+        decision_lease_guard(server_instances & m, std::string key, std::pair<std::string, int> entry);
+        ~decision_lease_guard();
+
+        decision_lease_guard(const decision_lease_guard &)             = delete;
+        decision_lease_guard & operator=(const decision_lease_guard &) = delete;
+    };
     // drop the store lock's refs afterwards: takes mutex_mgmt and releases them. every store
     // mutation that returns adapter refs releases them through here, so no path hand-rolls it.
+    // runs on a pool-owned non-scheduler thread only (an HTTP thread or the release worker), never
+    // on a scheduler thread and never while mutex_decision_sessions is held.
     void release_decision_refs(std::vector<common_adapter_lora_info> & loras);
     // remove every reference whose ttl_ms has elapsed since its last use. caller holds
     // mutex_decision_sessions; the returned refs are released through release_decision_refs.
@@ -683,6 +805,14 @@ struct server_instances {
                                                       const std::vector<llama_token> & incoming,
                                                       const std::string & subject,
                                                       std::vector<common_adapter_lora_info> & evicted);
+    // the whole store as one plain view, in store order, with the key each entry belongs to. Both
+    // the byte budget and the reported counters read it, so the bytes the budget charges and the
+    // bytes a client reads back are the same bytes. `exclude` is the key about to be replaced and is
+    // marked `replacing` there; a null exclude projects the store as it stands. caller holds
+    // mutex_decision_sessions.
+    void                 project_decision_sessions_locked(const std::pair<std::string, int> *        exclude,
+                                                          std::vector<decision_session_ref> &        refs,
+                                                          std::vector<std::pair<std::string, int>> & keys) const;
     decision_store_stats decision_store_stats_locked() const;
     // resolve a first-class session handle to a copy of its owned snapshot and lease its store
     // entry. this is one of the two points the TTL reaper runs from; a handle whose reference was
@@ -719,11 +849,40 @@ struct server_instances {
     server_http_res_ptr attach_decision_snapshot(const json & body, server_http_req & routed,
                                                  std::pair<std::string, int> & lease_out);
     // after a sidecar dispatch: drain the sidecar queue so a cancelled decision is guaranteed done
-    // before the store entry (and its adapter refs) is released, then unlease the entry.
+    // before the store entry (and its adapter refs) is released, then unlease the entry. This is
+    // the inline fallback the guard uses when the release worker is not available; the normal path
+    // enqueues the same work on the worker.
     void release_decision_snapshot_after_dispatch(const std::string & snap_key,
                                                   const std::pair<std::string, int> & entry_key);
+
+    // --- decision release worker: the drain wait and the store release never run on the client's
+    //     HTTP thread. One pool-owned, non-scheduler thread consumes a bounded FIFO of release jobs;
+    //     the lease guard enqueues and returns, and the worker drains the sidecar, then drops the
+    //     lease, erases the transient key and releases the adapter refs. It copies the snapshot I/O
+    //     worker's lifecycle (start_loops starts it, terminate joins it before the sidecar scheduler
+    //     stops) rather than inventing a second thread idiom.
+    void start_release_worker();
+    void stop_release_worker();
+    void release_loop();
+    // enqueue one release job. returns false when the worker is not running or the queue is full, so
+    // the caller falls back to the inline release instead of dropping a lease.
+    bool enqueue_decision_release(const std::string & snap_key, const std::pair<std::string, int> & entry_key);
+    // post the FIFO drain op on the sidecar and wait up to `budget`; true when the scheduler was
+    // observed inside it. false means the task may still be running, so nothing may be released.
+    // It is a sidecar-level barrier, so it takes no per-snapshot argument: the op is queued behind
+    // every decision task already posted, and any one of them answering it proves the queue drained.
+    bool drain_sidecar_bounded(int64_t budget);
+    // drop the lease, erase the transient key and release the adapter refs. runs on the release
+    // worker or on an HTTP thread, never on a scheduler thread and never while the store lock is
+    // held.
+    void complete_decision_release(const std::string & snap_key, const std::pair<std::string, int> & entry_key);
+    // The refusal every decision route answers with when the server has no decision executor. Session
+    // state lives only in the sidecar executor, so without one these routes have nothing to serve.
+    // It is answered here, before any dispatch, so a refused request cannot reach a chat context.
+    server_http_res_ptr decision_unavailable() const;
+
     // sidecar executor routing for /v1/decision and /v1/session
-    server_http_res_ptr handle_post_decision_sidecar(const server_http_req & req);
+    server_http_res_ptr handle_post_decision_sidecar(const server_http_req & req, bool jev_only);
     server_http_res_ptr handle_post_session_sidecar(const server_http_req & req);
     server_http_res_ptr handle_get_session_sidecar(const server_http_req & req);
     server_http_res_ptr handle_delete_session_sidecar(const server_http_req & req);

@@ -4,6 +4,7 @@
 #include "decision-engine.h"
 #undef private
 #include "../src/llama-ext.h"  // staging API
+#include "arg.h"
 #include "chat.h"
 #include "common.h"
 #include "decision-protocol.h"
@@ -5557,11 +5558,11 @@ static void test_fork_swa_clamp(testing & t) {
 static common_json oracle_readout(const llama_decision::readout_metrics & m,
                                   const std::vector<std::vector<float>> & probs) {
     common_json o = common_json::object();
-    o["cache_hit"]            = m.cache_hit;
-    o["suffix_tokens"]        = (long long) m.suffix_tokens;
-    o["common_suffix_tokens"] = (long long) m.common_suffix_tokens;
-    o["rows"]                 = (long long) m.rows;
-    o["rounds"]               = (long long) m.rounds;
+    o["cache_hit"]            = m.batch.cache_hit;
+    o["suffix_tokens"]        = (long long) m.batch.suffix_tokens;
+    o["common_suffix_tokens"] = (long long) m.batch.common_suffix_tokens;
+    o["rows"]                 = (long long) m.batch.rows;
+    o["rounds"]               = (long long) m.batch.rounds;
 
     common_json questions = common_json::array();
     for (const auto & p : probs) {
@@ -5761,6 +5762,130 @@ static void test_compile_fields_plan(testing & t) {
         t.assert_equal("decide_batch reports the plan suffix_tokens", a.suffix_tokens, br.suffix_tokens);
         t.assert_equal("decide_batch reports the plan leaf_suffix_tokens", a.leaf_suffix_tokens, br.leaf_suffix_tokens);
         t.assert_equal("decide_batch reports the plan common_suffix_tokens", a.common_suffix_tokens, br.common_suffix_tokens);
+    });
+}
+
+// Cost probe for the compile path. Observation only: it asserts the plans compile but nothing
+// about their content, and it is skipped unless LLAMA_DECISION_BENCH_MODEL names a real tokenizer.
+// The generated CPU fixture cannot tokenize the documented option counts, so it is not used here.
+// The documented worst case is 256 questions x 8 passes x 255 options, which is the same field
+// set as 2048 fields of 255 options, and the typical case is 8 questions x 1 pass x 4 options.
+static void test_compile_fields_cost_probe(testing & t) {
+    t.test("compile_fields cost probe", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_BENCH_MODEL");
+        if (path == nullptr || path[0] == '\0') {
+            t.skip("set LLAMA_DECISION_BENCH_MODEL to run the compile cost probe");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 256, false)) {
+            t.assert_true("the cost probe model loads", false);
+            return;
+        }
+        llama_decision::engine  eng(te.ctx, 2, 8);
+        llama_decision::options opt;
+        opt.mode = "tree";
+
+        auto build = [](int fields, int options, const std::string & tag) {
+            std::vector<llama_decision::field_input> out;
+            for (int f = 0; f < fields; ++f) {
+                std::vector<std::string> cands;
+                for (int o = 0; o < options; ++o) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "%s-%04d-%04d", tag.c_str(), f, o);
+                    cands.push_back(buf);
+                }
+                char suffix[64];
+                std::snprintf(suffix, sizeof(suffix), "\n%s-%04d: ", tag.c_str(), f);
+                out.push_back({ suffix, cands, 1.0f });
+            }
+            return out;
+        };
+
+        auto run = [&](const std::vector<llama_decision::field_input> & fields, const std::string & name) {
+            const auto                            t0   = std::chrono::steady_clock::now();
+            const llama_decision::compiled_fields plan = eng.compile_fields(fields, opt);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr,
+                    "compile_fields %s: %zu fields, %zu options, rows %d, branches %d, %.3f ms, "
+                    "cache %zu hits / %zu misses\n",
+                    name.c_str(), fields.size(), fields.empty() ? 0 : fields.front().candidates.size(), plan.rows,
+                    plan.branches, ms, plan.token_cache_hits, plan.token_cache_misses);
+            t.assert_true(name + ": the plan compiled", plan.rows > 0);
+        };
+
+        run(build(8, 4, "typical"), "typical");
+        run(build(256 * 8, 255, "worst"), "worst");
+    });
+}
+
+// The token cache is a pure function of (text, add_special) over the vocabulary, so evicting an
+// entry can only cost time, never change an answer. This is the control group for the eviction
+// policy: a plan compiled with a cold cache and the same plan compiled after the cache was
+// thrashed must be identical in every observable, and must score identically.
+static void test_token_cache_eviction_equivalence(testing & t) {
+    t.test("a thrashed token cache compiles and scores like a cold one", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no generated model; run the generate-models fixture");
+            return;
+        }
+        cpu_test_engine te;
+        if (!te.load(path, 2048, false)) {
+            t.assert_true("the CPU decision scaffold loads the model", false);
+            return;
+        }
+        llama_decision::engine  eng(te.ctx, 2, 8);
+        llama_decision::options opt;
+        opt.mode        = "tree";
+        opt.allow_cache = false;
+
+        const std::vector<llama_decision::field_input> target = {
+            { "\nalpha: ", { "a", "b", "c" }, 1.0f },
+            { "\nbeta: ",  { "d", "e" },      1.0f },
+            { "\ngamma: ", { "f", "g", "h" }, 1.0f },
+        };
+        const llama_decision::compiled_fields cold   = eng.compile_fields(target, opt);
+        const llama_decision::batch_result    cold_b = eng.decide_batch(cold, "system", { "context" }, opt);
+
+        // Flood the cache with far more distinct tokenizations than it holds, so every key the
+        // target compile inserted is evicted before the second compile.
+        std::vector<llama_decision::field_input> flood;
+        for (int f = 0; f < 60; ++f) {
+            std::vector<std::string> cands;
+            for (char c = 'a'; c <= 'z'; ++c) {
+                cands.push_back(std::string(1, c));
+            }
+            flood.push_back({ "\nflood" + std::to_string(f) + ": ", cands, 1.0f });
+        }
+        const llama_decision::compiled_fields flooded = eng.compile_fields(flood, opt);
+        t.assert_true("the flood plan compiles", flooded.branches > 0);
+
+        const llama_decision::compiled_fields warm   = eng.compile_fields(target, opt);
+        const llama_decision::batch_result    warm_b = eng.decide_batch(warm, "system", { "context" }, opt);
+
+        t.assert_equal("thrash keeps rows", cold.rows, warm.rows);
+        t.assert_equal("thrash keeps branches", cold.branches, warm.branches);
+        t.assert_equal("thrash keeps suffix_tokens", cold.suffix_tokens, warm.suffix_tokens);
+        t.assert_equal("thrash keeps common_suffix_tokens", cold.common_suffix_tokens, warm.common_suffix_tokens);
+        t.assert_equal("thrash keeps leaf_suffix_tokens", cold.leaf_suffix_tokens, warm.leaf_suffix_tokens);
+        t.assert_equal("thrash keeps the item count", cold_b.items.size(), warm_b.items.size());
+        // the plan answers one field per input, in input order: the input-to-scored-field map is
+        // observable through the answer positions, since the trie layout itself is opaque
+        t.assert_equal("every input field is answered", target.size(), cold_b.items.at(0).fields.size());
+        bool same = cold_b.items.size() == warm_b.items.size();
+        for (size_t i = 0; same && i < cold_b.items.size(); ++i) {
+            same = cold_b.items[i].fields.size() == warm_b.items[i].fields.size();
+            for (size_t f = 0; same && f < cold_b.items[i].fields.size(); ++f) {
+                const auto & a = cold_b.items[i].fields[f];
+                const auto & b = warm_b.items[i].fields[f];
+                same = a.winner == b.winner && a.scored_nodes == b.scored_nodes && a.probs.size() == b.probs.size();
+                for (size_t k = 0; same && k < a.probs.size(); ++k) {
+                    same = std::fabs(a.probs[k] - b.probs[k]) <= 1e-6f;
+                }
+            }
+        }
+        t.assert_true("thrash keeps every scored field", same);
     });
 }
 
@@ -6617,10 +6742,11 @@ static void test_prefix_hoist_cache(testing & t) {
             (void) test_letter_readout(eng, *vocab, nullptr, false, req1, pool, llama_decision::options{}, &m1);
             (void) test_letter_readout(eng, *vocab, nullptr, false, req2, pool, llama_decision::options{}, &m2);
 
-            t.assert_true("the shared head is at least 32 tokens", m1.shared_tokens >= 32);
-            t.assert_true("the first request prefills", !m1.cache_hit);
-            t.assert_true("a changed state still hits the shared head cache", m2.cache_hit);
-            t.assert_equal("both requests share the same head length", (size_t) m1.shared_tokens, (size_t) m2.shared_tokens);
+            t.assert_true("the shared head is at least 32 tokens", m1.batch.shared_tokens >= 32);
+            t.assert_true("the first request prefills", !m1.batch.cache_hit);
+            t.assert_true("a changed state still hits the shared head cache", m2.batch.cache_hit);
+            t.assert_equal("both requests share the same head length", (size_t) m1.batch.shared_tokens,
+                           (size_t) m2.batch.shared_tokens);
         } catch (const std::exception & e) {
             t.assert_true(std::string("hoist run: ") + e.what(), false);
         }
@@ -6757,6 +6883,99 @@ static void test_docs_errors(testing & t) {
             t.assert_true(std::string("the normative doc names the owner constant ") + name,
                           doc.find(name) != std::string::npos);
         }
+    });
+}
+
+// The decision deadline has one owner (common_params::decision_timeout_ms) but three places state its
+// default: the flag help text, the contract docs and the environment table. The value is calibrated, not
+// arbitrary, so a doc that drifts from the code tells a deployment to budget its own deadline wrong. This
+// pins the rendered help text, the parsed default and every doc site to the same number.
+static void test_docs_deadline_default(testing & t) {
+    t.test("the decision deadline default is one number in the help text, the code and the docs", [](testing & t) {
+        common_params params;
+        auto          ctx_arg = common_params_parser_init(params, LLAMA_EXAMPLE_SERVER, nullptr);
+
+        std::string help;
+        for (const auto & opt : ctx_arg.options) {
+            for (const auto & arg : opt.get_args()) {
+                if (arg == "--decision-timeout-ms") {
+                    help = opt.help;
+                }
+            }
+        }
+        t.assert_true("the decision deadline flag is registered", !help.empty());
+
+        const std::string default_str = std::to_string(params.decision_timeout_ms);
+        t.assert_true("the flag help states the parsed default",
+                      help.find("default: " + default_str) != std::string::npos);
+
+        // an explicit value still wins over the default
+        std::vector<std::string> argv = { "test", "--decision-timeout-ms", "1234" };
+        std::vector<char *>      c_argv;
+        for (auto & a : argv) {
+            c_argv.push_back(a.data());
+        }
+        common_params explicit_params;
+        t.assert_true(
+            "an explicit deadline parses",
+            common_params_parse((int) c_argv.size(), c_argv.data(), explicit_params, LLAMA_EXAMPLE_SERVER, nullptr));
+        t.assert_equal("an explicit deadline wins", 1234, explicit_params.decision_timeout_ms);
+
+        const std::string root = std::string(DECISION_TEST_SOURCE_DIR) + "/../..";
+        for (const char * doc : { "/docs/decision/API.md", "/docs/decision/OBJECTIVE_MULTI_CONTEXT.md" }) {
+            const std::string text = read_file(root + doc);
+            t.assert_true(std::string("read ") + doc, !text.empty());
+            t.assert_true(std::string(doc) + " states the same default deadline",
+                          text.find(default_str) != std::string::npos);
+            // the deadline is not off by default, so a doc must not present "none" as its default
+            t.assert_true(std::string(doc) + " does not claim no deadline is the default",
+                          text.find("--decision-timeout-ms` (0 = none)") == std::string::npos &&
+                              text.find("--decision-timeout-ms N` | 0 (none)") == std::string::npos);
+        }
+    });
+}
+
+// The disabled-route status is owned by DECISION_DISABLED_MESSAGE, whose error class maps to 501.
+// A doc that still pairs the phrase with a 400 tells a deployment the wrong status. The check is a
+// narrow text invariant, so its control pair lives here: an unrelated 400 passes, a mispaired 400
+// fails.
+static std::string disabled_status_violation(const std::string & text) {
+    std::istringstream in(text);
+    std::string        line;
+    while (std::getline(in, line)) {
+        if (line.find("decisions are disabled") != std::string::npos && line.find("400") != std::string::npos) {
+            return line;
+        }
+    }
+    return std::string();
+}
+
+static void test_docs_disabled_status(testing & t) {
+    t.test("a doc that names the disabled route states the 501 refusal, never a 400", [](testing & t) {
+        t.assert_true("an unrelated 400 is not a violation",
+                      disabled_status_violation("A malformed body is a 400.\n").empty());
+        t.assert_true("the phrase paired with a 400 is a violation",
+                      !disabled_status_violation("returns 400 \"decisions are disabled\"\n").empty());
+
+        const std::string root    = std::string(DECISION_TEST_SOURCE_DIR) + "/../..";
+        int               scanned = 0;
+        for (const auto & entry : std::filesystem::directory_iterator(root + "/docs/decision")) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".md") {
+                continue;
+            }
+            const std::string text = read_file(entry.path().string());
+            if (text.find("decisions are disabled") == std::string::npos) {
+                continue;
+            }
+            ++scanned;
+            const std::string name = entry.path().filename().string();
+            const std::string bad  = disabled_status_violation(text);
+            t.assert_true(name + " does not pair the disabled phrase with a 400: " + bad, bad.empty());
+            t.assert_true(name + " names the 501 refusal", text.find("501") != std::string::npos);
+            t.assert_true(name + " names DECISION_DISABLED_MESSAGE",
+                          text.find("DECISION_DISABLED_MESSAGE") != std::string::npos);
+        }
+        t.assert_true("at least one doc describes the disabled route", scanned > 0);
     });
 }
 
@@ -7016,6 +7235,109 @@ static void test_decision_default_envelope(testing & t) {
     });
 }
 
+// One accounting, two front-ends. The Jev readout and the generic schema readout both score through
+// the same engine and both report the same usage and timings, so the numbers must come out of the
+// engine's own record rather than out of a per-front-end copy of it. Every field is given a
+// distinct value, so a field dropped from the conversion fails here instead of reading as a zero
+// nobody would question.
+static llama_decision::batch_result accounting_fixture() {
+    llama_decision::batch_result b;
+    llama_decision::result       ctx0;
+    ctx0.context_tokens = 30;
+    llama_decision::result ctx1;
+    ctx1.context_tokens    = 12;
+    b.items                = { ctx0, ctx1 };
+    b.cache_hit            = true;
+    b.warm_hit             = true;
+    b.shared_tokens        = 40;
+    b.rows                 = 7;
+    b.rounds               = 3;
+    b.prefill_ms           = 11.5;
+    b.scoring_ms           = 4.25;
+    b.suffix_tokens        = 100;
+    b.common_suffix_tokens = 60;
+    b.leaf_suffix_tokens   = 200;
+    return b;
+}
+
+static void test_shared_response_accounting(testing & t) {
+    t.test("usage and timings are read off the engine record, from either front-end", [](testing & t) {
+        const llama_decision::batch_result    b = accounting_fixture();
+        // the same decision described the way the letter readout reports it: the engine's record
+        // held rather than copied field by field, plus the one number only that readout knows
+        const llama_decision::readout_metrics m{ b, 64 };
+
+        for (size_t ci = 0; ci < b.items.size(); ++ci) {
+            const common_json usage = llama_decision::decision_usage(b, ci);
+            t.assert_equal(std::string("context ") + std::to_string(ci) + " usage keys",
+                           std::string("cached_tokens,input_tokens,output_tokens,state_cache_hit"), key_set(usage));
+            // the shared prefix is charged once per context, on top of that context's own tokens
+            t.assert_equal("input_tokens is the prefix plus this context",
+                           (long long) (b.shared_tokens + b.items[ci].context_tokens),
+                           usage.at("input_tokens").get<long long>());
+            t.assert_equal("output_tokens is always zero", 0, usage.at("output_tokens").get<long long>());
+            t.assert_equal("a cache hit charges the cached prefix", (long long) b.shared_tokens,
+                           usage.at("cached_tokens").get<long long>());
+            t.assert_equal("the cache hit is reported", true, usage.at("state_cache_hit").get<bool>());
+
+            t.assert_equal(std::string("context ") + std::to_string(ci) + " usage agrees through the readout",
+                           usage.dump(), llama_decision::decision_usage(m.batch, ci).dump());
+        }
+
+        const common_json timings = llama_decision::decision_timings(b);
+        t.assert_equal("timings keys", std::string("per_decision_ms,prefill_ms,rounds,rows,scoring_ms,total_ms"),
+                       key_set(timings));
+        t.assert_equal("prefill_ms is reported", 11.5, timings.at("prefill_ms").get<double>());
+        t.assert_equal("scoring_ms is reported", 4.25, timings.at("scoring_ms").get<double>());
+        t.assert_equal("total_ms is their sum", 15.75, timings.at("total_ms").get<double>());
+        t.assert_equal("rounds is reported", 3, timings.at("rounds").get<long long>());
+        t.assert_equal("rows is reported", 7, timings.at("rows").get<long long>());
+        t.assert_equal("per_decision_ms is the batch spread over its contexts", 15.75 / 2.0,
+                       timings.at("per_decision_ms").get<double>());
+        t.assert_equal("timings agree through the readout", timings.dump(),
+                       llama_decision::decision_timings(m.batch).dump());
+    });
+
+    t.test("a cold batch charges no cached prefix, and an empty one charges nothing", [](testing & t) {
+        llama_decision::batch_result cold = accounting_fixture();
+        cold.cache_hit                    = false;
+        t.assert_equal("a miss reports no cached tokens", 0,
+                       llama_decision::decision_usage(cold, 0).at("cached_tokens").get<long long>());
+        t.assert_equal("a miss reports the state cache as cold", false,
+                       llama_decision::decision_usage(cold, 0).at("state_cache_hit").get<bool>());
+
+        const llama_decision::batch_result empty;
+        t.assert_equal("no context, no tokens", 0,
+                       llama_decision::decision_usage(empty, 0).at("input_tokens").get<long long>());
+        t.assert_equal("no context, no per-context time", 0.0,
+                       llama_decision::decision_timings(empty).at("per_decision_ms").get<double>());
+    });
+
+    t.test("the strict Jev usage is the shared one, subset to its two keys", [](testing & t) {
+        const llama_decision::batch_result b      = accounting_fixture();
+        const common_json                  full   = llama_decision::decision_usage(b, 0);
+        const common_json                  strict = llama_decision::jev_usage(full, false);
+        t.assert_equal("the strict usage is input/output only", std::string("input_tokens,output_tokens"),
+                       key_set(strict));
+        t.assert_equal("the strict usage keeps the input count", full.at("input_tokens").dump(),
+                       strict.at("input_tokens").dump());
+        t.assert_equal("the strict usage keeps the zero output count", full.at("output_tokens").dump(),
+                       strict.at("output_tokens").dump());
+        t.assert_equal("the opt-in usage is the full one", full.dump(), llama_decision::jev_usage(full, true).dump());
+    });
+
+    // The single-state envelope indexes one answer map. The one owner of that rule answers an empty
+    // object when the batch produced none, so an empty batch is a well-formed zero-answer envelope
+    // instead of an internal error. Both front-ends answer through it, so neither re-derives the
+    // fallback.
+    t.test("the single-state answer map is the one map, or an empty object when none scored", [](testing & t) {
+        t.assert_equal("an empty batch answers an empty object", std::string("{}"),
+                       llama_decision::single_state_answers({}).dump());
+        const std::vector<common_json> one = { common_json::parse("{\"q\":\"a\"}") };
+        t.assert_equal("a one-context batch answers that map", std::string("{\"q\":\"a\"}"),
+                       llama_decision::single_state_answers(one).dump());
+    });
+}
 
 // The Jev compatibility guarantee. The default envelope is the frozen contract: replaying the
 // committed letter golden must produce a byte-identical default (non-diagnostics) envelope, the
@@ -7115,13 +7437,49 @@ static void test_confidence_never_gates_envelope(testing & t) {
         const std::string engine   = read_file(std::string(DECISION_TEST_SOURCE_DIR) + "/decision-engine.cpp");
         const std::string engine_h = read_file(std::string(DECISION_TEST_SOURCE_DIR) + "/decision-engine.h");
         const std::string server   = read_file(std::string(DECISION_TEST_SOURCE_DIR) + "/../server/server-context.cpp");
+        const std::string pool = read_file(std::string(DECISION_TEST_SOURCE_DIR) + "/../server/server-instances.cpp");
         t.assert_true("read the engine source", !engine.empty());
         t.assert_true("read the server source", !server.empty());
+        t.assert_true("read the pool source", !pool.empty());
         t.assert_true("the scorer never reads confidence", engine.find("confidence") == std::string::npos);
         t.assert_true("the scorer never reads certainty", engine.find("certainty") == std::string::npos);
         t.assert_true("the head never reads confidence", engine_h.find("confidence") == std::string::npos);
         t.assert_true("the server never reads confidence", server.find("confidence") == std::string::npos);
         t.assert_true("the server never reads certainty", server.find("certainty") == std::string::npos);
+        // the pool owns admission, retention and byte-budget eviction, so a concentration check
+        // there would gate a session on how unsure the producer was
+        t.assert_true("the pool never reads confidence", pool.find("confidence") == std::string::npos);
+        t.assert_true("the pool never reads certainty", pool.find("certainty") == std::string::npos);
+    });
+
+    // The scheduler acknowledgement budget bounds whether a scheduler answered, so it is a liveness
+    // property of the executor. A future edit that reads it as a quality threshold would let a
+    // decision's reported distribution decide whether its own reference survives, which is the same
+    // conflation the pool check above forbids. The budget is declared in a widely shared header, so
+    // the check is on the lines that name it rather than on the whole file.
+    t.test("the scheduler acknowledgement budget never reads a distribution measure", [](testing & t) {
+        const std::string params = read_file(std::string(DECISION_TEST_SOURCE_DIR) + "/../../common/common.h");
+        const std::string pool   = read_file(std::string(DECISION_TEST_SOURCE_DIR) + "/../server/server-instances.cpp");
+        t.assert_true("read the params header", !params.empty());
+
+        std::string line;
+        int         named   = 0;
+        int         coupled = 0;
+        for (const std::string & src : { params, pool }) {
+            std::istringstream in(src);
+            while (std::getline(in, line)) {
+                if (line.find("DECISION_SCHEDULER_ACK_BUDGET_MS") == std::string::npos &&
+                    line.find("scheduler_ack_budget_ms") == std::string::npos) {
+                    continue;
+                }
+                ++named;
+                if (line.find("confidence") != std::string::npos || line.find("certainty") != std::string::npos) {
+                    ++coupled;
+                }
+            }
+        }
+        t.assert_true("the budget is named in the params header and read in the pool", named >= 2);
+        t.assert_equal("no budget line couples the wait with a distribution measure", 0, coupled);
     });
 }
 
@@ -8555,8 +8913,8 @@ static common_json readout_capture(const std::string & path, bool gpu) {
         out["readout"]          = core;
 
         common_json timing   = common_json::object();
-        timing["prefill_ms"] = metrics.prefill_ms;
-        timing["scoring_ms"] = metrics.scoring_ms;
+        timing["prefill_ms"] = metrics.batch.prefill_ms;
+        timing["scoring_ms"] = metrics.batch.scoring_ms;
         out["timings"]       = timing;
     };
 
@@ -8809,6 +9167,7 @@ int main(int argc, char ** argv) {
         test_decision_assemble(t);
         test_adapter_scope_applied(t);
         test_decision_default_envelope(t);
+        test_shared_response_accounting(t);
         test_decision_values_golden(t);
         test_jev_compat_guarantee(t);
         test_generic_frontend(t);
@@ -8858,6 +9217,8 @@ int main(int argc, char ** argv) {
         test_decision_cpu_oracle(t);
         test_readout_baseline(t);
         test_compile_fields_plan(t);
+        test_compile_fields_cost_probe(t);
+        test_token_cache_eviction_equivalence(t);
         test_decide_batch_plan_overload(t);
         test_token_entry_equality(t);
         test_warm_resident_cache(t);
@@ -8880,6 +9241,8 @@ int main(int argc, char ** argv) {
         test_contract_hash(t);
         test_reference_corpus(t);
         test_docs_errors(t);
+        test_docs_deadline_default(t);
+        test_docs_disabled_status(t);
         test_policy_confidence(t);
         test_sha256(t);
         test_confidence_never_gates_envelope(t);

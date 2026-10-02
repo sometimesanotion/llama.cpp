@@ -260,6 +260,73 @@ def sidecar_args():
             "--slots", "--jinja", "--slot-save-path", tempfile.mkdtemp()]
 
 
+# the URL prefixes a deployment may mount the API under with --api-prefix
+PREFIXES = ("", "/api", "/api/v1")
+
+SCHEMA_BODY = {"model": "test", "state": STATE,
+               "schema": {"dept": {"type": "enum", "description": "owning team",
+                                   "enum": ["billing", "technical"]}}}
+
+
+def run_prefix_checks(model):
+    """Which shapes a route accepts is a property of the route, not of where it is mounted.
+
+    A deployment controls the mount point with --api-prefix, so no routing rule may recover a
+    route's identity from the request path: the answer has to follow the route that was invoked.
+    Each prefix is checked three ways - the strict-Jev refusal, the superset still serving the
+    generic shape, and a control group asserting the strict route's own output did not move.
+    """
+    baseline = None
+    for prefix in PREFIXES:
+        server = env.Server(model, sidecar_args(), api_prefix=prefix)
+        try:
+            server.start()
+        except Exception as e:  # noqa: BLE001
+            server.stop()
+            print(f"skip prefix {prefix!r}: {e}")
+            return
+        try:
+            status, text = call(server, prefix + SYSTEMONE, SCHEMA_BODY)
+            env.check(status == 400,
+                      f"prefix {prefix!r}: the strict route refuses a schema body: {status} {text[:160]}")
+            env.check("/v1/decision" in text,
+                      f"prefix {prefix!r}: the refusal names the route that serves it: {text[:160]}")
+
+            status, text = call(server, prefix + DECISION, SCHEMA_BODY)
+            env.check(status == 200,
+                      f"prefix {prefix!r}: the superset route serves a schema body: {status} {text[:160]}")
+            if status == 200:
+                sup = json.loads(text)
+                env.check(set(sup) == {"model", "answers", "usage"},
+                          f"prefix {prefix!r}: the schema answer is the Jev envelope: {sorted(sup)}")
+                for name, ans in sup["answers"].items():
+                    env.check("type" in ans and "value" in ans,
+                              f"prefix {prefix!r}: the generic {name} answer carries a typed value: {sorted(ans)}")
+
+            # control group: the strict route's own response is unmoved by the mount point. The
+            # comparison is the shared one rather than bit equality, because these are separate
+            # server processes and the repeatability rule does not promise the last bits of a
+            # probability on a recurrent or hybrid model.
+            status, text = call(server, prefix + SYSTEMONE, jev_body())
+            env.check(status == 200,
+                      f"prefix {prefix!r}: the strict route answers a Jev body: {status} {text[:160]}")
+            if status != 200:
+                continue
+            doc = json.loads(text)
+            env.check(set(doc) == {"model", "answers", "usage"},
+                      f"prefix {prefix!r}: the strict response is the Jev envelope: {sorted(doc)}")
+            check_envelope(env, doc, f"systemone prefix {prefix!r}")
+            env.check(set(doc["answers"]) == set(ALL_THREE),
+                      f"prefix {prefix!r}: every question is answered ({sorted(doc['answers'])})")
+            if baseline is None:
+                baseline = doc
+            else:
+                env.check_answers_agree(baseline["answers"], doc["answers"],
+                                        f"prefix {prefix!r} control group")
+        finally:
+            server.stop()
+
+
 def main():
     if not os.path.isfile(env.SERVER_BIN):
         print(f"SKIP: server binary not found at {env.SERVER_BIN}")
@@ -286,7 +353,13 @@ def main():
             server.stop()
             print(f"FAIL: systemone conformance: {e}")
             return 1
+        # one model resident at a time: the mount-point checks each start their own server
         server.stop()
+        try:
+            run_prefix_checks(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: systemone mount-point conformance: {e}")
+            return 1
         print("decision systemone conformance checks passed")
         return 0
     print("SKIP: no candidate model supports letter labels; set LLAMA_SERVER_TEST_MODEL")

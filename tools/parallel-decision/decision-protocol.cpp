@@ -866,11 +866,7 @@ double value_quantile(const std::vector<float> & p, const std::vector<double> & 
     return values.back();
 }
 
-common_json assemble_decision_response(const decision_request & req,
-                                  const std::vector<std::vector<float>> & probs,
-                                  const std::string & model,
-                                  const common_json & usage,
-                                  const common_json * diagnostics) {
+common_json assemble_answers(const decision_request & req, const std::vector<std::vector<float>> & probs) {
     common_json answers = common_json::object();
     for (size_t qi = 0; qi < req.questions.size(); ++qi) {
         const decision_question & q = req.questions[qi];
@@ -971,24 +967,35 @@ const common_json conc = concentration_metrics(p, req.envelope.knobs.confidence_
         }
         answers[q.id] = a;
     }
+    return answers;
+}
 
-    common_json out = common_json::object();
-    out["model"]   = model;
-    out["answers"] = answers;
-    // The strict Jev envelope carries only input/output tokens. The extra counters are additive
-    // diagnostics, so drop them unless the caller opted in.
-    if (req.envelope.diagnostics) {
-        out["usage"] = usage;
-    } else {
-        common_json jev_usage = common_json::object();
-        if (usage.contains("input_tokens")) {
-            jev_usage["input_tokens"] = usage.at("input_tokens");
-        }
-        if (usage.contains("output_tokens")) {
-            jev_usage["output_tokens"] = usage.at("output_tokens");
-        }
-        out["usage"] = jev_usage;
+common_json jev_usage(const common_json & usage, bool diagnostics) {
+    if (diagnostics) {
+        return usage;
     }
+    common_json out = common_json::object();
+    for (const char * key : { "input_tokens", "output_tokens" }) {
+        if (usage.contains(key)) {
+            out[key] = usage.at(key);
+        }
+    }
+    return out;
+}
+
+common_json single_state_answers(const std::vector<common_json> & answers_per_context) {
+    return answers_per_context.empty() ? common_json::object() : answers_per_context.front();
+}
+
+common_json assemble_decision_response(const decision_request &                req,
+                                       const std::vector<std::vector<float>> & probs,
+                                       const std::string &                     model,
+                                       const common_json &                     usage,
+                                       const common_json *                     diagnostics) {
+    common_json out = common_json::object();
+    out["model"]    = model;
+    out["answers"]  = assemble_answers(req, probs);
+    out["usage"]    = jev_usage(usage, req.envelope.diagnostics);
     // The diagnostics object and the session fork fields are additive too. The caller hands over a
     // ready payload and decides whether it is emitted: the server passes it for a diagnostics
     // request and for a session fork (which reports its fork fields additively, even without

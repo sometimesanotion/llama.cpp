@@ -36,6 +36,14 @@ temperature_provenance decision_provenance_current(const std::string & model_nam
                                                    const llama_model * model,
                                                    const common_chat_templates * tmpls, bool use_jinja);
 
+// The same provenance for a given prompt template hash. One builder, so the letter readout and the
+// generic schema readout cannot report a different model identity, quantization or backend, and
+// neither can drift from the temperature-profile validation that reads the same fields.
+temperature_provenance decision_provenance(const std::string &   model_name,
+                                           const common_params & params,
+                                           const llama_model *   model,
+                                           const std::string &   template_hash);
+
 // The fixed system instruction used by the letter readout.
 const char * letter_system_text();
 
@@ -43,19 +51,13 @@ const char * letter_system_text();
 // definition, so the framer, the per-request gate and the server cannot drift apart.
 std::string letter_answer_tail(const std::string & after);
 
+// What the letter readout reports about the decode it ran: the engine's own record of that
+// batched decode, plus the one number the engine does not know - the realized answer-label pool it
+// scored against. The engine's record is held, not copied into a second field list, so the
+// response accounting both front-ends build reads one list of numbers in the tree.
 struct readout_metrics {
-    bool   cache_hit      = false;
-    bool   warm_hit       = false; // a resident warm prefix was forked instead of a cold replay
-    size_t shared_tokens  = 0;
-    size_t context_tokens = 0;         // sum over contexts
-    std::vector<size_t> per_context_tokens; // one entry per context
-    int    rows           = 0;
-    int    rounds         = 0;
-    double prefill_ms     = 0;
-    double scoring_ms     = 0;
-    size_t      label_pool_size      = 0;  // realized answer-label pool for this model, <= LABEL_POOL_CAP
-    size_t suffix_tokens        = 0; // unique question suffixes after dedup
-    size_t common_suffix_tokens = 0; // suffix head hoisted onto the shared trunk
+    batch_result batch;                // the decode that produced these answers
+    size_t       label_pool_size = 0;  // realized answer-label pool for this model, <= LABEL_POOL_CAP
 };
 
 // Splits the rendered chat prompt at the user message: `first` is the cacheable
@@ -111,9 +113,9 @@ struct readout_sources {
 
 // The multi-context form: the same questions scored against every context of a `contexts`
 // request (or the single `state`, when that is set) in one batched pass. Returns one
-// probability matrix per context (question x option), in request order. `metrics` is batch
-// level; `per_context_tokens` reports each context's token count. A session fork scores exactly
-// one context.
+// probability matrix per context (question x option), in request order. `metrics` receives the
+// engine's record of that batch, so the response envelope reports the same accounting the generic
+// schema readout does. A session fork scores exactly one context.
 std::vector<std::vector<std::vector<float>>> letter_readout_multi(const readout_sources & sources,
                                                                   const label_vocab & vocab,
                                                                   const common_chat_templates * tmpls, bool use_jinja,

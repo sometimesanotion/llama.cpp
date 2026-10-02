@@ -264,15 +264,33 @@ void validate_temperature_profile(const temperature_profile & profile, const tem
 // Lowercase hex SHA-256 of the given bytes. Used for the decision contract hash.
 std::string sha256_hex(const std::string & text);
 
+// One context's Jev answers: the `answers` map assemble_decision_response emits, without the
+// envelope around it. A caller that builds its own envelope - the server's, shared by both
+// front-ends - uses this instead of running the Jev envelope and taking it apart. `probs` is
+// index-aligned with req.questions and carries exactly one score per option; a missing or
+// mis-sized vector is an internal defect and throws rather than being answered with a distribution
+// nobody scored. This is the single owner of the Jev answer record, and of the default-vs-
+// diagnostics rule for its per-answer additive fields.
+common_json assemble_answers(const decision_request & req, const std::vector<std::vector<float>> & probs);
+
+// The strict Jev `usage` object: input_tokens and output_tokens only. The prefix-cache counters are
+// additive diagnostics, so they are dropped unless the caller opted in. One definition, reached by
+// the Jev assembler and by the response envelope both front-ends answer through, so the two shapes
+// cannot disagree on which usage keys the strict envelope carries.
+common_json jev_usage(const common_json & usage, bool diagnostics);
+
+// The single-state shape answers exactly one answer map. When the batch produced none - a session
+// with no decoded context - the one owner of the empty case answers an empty object, so the shared
+// envelope never indexes an empty vector and neither front-end re-derives a fallback. A `contexts`
+// request does not use this: it answers the documented array even when it carries one entry.
+common_json single_state_answers(const std::vector<common_json> & answers_per_context);
+
 // Canonical decision response. The per-answer additive fields (certainty, the extra usage
 // counters) are emitted only when `req.diagnostics` is set. The optional `diagnostics` payload is
 // additive and merged whenever the caller provides it: the server passes it for a diagnostics
 // request and for a session fork (which reports its fork fields additively, even without
 // `diagnostics: true`); a null payload keeps the strict Jev default envelope. `probs` is
-// index-aligned with req.questions and carries exactly one score per option; a missing or
-// mis-sized vector is an internal defect and throws rather than being answered with a
-// distribution nobody scored. This assembler is the single owner of the default-vs-diagnostics
-// envelope.
+// index-aligned with req.questions as for assemble_answers.
 common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,

@@ -32,13 +32,17 @@ first, because everything else in this document follows from it.
   validator, no second temperature resolver and no second scorer, so the two
   contracts cannot drift; the generic shape is a strict, additive extension of
   the Jev one rather than a sibling of it.
-* **One answer assembly.** The response is the Jev envelope. A generic answer
-  keeps the Jev keys for the primitive that scores it - `type`, `confidence`,
-  `probabilities`, `legend` - replaces the type-specific answer key (`choice`,
-  `noul`, `score`) with a typed `value`, and adds exactly three keys of its own:
-  `value`, `scored` and `scored_nodes` (plus the diagnostics-only numeric
-  summaries). Nothing else changes, so a Jev client reads the same envelope it
-  always has.
+* **One answer assembly, one envelope.** The response is the Jev envelope, and
+  both shapes build it from one emitter: the same model echo, the same `usage`,
+  the same `timings`, the same additive `diagnostics` object and the same
+  session-fork fields. Only the answer *records* differ, because they are the
+  feature: a generic answer keeps the Jev keys for the primitive that scores it -
+  `type`, `confidence`, `probabilities`, `legend` - replaces the type-specific
+  answer key (`choice`, `noul`, `score`) with a typed `value`, and adds exactly
+  three keys of its own: `value`, `scored` and `scored_nodes` (plus the
+  diagnostics-only numeric summaries). Nothing else changes, so switching a field
+  from a `score` to a typed `number` changes the answer's shape and nothing else,
+  and a Jev client reads the same envelope it always has.
 * **One executor.** Every decision, stateless and session, runs on the internal
   `__decision__` sidecar executor: its own context, its own scheduler thread.
   Chat contexts are never written, stalled or resized by decision work. There is
@@ -52,6 +56,7 @@ What each shape is for:
 | unit | a typed question with free-text option descriptions | a typed field with a closed value space |
 | readout | one verified single-token letter label per option | the model's own token paths over the value space |
 | adds | - | `value`, `scored`, `scored_nodes`, and the diagnostics-only numeric summaries |
+| envelope | the Jev envelope | the same one, field for field: there is no second, thinner envelope |
 | reaches for it when | you want a Jev-compatible contract | a field is wider than the realized label pool, or you want a typed value grid with an aggregate |
 
 The endpoint naming is settled:
@@ -297,7 +302,7 @@ The unified shape accepts an optional `id_slot` (int) so the decision is answere
 a chat slot that already holds decoded state, without re-prefilling the
 transcript. A first-class `session_id` (string) is the alternative: a server-side
 session handle that owns its slot and turn, decoupled from the reused `id_slot`.
-`session_id` and `id_slot` are mutually exclusive; a body carrying both is a 400.
+`session_id` and `id_slot` are mutually exclusive; a body carrying both is a 422.
 `session_pos` (int) optionally pins the continuation position; it
 requires a session and must equal the session's next position exactly, otherwise
 the request is a 422 (a shifted position is never scored silently). `turn` (string)
@@ -345,21 +350,34 @@ and survives the slot's KV being cleared and reused:
   token snapshot.
 - `GET /v1/session/{id}` - status: `session_id`, `id_slot`, `turn`, `backend`
   (`"tokens"`), `pinned`, `ttl_ms`, `captured`, `bytes`, `created_ms`,
-  `last_used_ms`, and the trigger counters (`n_snapshots`, `n_reuses`,
-  `n_releases`, `n_sessions`, `bytes_total`). The arena counters
-  (`arena_used`/`arena_capacity`) are removed: a token snapshot holds no reserved
-  sequence between decisions, so there is no arena to report. The counters are
-  pool-wide, not per reference: `n_snapshots` counts captures performed, `n_reuses`
+  `last_used_ms`, and a nested `counters` object carrying the trigger counters
+  (`n_snapshots`, `n_reuses`, `n_releases`, `n_sessions`, `bytes_total`,
+  `n_pending`) plus a nested `release` object carrying the release worker's own
+  liveness counters (`jobs`, `retries`, `retained`, `inline`, `queue_high`,
+  `bytes_pending`, `bytes_high`). They
+  are nested because they are pool-wide rather than properties of this
+  reference, so grouping them keeps them out of the per-reference field
+  namespace; the top level carries only this reference's own fields. The arena
+  counters (`arena_used`/`arena_capacity`) are removed: a token snapshot holds no
+  reserved sequence between decisions, so there is no arena to report. The
+  counters are pool-wide, not per reference: `n_snapshots` counts captures performed, `n_reuses`
   resolves that reused an existing snapshot instead of capturing one, `n_releases`
   references that left the store by any route (expiry, eviction, explicit erase,
-  the slot advancing past the retained turn), `n_sessions` the current store size
-  and `bytes_total` the owned byte total the budget charges. **`GET` does not
+  the slot advancing past the retained turn), `n_sessions` the current store size,
+  `bytes_total` the owned byte total the budget charges, and `n_pending` the
+  transient resolve keys still awaiting release. `release` counts the post-dispatch
+  drain work: `jobs` leases released, `retries` drains that were re-queued, `retained`
+  leases the worker failed closed on, `inline` leases released on the HTTP thread
+  because the queue was stopped or full, `queue_high`/`bytes_high` high-water marks
+  and `bytes_pending` the snapshot bytes held by unfinished jobs. Every one of them
+  is executor work or bytes: none is compared against a reported `confidence` or
+  `certainty`, and none gates anything. **`GET` does not
   reap**: see the lifecycle rules below, so a status read on a reference that is
   past its TTL but has not been touched since still answers 200.
 - `PATCH /v1/session/{id}` - set `pinned` and/or `ttl_ms`.
 - `DELETE /v1/session/{id}` - erase, releasing the owned reference.
 
-`session_id` is mutually exclusive with `id_slot` in a decision request (400 when
+`session_id` is mutually exclusive with `id_slot` in a decision request (422 when
 both appear). A session handle is bound to one source slot; when the slot's turn
 ends the session ends with it.
 
@@ -399,6 +417,32 @@ per retained turn:
   (`--decision-session-budget-mb`), by LRU eviction. The default budget is
   unlimited and the default TTL is 0 (no expiry), so a deployment that never sets
   them sees no eviction.
+- **The drain after a decision fails closed, and it runs off the response path.**
+  Once a session decision has been dispatched, the pool takes a lease on the
+  reference and hands the post-decision drain to a pool-owned release worker. The
+  client response returns as soon as the answer exists; the worker then waits for
+  the sidecar's scheduler to acknowledge that the task is finished, and only then
+  drops the lease. That wait is bounded. If the acknowledgement does not arrive
+  inside the budget the worker retries; a job whose retries keep failing is
+  reported at error level and **keeps** its lease, its adapter references and its
+  reference, because an unobserved task is indistinguishable from a running one, so
+  the safe reading of an exceeded wait is that the reader's completion could not be
+  proven. The client sees no error - the answer was already computed - and the
+  reference stays in `GET /v1/session/{id}` with its `bytes`, its `n_pending` entry
+  and the store's counters. Because release is asynchronous, a status read taken
+  immediately after a decision may still show the reference leased and
+  `n_pending > 0`; both settle once the worker catches up. This is deliberate: a
+  retained reference is a slow leak, while an early release is memory a running
+  decode still points at.
+  **A retained reference still releases itself.** The worker never abandons a
+  failed drain: it retries on a long interval (60 s) and releases the reference the
+  moment the scheduler is observed, without an operator. `DELETE` does not wait for
+  that interval - it wakes the parked retry immediately, and the reference, its
+  lease and its transient snapshot key are released shortly after the response. So
+  `n_pending` and `counters.release.bytes_pending` fall back to their baseline
+  after a `DELETE` instead of holding memory until the process restarts. Only a
+  scheduler that can never be observed keeps them up, and then nothing is released,
+  which is the same fail-closed rule as above rather than a second one.
 - **TTL is a reaper, not a read filter.** It runs at the two points that already
   take the store lock - `POST /v1/session` create, and a decision resolve
   (a `session_id`, or the first `id_slot` decision for a turn) - and never from a
@@ -475,9 +519,22 @@ Schema object with `properties`:
   | `scored_nodes` | the trie nodes the field cost |
 
   So a Jev client reads the same keys, and `value` is the only addition. Under
-  `diagnostics: true` a numeric field adds `interval_p10_p90` and `aggregate`,
-  the same diagnostics-only discipline the Jev `score` answer follows, and the
-  top level adds `timings` and the full `usage` counters.
+  `diagnostics: true` a field adds `certainty`, a numeric field adds
+  `interval_p10_p90` and `aggregate` - the same diagnostics-only discipline the
+  Jev `score` answer follows, from the same `concentration_metrics` helper - and
+  the top level carries the full documented `diagnostics` object and `timings`,
+  plus the full `usage` counters. A session decision reports the same fork fields
+  a Jev session decision does (`session_fork`, `source_slot`, `session_pos`,
+  `warm_hit`, and `session_id`/`turn` when the request set one), for the same
+  reason: there is one envelope, so there is nothing to hold back.
+
+  The `diagnostics` object is the same, with the readout identity naming the
+  schema prompt rather than the letter prompt: `prompt_version` is
+  `schema-v1`, and `label_pool_size` is `0`, because a typed schema scores the
+  model's own token paths over the value space and needs no answer labels. The
+  `contract_hash` is likewise the schema readout's own, derived from the tokenizer
+  and the schema prompt template, so a calibration recorded under one shape is
+  never read as a calibration of the other.
 
   A field wider than `tree_max` is scored greedily (or `mode: "greedy"` forces
   it). It has no distribution over its value space, only the winning path's
@@ -532,8 +589,9 @@ Sidecar executor flags (server side):
 * `--decision-sidecar-prebuild` - build the sidecar context eagerly at startup
   instead of lazily on the first decision.
 * `--decision-timeout-ms N` - server-side deadline for a whole decision (default
-  0 = none); on expiry the request answers 503 + Retry-After, never a partial
-  answer.
+  60000, calibrated as `max(30 s, 4x p99 cold-prefill)` on the reference GPU);
+  on expiry the request answers 503 + Retry-After, never a partial answer. `0`
+  disables the deadline.
 * `--decision-max-queue N` - concurrent decision cap (default 4); beyond it the
   request answers 429, above twice it 529. `LLAMA_DECISION_MAX_BODY` and the
   env-var overrides still apply.
@@ -581,7 +639,9 @@ With `diagnostics: true` the same answers are returned with additive fields:
 `certainty` on choice/score/numeric, the `diagnostics` object, the extra `usage`
 counters, the `timings` object, and the score/numeric spread summaries
 (`median`, `interval_p10_p90`). The answers themselves are byte-identical
-either way.
+either way. The generic `schema` shape returns the same envelope and the same
+additive fields for its own answer records (Section 2.5); only the answer keys
+inside `answers` differ between the two shapes.
 
 ```json
 {
@@ -659,8 +719,12 @@ either way.
   `prompt_version`, `model`, `quantization`, `template_hash`, `backend_flags`,
   `label_pool_size`), the adapter scope (`adapters_configured`,
   `adapter_scope`), and timings (`prefill_ms`, `scoring_ms`, `suffix_tokens`,
-  `common_suffix_tokens`). These are additive and never change an answer. The
-  default response omits them.
+  `common_suffix_tokens`, `leaf_suffix_tokens`), plus the field-compile token
+  cache's `token_cache_hits` and `token_cache_misses`. These are additive and never
+  change an answer. The default response omits them. Both front-ends report the
+  same keys, with the readout identity naming the prompt each one framed
+  (`prompt_version` `letter-v2` for `questions`, `schema-v1` for `schema`; see
+  Section 2.5).
 
 ### 3.2 Worked example
 
@@ -723,7 +787,8 @@ all, are 400; a well-formed body with semantically invalid decision content is
 422 (including an unknown field inside a question object and a field of the
 wrong JSON type, whose own name is in the message); unknown top-level fields
 are ignored; over-limit capacity is 413 or 422; a full queue is 429 or 529 with
-`Retry-After`; a cancel or client disconnect is 499; an unavailable model (no
+`Retry-After`; a cancel or client disconnect is 499; a transient failure is 503
+with `Retry-After`; an unavailable model (no
 usable labels, contract mismatch) is 501. The full contract follows.
 
 ### 4.1 Full target error contract
@@ -741,7 +806,7 @@ usable labels, contract mismatch) is 501. The full contract follows.
 | 500 | `server_error` | inference/engine failure | reset engine state |
 | 507 | `insufficient_memory_error` | the sidecar could not be built or resized: a weight or adapter reload failed, or the host is out of memory | the executor is unavailable until it is rebuilt |
 | 501 | `not_supported_error` | feature not enabled/available | existing enum value |
-| 503 | `unavailable_error` | shutting down / no service | include `Retry-After` when transient |
+| 503 | `unavailable_error` | shutting down / no service, an expired server-side deadline, or a pool transient (instance reconfiguring, snapshot I/O busy, group still full past `--instance-wait`) | always carries `Retry-After`: every 503 here is retriable |
 | 529 | `overloaded_error` | server overloaded | include `Retry-After`; Jev uses this |
 
 Two codes this table deliberately omits. **409** is not produced: it existed only
@@ -775,7 +840,10 @@ Notes:
 
 ### 4.2 Headers
 
-* `Retry-After` on 429/529 (implemented).
+* `Retry-After` on 429/529 and on 503 (implemented). Every 503 is a transient
+  condition - an expired server-side deadline, an instance being reconfigured, a
+  busy snapshot I/O worker, a group that stayed full past its wait - so all of
+  them carry the header and a retrying client never has to guess a backoff.
 * Cancel/disconnect aborts the evaluation and never emits a partial answer
   (implemented; a client that is already gone cannot observe the 499, so the
   observable guarantee is that no partial answer is produced).
@@ -817,10 +885,11 @@ that request; `LLAMA_ARG_DECISION_PERMUTATIONS` is a server flag read at startup
 |---|---|---|
 | `LLAMA_DECISION_MAX_BODY` | 2 MiB | request body cap; over it the request is 413, before any decode |
 | `LLAMA_DECISION_MAX_QUEUE` | `--decision-max-queue` (4) | concurrent decision cap; past the cap 429, past twice the cap 529 |
-| `LLAMA_DECISION_TIMEOUT_MS` | `--decision-timeout-ms` (0 = none) | server-side deadline for a whole decision; on expiry 503 + `Retry-After`, never a partial answer |
+| `LLAMA_DECISION_TIMEOUT_MS` | `--decision-timeout-ms` (60000) | server-side deadline for a whole decision; on expiry 503 + `Retry-After`, never a partial answer. `0` disables it |
 | `LLAMA_DECISION_POOL_CAP` | `LABEL_POOL_CAP` (255) | clamps the **realized** answer-label pool, so it **lowers the widest question the model can answer**: a `choice` with more options than the clamped pool is a 422. A value below 2 is ignored. Narrowing it is only safe when every question that model answers fits |
 | `LLAMA_DECISION_FORK` | `auto` | forces the branch fork strategy: `auto` (hybrid on a recurrent/hybrid model when the partial state format is available, else restore; `copy` on dense attention), `restore` (save and reload the whole sequence state, exact everywhere), `hybrid` (attention `seq_cp` plus a `PARTIAL_ONLY` recurrent copy; `copy` on dense attention, where there is no recurrent part), or `copy` (attention cells only, by metadata; exact for dense attention alone). A value the model cannot satisfy is a 400, and so is `copy` on a recurrent or hybrid model. There is deliberately no request-body field for this: the fork is a property of the model, not of the question |
 | `LLAMA_ARG_DECISION_PERMUTATIONS` | `--decision-permutations` (1) | server default pass count for requests that omit `permutations`; an explicit request field always wins and the cap still applies |
+| `LLAMA_DECISION_SCHEDULER_ACK_BUDGET_MS` | `DECISION_SCHEDULER_ACK_BUDGET_MS` (30000) | how long the caller waits for a decision-owning scheduler to acknowledge the work it posted: the release worker's drain after a dispatched session decision (off the response path; an unobserved drain is retried 5 times at 50 ms, then parked on a 60 s interval until the scheduler is observed, and an operator erase wakes it immediately), and a slot's token capture on a chat scheduler (which still runs on the HTTP thread). On drain expiry the reference is **kept**, never released early (Section 2.4); on capture expiry the request is 503 + `Retry-After`. It bounds the executor's liveness, is never derived from the decision deadline, and no reported distribution measure is compared against it. A deployment has no reason to set it; it exists so a test can drive the expiry branch, and it is read once per process. A positive value is the wait; a negative value makes the drain fail closed with no wait, which a test uses to reach the retry-and-park branch deterministically (0 keeps the default) |
 
 The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (255); the label-pool
 cap is `LABEL_POOL_CAP` (255), equal so every option can get a label. The

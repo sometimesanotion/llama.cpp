@@ -46,28 +46,6 @@
 #include <windows.h>
 #endif
 
-// The manifest sidecar is written next to the slot save file and read back on restore; these
-// helpers move its raw bytes and test for its presence.
-static bool server_read_file(const std::string & path, std::string & out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    out = ss.str();
-    return true;
-}
-
-static bool server_write_file(const std::string & path, const std::string & bytes) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-        return false;
-    }
-    out << bytes;
-    return (bool) out;
-}
-
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -2566,74 +2544,117 @@ private:
         return *decision.decision_letter_engine;
     }
 
-    // The accounting every decision response reports, gathered from whichever front-end scored it.
-    // Both front-ends produce the same batch_result shape, so the usage and timings objects are
-    // built from one record and cannot drift apart.
-    struct decision_accounting {
-        std::vector<size_t> per_context_tokens; // one entry per context, in request order
-        size_t context_tokens = 0;              // sum over contexts
-        size_t shared_tokens  = 0;
-        bool   cache_hit      = false;
-        int    rows           = 0;
-        int    rounds         = 0;
-        double prefill_ms     = 0.0;
-        double scoring_ms     = 0.0;
-
-        size_t context_tokens_at(size_t i) const {
-            return i < per_context_tokens.size() ? per_context_tokens[i] : 0;
-        }
+    // How a decision request was answered about a live session. Resolved once from the request's
+    // session reference and reported additively by the response envelope, so a caller can tell a
+    // session answer from a stateless one. A token-snapshot session owns a copy of the completed
+    // turn's tokens that the readout re-prefills, so the source instance is never touched.
+    struct session_resolution {
+        llama_pos                        pos             = -1;  // snapshot continuation position, echoed additively
+        const std::vector<llama_token> * snapshot_tokens = nullptr;
+        std::string                      turn;                  // retained-turn tag, echoed additively
+        std::string                      session_id;            // first-class session handle, echoed additively
+        int                              source_slot = -1;      // owning slot id, echoed additively
+        std::string                      adapter_scope;         // snapshot scope for diagnostics ("" = base)
+        std::string                      warm_tag;  // session content hash; resident warm identity ("" = cold replay)
+        bool                             snapshot = false;  // token-snapshot session, no live slot on this context
     };
 
-    static decision_accounting decision_accounting_of(const llama_decision::batch_result & b) {
-        decision_accounting a;
-        a.per_context_tokens.reserve(b.items.size());
-        for (const auto & item : b.items) {
-            a.context_tokens += item.context_tokens;
-            a.per_context_tokens.push_back(item.context_tokens);
+    // What a front-end reports about the readout it ran, as opposed to the answers themselves. It
+    // differs per front-end only in the prompt that was framed; everything that decides *which*
+    // envelope keys are emitted - the opt-in and the evidence shape - is read from the request, so
+    // it cannot be stated here a second time and drift.
+    struct decision_readout_identity {
+        std::string contract_hash;     // tokenizer + template + prompt-layout identity of the readout
+        std::string prompt_version;    // the framed prompt layout that ran
+        std::string provenance_model;  // the readout's model identity
+        std::string quantization;
+        std::string template_hash;
+        std::string backend_flags;
+        std::string adapter_scope        = "base";  // the scope actually decoded under
+        bool        adapters_configured  = false;   // whether this server has adapters at all
+        size_t      label_pool_size      = 0;       // realized answer-label pool; a typed schema needs none
+        size_t      suffix_tokens        = 0;       // unique field suffixes after dedup
+        size_t      common_suffix_tokens = 0;       // suffix head hoisted onto the shared trunk
+        size_t      leaf_suffix_tokens   = 0;       // what the branches still decode after that hoist
+    };
+
+    // The one response envelope both front-ends answer through. Everything around the answer
+    // records is identical work - the echoed model, the per-context usage and timings, the additive
+    // diagnostics object, the session fork fields, and the single-context versus `contexts`-array
+    // shape - so it is built once here from pieces both shapes already have. The answer records
+    // themselves stay with the front-end that owns them: a Jev primitive or a typed field is a real
+    // difference between the shapes, not duplication. Adding a field to the envelope therefore adds
+    // it to both shapes at once, which is what "one envelope, two shapes" means.
+    static json decision_response(const std::vector<json> &                answers_per_context,
+                                  const llama_decision::batch_result &     batch,
+                                  const llama_decision::decision_request & req,
+                                  const std::string &                      model,
+                                  const decision_readout_identity &        readout,
+                                  const session_resolution &               session) {
+        const bool want_diagnostics = req.envelope.diagnostics;
+        // a `contexts` request answers with the documented array even when it carries one entry:
+        // the key names the request shape, so it is not decided by how many answers came back
+        const bool multi            = !req.envelope.evidence.contexts.empty();
+
+        json out     = json::object();
+        out["model"] = model;
+        if (multi) {
+            json contexts_resp = json::array();
+            for (size_t ci = 0; ci < answers_per_context.size(); ++ci) {
+                contexts_resp.push_back({
+                    { "answers", answers_per_context[ci] },
+                    { "usage", llama_decision::jev_usage(llama_decision::decision_usage(batch, ci), want_diagnostics) },
+                });
+            }
+            out["contexts"] = contexts_resp;
+        } else {
+            out["answers"] = llama_decision::single_state_answers(answers_per_context);
+            out["usage"]   = llama_decision::jev_usage(llama_decision::decision_usage(batch, 0), want_diagnostics);
         }
-        a.shared_tokens = b.shared_tokens;
-        a.cache_hit     = b.cache_hit;
-        a.rows          = b.rows;
-        a.rounds        = b.rounds;
-        a.prefill_ms    = b.prefill_ms;
-        a.scoring_ms    = b.scoring_ms;
-        return a;
-    }
-
-    static decision_accounting decision_accounting_of(const llama_decision::readout_metrics & m) {
-        decision_accounting a;
-        a.per_context_tokens = m.per_context_tokens;
-        a.context_tokens     = m.context_tokens;
-        a.shared_tokens      = m.shared_tokens;
-        a.cache_hit          = m.cache_hit;
-        a.rows               = m.rows;
-        a.rounds             = m.rounds;
-        a.prefill_ms         = m.prefill_ms;
-        a.scoring_ms         = m.scoring_ms;
-        return a;
-    }
-
-    // The token accounting for one context. A decision generates nothing, so the output count is
-    // always zero, and a prefix-cache hit counts the cached prefix as its cached tokens.
-    static json decision_usage(const decision_accounting & a, size_t context_tokens) {
-        json usage = json::object();
-        usage["input_tokens"]    = (long long) (a.shared_tokens + context_tokens);
-        usage["output_tokens"]   = 0;
-        usage["cached_tokens"]   = (long long) (a.cache_hit ? a.shared_tokens : 0);
-        usage["state_cache_hit"] = a.cache_hit;
-        return usage;
-    }
-
-    static json decision_timings(const decision_accounting & a) {
-        json timings = json::object();
-        timings["prefill_ms"] = a.prefill_ms;
-        timings["scoring_ms"] = a.scoring_ms;
-        timings["total_ms"]   = a.prefill_ms + a.scoring_ms;
-        timings["rounds"]     = a.rounds;
-        timings["rows"]       = a.rows;
-        timings["per_decision_ms"] = a.per_context_tokens.empty()
-            ? 0.0 : (a.prefill_ms + a.scoring_ms) / (double) a.per_context_tokens.size();
-        return timings;
+        // the diagnostics object is additive, and the envelope reads the readout identity only here,
+        // so a front-end that has no opt-in never pays to compute it
+        if (want_diagnostics) {
+            json diag                    = json::object();
+            diag["contract_hash"]        = readout.contract_hash;
+            diag["prompt_version"]       = readout.prompt_version;
+            diag["prefill_ms"]           = batch.prefill_ms;
+            diag["scoring_ms"]           = batch.scoring_ms;
+            // the three halves of the rendered question suffixes: the total before the shared head
+            // was hoisted, the head itself, and what the branches still decode after the hoist
+            diag["suffix_tokens"]        = (long long) readout.suffix_tokens;
+            diag["common_suffix_tokens"] = (long long) readout.common_suffix_tokens;
+            diag["leaf_suffix_tokens"]   = (long long) readout.leaf_suffix_tokens;
+            diag["label_pool_size"]      = (long long) readout.label_pool_size;
+            // the field-compile token cache's cost: the entries this request hit and missed. The
+            // cache is a pure function of the prompt over the vocabulary, so these are cost only.
+            diag["token_cache_hits"]     = (long long) batch.token_cache_hits;
+            diag["token_cache_misses"]   = (long long) batch.token_cache_misses;
+            diag["permutations"]         = req.envelope.knobs.permutations;
+            diag["adapters_configured"]  = readout.adapters_configured;
+            diag["adapter_scope"]        = readout.adapter_scope;
+            diag["model"]                = readout.provenance_model;
+            diag["quantization"]         = readout.quantization;
+            diag["template_hash"]        = readout.template_hash;
+            diag["backend_flags"]        = readout.backend_flags;
+            out["diagnostics"]           = diag;
+        }
+        // a session fork reports its timings without the opt-in, like the rest of its additive fields
+        if (want_diagnostics || session.snapshot) {
+            out["timings"] = llama_decision::decision_timings(batch);
+        }
+        if (session.snapshot) {
+            out["session_fork"] = true;
+            out["source_slot"]  = session.source_slot;
+            out["session_pos"]  = (long long) session.pos;
+            out["warm_hit"]     = batch.warm_hit;
+            if (!session.session_id.empty()) {
+                out["session_id"] = session.session_id;
+            }
+            if (!session.turn.empty()) {
+                out["turn"] = session.turn;
+            }
+        }
+        return out;
     }
 
     // The engine options shared by every decision front-end: the fork override, the client
@@ -2690,18 +2711,6 @@ private:
         // re-prefills the owned tokens, so no chat context is touched and no lease is needed. The
         // checks below are capability checks only (the snapshot matches the pinned fields); they
         // never inspect a producer concentration score.
-        struct session_resolution {
-            llama_pos     pos  = -1; // snapshot continuation position, echoed additively
-            // token-snapshot session: an owned copy of the completed turn's tokens the readout
-            // re-prefills; the source instance is never touched.
-            const std::vector<llama_token> * snapshot_tokens = nullptr;
-            std::string   turn; // retained-turn tag, echoed additively
-            std::string   session_id; // first-class session handle, echoed additively
-            int           source_slot = -1; // owning slot id, echoed additively
-            std::string   adapter_scope;    // snapshot scope for diagnostics ("" = base)
-            std::string   warm_tag;         // session content hash; resident warm identity ("" = cold replay)
-            bool          snapshot = false; // token-snapshot session, no live slot on this context
-        };
         auto resolve_session = [&](const llama_decision::session_ref & ref) -> session_resolution {
             session_resolution out;
             if (!ref.present) {
@@ -2872,48 +2881,45 @@ private:
                 }
             });
 
-            // The generic path emits the Jev envelope, extended: a single context answers at the top
-            // level as `answers`, several are wrapped in the documented `contexts` array, and the
-            // extra usage counters and timings are additive diagnostics, so they are dropped unless
-            // the caller opted in - exactly the Jev discipline.
-            const decision_accounting acct = decision_accounting_of(b);
-            std::vector<json>           per_context;
+            // The generic shape keeps its own answer records - a typed value over a field's value
+            // space - and shares the response envelope with the Jev shape, so the extra usage
+            // counters, the timings, the diagnostics object and the session fork fields are the same
+            // work here as there.
+            std::vector<json> per_context;
             per_context.reserve(b.items.size());
             for (auto & item : b.items) {
                 llama_decision::mean_permuted_passes(cs, item);
                 per_context.push_back(llama_decision::assemble(cs, item, want_diagnostics));
             }
-            // the strict envelope carries only input/output tokens; the extra counters are additive
-            const auto scoped_usage = [&](size_t ci) {
-                const json full = decision_usage(acct, acct.context_tokens_at(ci));
-                if (want_diagnostics) {
-                    return full;
-                }
-                json jev_usage = json::object();
-                for (const char * k : { "input_tokens", "output_tokens" }) {
-                    if (full.contains(k)) {
-                        jev_usage[k] = full.at(k);
-                    }
-                }
-                return jev_usage;
-            };
-            json out = json::object();
-            out["model"] = decision_model_echo(req.envelope.model, model_name);
-            if (per_context.size() == 1) {
-                out["answers"] = per_context[0];
-                out["usage"]   = scoped_usage(0);
-            } else {
-                json contexts_resp = json::array();
-                for (size_t ci = 0; ci < per_context.size(); ++ci) {
-                    contexts_resp.push_back({ { "answers", per_context[ci] },
-                                              { "usage",   scoped_usage(ci) } });
-                }
-                out["contexts"] = contexts_resp;
-            }
+            decision_readout_identity readout;
             if (want_diagnostics) {
-                out["timings"] = decision_timings(acct);
+                // the readout identity of the schema prompt: the chat template shape, the schema
+                // prompt version, and the tokenizer, as its own contract distinct from the letter
+                // readout's, so a calibration under one shape is never read as the other's. A typed
+                // schema scores values, so there is no answer-label pool.
+                const std::string template_hash =
+                    llama_decision::generic_template_hash(chat_params.tmpls.get(), chat_params.use_jinja);
+                const llama_decision::temperature_provenance prov = llama_decision::decision_provenance(
+                    model_name, params_base, llama_get_model(ctx_tgt), template_hash);
+                readout.contract_hash = llama_decision::generic_contract_hash(
+                    model_name, template_hash, llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
+                readout.prompt_version       = llama_decision::GENERIC_PROMPT_VERSION;
+                readout.provenance_model     = prov.model;
+                readout.quantization         = prov.quantization;
+                readout.template_hash        = prov.template_hash;
+                readout.backend_flags        = prov.backend_flags;
+                readout.adapters_configured  = adapters_on;
+                readout.suffix_tokens        = b.suffix_tokens;
+                readout.common_suffix_tokens = b.common_suffix_tokens;
+                readout.leaf_suffix_tokens   = b.leaf_suffix_tokens;
+                // a live-session readout reports the scope it actually decoded under; the base scope
+                // keeps the historical "base" label
+                if (sess.snapshot && !sess.adapter_scope.empty()) {
+                    readout.adapter_scope = sess.adapter_scope;
+                }
             }
-            return out;
+            return decision_response(per_context, b, req, decision_model_echo(req.envelope.model, model_name), readout,
+                                     sess);
         }
         // Decision shape: state + typed questions, scored as one next-token choice over the
         // verified letter labels, sharing one framed state prefix across all questions.
@@ -2969,84 +2975,44 @@ private:
                                                              decision.decision_labels, opt, &metrics);
         });
 
-        const bool              multi = !req.envelope.evidence.contexts.empty();
-        const decision_accounting acct = decision_accounting_of(metrics);
-        const json               usage   = decision_usage(acct, acct.context_tokens);
-        const json               timings = decision_timings(acct);
-
         // The echoed model identity: the Jev aliases resolve to the loaded (chat slot) model; any other
         // requested id is echoed verbatim; an omitted model defaults to the loaded model.
         const std::string echo = decision_model_echo(req.envelope.model, model_name);
-        json decision_diagnostics = json::object();
+
+        // One answer record per context, in request order, from the front-end that owns the Jev
+        // answer shape. The envelope around them is shared with the generic shape.
+        std::vector<json> per_context;
+        per_context.reserve(all_probs.size());
+        for (const auto & probs : all_probs) {
+            per_context.push_back(llama_decision::assemble_answers(req, probs));
+        }
+
+        decision_readout_identity readout;
         if (want_diagnostics) {
-            // additive diagnostics: the readout contract identity this server is running
-            decision_diagnostics["diagnostics"] = json::object();
-            decision_diagnostics["diagnostics"]["contract_hash"]  = decision.decision_contract;
-            // the readout identity this request ran under. The contract hash covers the tokenizer
-            // and the chat template; prompt_version names the framed prompt layout.
-            decision_diagnostics["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
-            decision_diagnostics["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
-            decision_diagnostics["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
-            decision_diagnostics["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
-            decision_diagnostics["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
-            decision_diagnostics["diagnostics"]["label_pool_size"]      = (long long) metrics.label_pool_size;
-            decision_diagnostics["diagnostics"]["permutations"]         = req.envelope.knobs.permutations;
-            decision_diagnostics["diagnostics"]["adapters_configured"] = adapters_on;
-            // a live-session readout reports the scope it actually decoded under; the base
-            // scope keeps the historical "base" label. a token-snapshot session reports its
-            // captured scope; a stateless request always decodes on the base model.
-            const std::string readout_scope = sess.snapshot ? sess.adapter_scope : std::string();
-            decision_diagnostics["diagnostics"]["adapter_scope"] = readout_scope.empty() ? "base" : readout_scope;
+            // the readout identity this request ran under. The contract hash covers the tokenizer,
+            // the chat template and the label code; prompt_version names the framed prompt layout.
             const llama_decision::temperature_provenance prov =
                 llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
                                                             chat_params.tmpls.get(), chat_params.use_jinja);
-            decision_diagnostics["diagnostics"]["model"]          = prov.model;
-            decision_diagnostics["diagnostics"]["quantization"]   = prov.quantization;
-            decision_diagnostics["diagnostics"]["template_hash"]  = prov.template_hash;
-            decision_diagnostics["diagnostics"]["backend_flags"]  = prov.backend_flags;
-        }
-        // a session answer reports the fork it took so a caller can tell it apart from a
-        // stateless answer; these are additive and never change an answer
-        if (is_session) {
-            decision_diagnostics["session_fork"] = true;
-            decision_diagnostics["source_slot"]  = sess.source_slot;
-            decision_diagnostics["session_pos"]  = (long long) sess.pos;
-            decision_diagnostics["warm_hit"]     = metrics.warm_hit;
-            if (!sess.session_id.empty()) {
-                decision_diagnostics["session_id"] = sess.session_id;
-            }
-            if (!sess.turn.empty()) {
-                decision_diagnostics["turn"] = sess.turn;
-            }
-        }
-        const bool emit_diagnostics = want_diagnostics || is_session;
-        if (!multi) {
-            json out = llama_decision::assemble_decision_response(
-                req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
-                echo, usage, emit_diagnostics ? &decision_diagnostics : nullptr);
-            if (emit_diagnostics) {
-                out["timings"] = timings;
-            }
-            return out;
-        }
-        // Multi-context: answers grouped per context, in request order. The `contexts` key is the
-        // one extension over the Jev single-state envelope, so a single-state client is unchanged.
-        json contexts_resp = json::array();
-        for (size_t ci = 0; ci < all_probs.size(); ++ci) {
-            json ans = llama_decision::assemble_decision_response(
-                req, all_probs[ci], echo, decision_usage(acct, acct.context_tokens_at(ci)), nullptr);
-            contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
-        }
-        json out = json::object();
-        out["model"]    = echo;
-        out["contexts"] = contexts_resp;
-        if (emit_diagnostics) {
-            out["timings"] = timings;
-            for (auto it = decision_diagnostics.begin(); it != decision_diagnostics.end(); ++it) {
-                out[it.key()] = it.value();
+            readout.contract_hash        = decision.decision_contract;
+            readout.prompt_version       = llama_decision::LETTER_PROMPT_VERSION;
+            readout.provenance_model     = prov.model;
+            readout.quantization         = prov.quantization;
+            readout.template_hash        = prov.template_hash;
+            readout.backend_flags        = prov.backend_flags;
+            readout.adapters_configured  = adapters_on;
+            readout.label_pool_size      = metrics.label_pool_size;
+            readout.suffix_tokens        = metrics.batch.suffix_tokens;
+            readout.common_suffix_tokens = metrics.batch.common_suffix_tokens;
+            readout.leaf_suffix_tokens   = metrics.batch.leaf_suffix_tokens;
+            // a live-session readout reports the scope it actually decoded under; the base scope
+            // keeps the historical "base" label. a token-snapshot session reports its captured
+            // scope; a stateless request always decodes on the base model.
+            if (sess.snapshot && !sess.adapter_scope.empty()) {
+                readout.adapter_scope = sess.adapter_scope;
             }
         }
-        return out;
+        return decision_response(per_context, metrics.batch, req, echo, readout, sess);
     }
 
     bool process_single_task(server_task && task, bool is_yielding) {
@@ -6212,9 +6178,10 @@ void server_routes::init_routes() {
         auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
         server_task task(SERVER_TASK_TYPE_DECISION);
         task.id               = res->rd.get_new_id();
-        if (jev_only) {
+        if (jev_only && body.is_object()) {
             // the strict-Jev route mark; harmless to the parsers, which tolerate unknown top-level
-            // fields, and it survives the pool's routing rewrite of the body
+            // fields. A body that is not an object cannot carry it, and must reach the decision
+            // parser unmarked so it is reported as the client error it is
             body[DECISION_JEV_ONLY_KEY] = true;
         }
         task.decision_request = body;
@@ -6268,11 +6235,11 @@ void server_routes::init_routes() {
     };
 
     // /v1/session is served by the decision sidecar executor; a context without one (decisions
-    // disabled) has no session state to serve.
+    // disabled) has no session state to serve, and has none to refuse over: it answers before any
+    // dispatch, so it can never reach a chat context.
     const auto session_disabled = [this](const server_http_req & req) {
         auto res = create_response();
-        res->error(format_error_response(
-            "decisions are disabled: start the server with --decision-seqs N (N >= 3)", ERROR_TYPE_INVALID_REQUEST));
+        res->error(format_error_response(DECISION_DISABLED_MESSAGE, ERROR_TYPE_NOT_SUPPORTED));
         return res;
     };
     this->post_session    = session_disabled;

@@ -257,8 +257,8 @@ static std::string generic_value_key(const common_json & v) {
 //   probabilities the Jev map: every allowed value keyed by its value, summing to 1
 //   legend        the value space, as a Jev ScoreAnswer legend
 //   scored        "tree" for a real distribution, "argmax" for a greedy-scored field
-// The spread summaries (aggregate, interval_p10_p90) are diagnostics-only, matching the Jev path,
-// so the default answer carries no off-envelope field.
+// The winner's share `certainty` and the spread summaries (interval_p10_p90, aggregate) are
+// diagnostics-only, matching the Jev path, so the default answer carries no off-envelope field.
 common_json generic_field_record(const generic_field_spec & spec, const field_result & fr,
                                  const std::string & confidence_profile, bool diagnostics) {
     const int idx = fr.winner;
@@ -297,6 +297,9 @@ common_json generic_field_record(const generic_field_spec & spec, const field_re
     f["legend"]       = legend;
     f["scored"]       = have_dist ? "tree" : "argmax";
     f["scored_nodes"] = fr.scored_nodes;
+    if (diagnostics) {
+        f["certainty"] = conc.at("certainty");  // max(p); additive, as on the Jev path
+    }
 
     if (diagnostics && numeric && have_dist) {
         // the numeric spread summary and aggregate reuse the Jev value-space quantile over the grid
@@ -348,6 +351,18 @@ std::string generic_cache_tag(const common_chat_templates * tmpls, bool use_jinj
     const auto split = tmpls != nullptr ? split_chat_template(tmpls, use_jinja, system_text, false)
                                         : std::make_pair(system_text + "\n", std::string("\n"));
     return make_prefix_tag(system_text, split.second, GENERIC_PROMPT_VERSION);
+}
+
+std::string generic_template_hash(const common_chat_templates * tmpls, bool use_jinja) {
+    // rendered with an empty system text, so the tag covers the chat template's own shape and the
+    // schema prompt version without the request's field catalogue
+    const auto parts = render_schema_prompt(tmpls, use_jinja, std::string(), std::string());
+    return make_prefix_tag(std::string(), parts.second, GENERIC_PROMPT_VERSION);
+}
+
+std::string generic_contract_hash(const std::string & model_name, const std::string & template_hash, int vocab_size) {
+    return sha256_hex("decision-contract-v1|" + template_hash + "|" + std::string(GENERIC_PROMPT_VERSION) + "|" +
+                      model_name + "|" + std::to_string(vocab_size));
 }
 
 std::vector<field_input> session_field_inputs(const compiled_schema & cs,

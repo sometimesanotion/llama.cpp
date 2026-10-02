@@ -32,23 +32,24 @@ cmake --build build --config Release -j
 
 ## Run the server
 
-`--decision-seqs N` reserves the sequence slots the decisions need: one holds the cached instructions, one per context
-in flight, the rest are the parallel questions. It also switches the KV cache to unified, which is what lets the
-branches share the context's cells.
+`--decision-seqs N` turns the decision API on and registers the decision sidecar executor: an
+internal, undeletable pool instance with its own context and its own scheduler thread, sized to
+hold the shared prefix, one context in flight and one branch per scored path. Every decision runs
+there, stateless and session alike, so a decision can never write, stall or resize a chat context.
 
 ```bash
 ./build/bin/llama-server -m model.gguf -ngl 99 -fa on -c 32768 --decision-seqs 24 --port 8096
 ```
 
-The readout runs full logits on the shared chat context. There is no
-classifier-only context and no answer head: every decision reads output rows
-from the one context chat uses, so a decision cannot duplicate the KV cache.
-The decision sequences sit above the chat slots (n_parallel ..
-n_parallel + n_seq_decision). The engine estimates the request's peak KV use
-(the cached instructions plus every live question branch) before any decode.
-A request that does not fit is rejected with `422`, returns no decision, and
-leaves no partial state; the next request still succeeds. The decision path
-never truncates a prompt.
+A decision has no classifier-only context and no answer head: the readout reads full logits from the
+sidecar's own context, so answering a question costs no duplicated chat KV. The engine estimates the
+request's peak KV use (the cached prefix plus every live question branch) before any decode. A
+request that does not fit is rejected with `422`, returns no decision, and leaves no partial state;
+the next request still succeeds. The decision path never truncates a prompt.
+
+Without `--decision-seqs` there is no sidecar, and every decision and session route answers `501`
+`not_supported_error` naming the flag. The refusal happens before any dispatch, so it never touches
+chat state.
 
 With a presets file, one loaded model serves chat and decisions:
 
@@ -73,10 +74,16 @@ decision-seqs = 12
 ./build/bin/llama-server --models-preset models.ini --models-max 1 --port 8096
 ```
 
-How many sequences a model affords depends on its attention. A plain-attention model shares the context's cells, so
-128 sequences cost almost nothing. A sliding-window model (Gemma) allocates its window per sequence, so keep it low
-(12 on a 12 GB card). Hybrid models with recurrent layers work, but llama.cpp splits their batches per sequence
-length, so branches run in several passes instead of one.
+How many decision sequences a model affords depends on its attention, and the budget is the sidecar's
+own: it is sized from `--decision-seqs`, not from the chat instance's `n_parallel`. A plain-attention
+model shares the sidecar's cells across its sequences, so many sequences cost almost nothing. A
+sliding-window model (Gemma) allocates its window per sequence, so keep it low (12 on a 12 GB card).
+Hybrid models with recurrent layers work, but llama.cpp splits their batches per sequence length, so
+branches run in several passes instead of one.
+
+`--decision-sidecar-ctx N` sizes the sidecar window; `0` (the default) means the largest configured
+instance window, so the longest turn a chat instance can produce still replays. `--decision-seqs`
+forces `kv_unified` on the sidecar context only, never on a chat instance.
 
 Set `"permutations": N` (default 1, capped at 8) to de-bias option order: pass 0 keeps the caller's
 order and each later pass presents the same options in a distinct order seeded by the question id,
@@ -151,16 +158,20 @@ full double precision. The digits are one run: a repeat returns the same keys an
 concentration can move a little (see the repeatability rule in `docs/decision/API.md` section 3.1), so read this for
 the keys, not for the digits:
 
-* The envelope is the **Jev one, extended**. There is no `object`, no `results[]`, no `fields`, no `decision`: the top
-  level is `model`, `answers`, `usage`, and each answer is the Jev key set plus `value` and `scored`. A Jev client
-  reads the same keys it always has.
+* The envelope is the **Jev one, extended**, and it is built by the same emitter for both shapes: the same `model`,
+  `usage`, `timings`, `diagnostics` object and session-fork fields. There is no `object`, no `results[]`, no `fields`,
+  no `decision`: the top level is `model`, `answers`, `usage`, and each answer is the Jev key set plus `value` and
+  `scored`. A Jev client reads the same keys it always has, and switching a field from a `score` to a typed `number`
+  changes the answer's shape and nothing else.
 * `probabilities` is a **map**, keyed by every allowed value, summing to 1 - never a singular `probability`. `tree` is
   the string `"tree"` or `"argmax"` inside `scored`, never a boolean.
 * One context answers at the top level as `answers`. Several use the `contexts` array of
   `{"answers": ..., "usage": ...}` objects, one per context, in request order.
 * `usage` carries only `input_tokens` and `output_tokens` by default, exactly as on the Jev shape. `"diagnostics": true`
-  adds the full counters (`cached_tokens`, `state_cache_hit`) and the `timings` object at the top level, and adds
-  `interval_p10_p90` and `aggregate` to a **numeric** field. It never changes an answer.
+  adds the full counters (`cached_tokens`, `state_cache_hit`), the `timings` object and the whole `diagnostics` object at
+  the top level - the same ones the Jev shape reports, with `prompt_version` naming the schema prompt - and adds
+  `certainty` to every field plus `interval_p10_p90` and `aggregate` to a **numeric** one. A session decision reports the
+  same fork fields a Jev session decision does. It never changes an answer.
 
 The normative version of all of this is `docs/decision/API.md` section 2.5; where this README and that document
 disagree, that document wins.
@@ -245,7 +256,7 @@ echoed back verbatim; `GET /v1/models` keeps the OpenAI list shape, not Jev's.
 Both shapes accept `id_slot` (and optional `session_pos` and `turn`) to answer about a chat slot
 that already holds decoded state, so the transcript is not re-prefilled. A first-class `session_id`
 is the alternative: a server-side handle decoupled from the reused `id_slot`, mutually exclusive
-with it (a body carrying both is a 400), with a create/query/pin/erase lifecycle over
+with it (a body carrying both is a 422), with a create/query/pin/erase lifecycle over
 `POST/GET/PATCH/DELETE /v1/session`. The slot must exist and hold state; a `session_pos` that does
 not exactly continue it is a 422. The generic shape scores one context per session request; the Jev
 shape appends the questions as a fresh user turn through the slot's chat template and runs full
@@ -263,19 +274,25 @@ is a live sidecar handle and is not part of a slot file. Under a configured byte
 store evicts the least-recently-used unpinned, unleased reference and reaps expired unpinned
 references; the defaults never evict.
 
-In multi-instance mode (`--instance`), `/v1/decision` and `/v1/session` route through the same
-`instance`/`model` fields chat uses. A stateless decision always runs on the internal decision
-sidecar executor. A live-session decision is pinned to the instance that owns its slot and is
-never group-routed; the same slot id in another instance is a different, empty slot.
+In multi-instance mode (`--instance`), routing differs by shape, and the difference is the whole
+point of the sidecar. A **stateless** decision carries no placement at all: `model` and `instance`
+are echo-only, they never select a target, and the request is dispatched straight to the internal
+decision sidecar executor. A **live-session** decision and a `/v1/session` create must name the
+instance that owns the source slot, through the same `instance`/`model` fields chat uses, because
+the snapshot is taken from that instance's scheduler; a group is refused. The decision itself still
+runs on the sidecar, so the same slot id in another instance is a different, empty slot.
 
 ### Limits and errors
 
 The full contract lives in `docs/decision/API.md` (Sections 4 and 5); the
 validator and that document read the same `DECISION_*`/`LABEL_POOL_CAP`
 constants. In short: 422 for semantic errors (empty state, unknown field
-inside a question, missing/non-null `instructions`, over-limit options),
-413 for the body cap, 429/529 with `Retry-After` for the queue cap, 499 on
-client disconnect, and 501 when the model cannot serve decisions. The path
+inside a question, missing/non-null `instructions`, over-limit options, a
+`session_id` together with `id_slot`), 400 for a body carrying both `schema`
+and `questions`, 413 for the body cap, 429/529 with `Retry-After` for the queue
+cap, 503 with `Retry-After` when the server-side deadline expires or a pool
+transient fails, 499 on client disconnect, and 501 when decisions are not
+enabled or the model cannot serve them. The path
 never truncates: an over-limit request is rejected, never silently clipped.
 
 ### Prefix cache
@@ -353,7 +370,9 @@ share the prefix cache, the branch scorer, the softmax and the SWA clamp:
 
 A body with `questions` selects the Jev front-end; a body with `schema` selects
 the generic front-end; a body carrying both is a 400. The letter readout is a
-thin layer over the trie scorer, not a second implementation.
+thin layer over the trie scorer, not a second implementation, and the response
+envelope around the two is built once (`server_context::decision_response`), so a
+field added to it appears on both shapes at once.
 
 Letter labels are resolved at the framed answer boundary, not in isolation. A SentencePiece /
 `add_space_prefix` vocabulary tokenizes a bare `A` as the space-prefixed form in isolation but
@@ -374,7 +393,8 @@ a model whose tokenizer resolves enough single tokens.
 model: <base gguf>
 task: single-pass decision / classification over a supplied state
 readout: answer labels resolved at the framed answer tail (SentencePiece and BPE)
-context: shared prefix + one state per request; branches forked on a unified KV cache
+context: shared prefix + one state per request, on the sidecar executor's own context; branches forked
+  on that context's unified KV cache, never on a chat context
 output: probability distributions only, output_tokens always 0, closed over the supplied options
 confidence: Jev value (N*p_max-1)/(N-1) by default, opt-in 1 - H/log(K); certainty: max(p); concentration, NOT calibrated accuracy
 calibration: deployment-specific; valid only under the recorded model, quantization, template hash and backend flags

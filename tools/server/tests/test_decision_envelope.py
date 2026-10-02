@@ -73,11 +73,18 @@ def http(method, url, body=None, content_type="application/json"):
 
 
 class Server:
-    def __init__(self, model, extra_args=None):
+    def __init__(self, model, extra_args=None, api_prefix="", env_overrides=None, log_path=None):
         self.model = model
         self.extra_args = extra_args or []
+        # every route is mounted under --api-prefix, health included, so the probe path carries it
+        self.api_prefix = api_prefix.rstrip("/")
         self.port = free_port()
         self.proc = None
+        # per-process overrides for the server, so one suite can drive two configurations of the
+        # same server; and an optional file to keep stderr in, for the checks that assert on a
+        # server-side diagnostic
+        self.env_overrides = env_overrides or {}
+        self.log_path = log_path
 
     def start(self):
         cmd = [
@@ -89,16 +96,20 @@ class Server:
             "--port", str(self.port),
             "--host", "127.0.0.1",
         ] + self.extra_args
+        if self.api_prefix:
+            cmd += ["--api-prefix", self.api_prefix]
         env = dict(os.environ)
+        env.update(self.env_overrides)
         build_bin = os.path.dirname(os.path.abspath(SERVER_BIN))
         env["LD_LIBRARY_PATH"] = build_bin + (os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        stderr = open(self.log_path, "w") if self.log_path else subprocess.DEVNULL
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr, env=env)
         deadline = time.time() + 120
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError("server exited early")
             try:
-                status, _ = http("GET", f"http://127.0.0.1:{self.port}/health")
+                status, _ = http("GET", f"http://127.0.0.1:{self.port}{self.api_prefix}/health")
                 if status == 200:
                     return
             except Exception:
@@ -176,20 +187,42 @@ def run_checks(server, captured):
     # unconditional field cannot slip into the default envelope, and so a missing one is caught
     check(set(diag_body) == {"model", "answers", "usage", "timings", "diagnostics"},
           f"diagnostics top-level key set: {set(diag_body)}")
+    check(set(diag_body["diagnostics"]) == {
+        "contract_hash", "prompt_version", "prefill_ms", "scoring_ms", "suffix_tokens",
+        "common_suffix_tokens", "leaf_suffix_tokens", "label_pool_size", "permutations",
+        "adapters_configured", "adapter_scope", "model", "quantization", "template_hash",
+        "backend_flags", "token_cache_hits", "token_cache_misses",
+    }, f"diagnostics key set: {sorted(diag_body['diagnostics'])}")
+    th = diag_body["diagnostics"]["token_cache_hits"]
+    tm = diag_body["diagnostics"]["token_cache_misses"]
+    check(isinstance(th, int) and isinstance(tm, int) and th >= 0 and tm >= 0 and th + tm > 0,
+          f"the field-compile token cache is reported: {th} hit / {tm} miss")
     check(set(diag_body["usage"]) == {"input_tokens", "output_tokens", "cached_tokens", "state_cache_hit"},
           f"diagnostics usage key set: {set(diag_body['usage'])}")
     check(set(diag_body["answers"]["refund"]) == {"type", "noul"},
           f"diagnostics noul key set: {set(diag_body['answers']['refund'])}")
     check(set(diag_body["answers"]["dept"]) == {"type", "choice", "probabilities", "confidence", "certainty"},
           f"diagnostics choice key set: {set(diag_body['answers']['dept'])}")
-    check(set(diag_body["answers"]["urgency"]) ==
-          {"type", "score", "probabilities", "legend", "confidence", "certainty", "median", "interval_p10_p90"},
+    check(set(diag_body["answers"]["urgency"]) == {"type", "score", "probabilities", "legend",
+                                                    "confidence", "certainty", "median", "interval_p10_p90"},
           f"diagnostics score key set: {set(diag_body['answers']['urgency'])}")
 
     # the prompt/cached split is exposed so callers can see how much of the prompt was reused
     check("input_tokens" in diag_body["usage"], "usage reports input_tokens")
     check("cached_tokens" in diag_body["usage"], "usage reports a cached_tokens split")
     check(diag_body["usage"]["input_tokens"] >= diag_body["usage"]["cached_tokens"], "cached tokens are part of the input")
+
+    # the prompt layout is reported as three numbers, not two: suffix_tokens is the whole question
+    # head before anything is shared, common_suffix_tokens is the head hoisted onto the trunk and
+    # leaf_suffix_tokens is what the branches still decode afterwards. The last is what makes the
+    # hoist visible - if it equalled suffix_tokens the trunk would be carrying nothing.
+    d = diag_body["diagnostics"]
+    check(isinstance(d["leaf_suffix_tokens"], int) and d["leaf_suffix_tokens"] > 0,
+          f"leaf_suffix_tokens is the per-branch remainder: {d['leaf_suffix_tokens']!r}")
+    check(d["leaf_suffix_tokens"] <= d["suffix_tokens"],
+          f"the remainder is not longer than the whole head: {d['leaf_suffix_tokens']} vs {d['suffix_tokens']}")
+    check(d["common_suffix_tokens"] == 0 or d["leaf_suffix_tokens"] < d["suffix_tokens"],
+          "a non-zero hoist actually took tokens off the branches")
 
     # the realized answer-label pool is reported and covers every option the request used
     pool_size = diag_body["diagnostics"].get("label_pool_size")
@@ -679,13 +712,18 @@ def max_prob_delta(p1, p2):
     return max(abs(p1.get(k, 0.0) - p2.get(k, 0.0)) for k in keys) if keys else 0.0
 
 
-# The concentration bound a recurrent model may drift by when the same question set is scored
-# twice. A cached prefix is restored through the engine's host-state warm path, so a cold call
-# and a warm call land the recurrent cells at different rows and the label logits differ in the
-# last bits; on a near-tie the reported concentration moves while the winner does not. The bound
-# is the one API.md documents for the qwen hybrid warm restore. It is a producer-numerics bound,
-# not a task-value one: it never licenses a different winner, a different option set, or a
-# different answer key.
+# The concentration bound a producer may drift by when the same question set is scored twice. A
+# cached prefix is restored through the engine's host-state warm path, so a cold call and a warm
+# call land the recurrent cells at different rows and the label logits differ in the last bits; on
+# a near-tie the reported concentration moves while the winner does not. The bound is the one
+# API.md documents for the qwen hybrid warm restore. It is a producer-numerics bound, not a
+# task-value one: it never licenses a different winner, a different option set, or a different
+# answer key. Those three are pinned exactly by `check_same_decisions`.
+#
+# It is sized for a repeat of the *same* question set, which is the only case the repeatability
+# rule describes. Changing which questions share a batch changes the decode's shape and therefore
+# its reduction order, which is a larger and near-tie-amplified effect; a caller comparing across
+# different question sets uses `check_same_decisions` and not this bound.
 PRODUCER_DRIFT_TOL = 0.05
 
 
@@ -699,34 +737,72 @@ def winner_key(answer):
 DIAGNOSTICS_ADDITIVE_KEYS = ("certainty", "median", "interval_p10_p90")
 
 
-def check_answers_agree(a, b, label, tol=PRODUCER_DRIFT_TOL, additive=()):
-    """Two answers to the same question set must agree on every decision and on the envelope.
+def positional(answers):
+    """Re-key an answers map by position instead of by question key.
 
-    The winner is pinned exactly. The concentration is compared with the documented
-    producer-numerics bound because a recurrent prefix restore is exact in the answer and
-    approximate in the float. `tol` widens the concentration bound only; a caller that needs a
-    looser comparison (a session replay churns the cache harder than a plain repeat) says so,
-    and still gets the winner, the option set and the key set pinned. `additive` names the keys
-    the contract lets one side carry and the other not; `diagnostics: true` is the only such
-    case, and it must be named rather than assumed.
+    The two runs of a key-opacity comparison share the question order and nothing else: the keys
+    are exactly what changed. Re-keying by position lets the shared comparison policy compare the
+    two answers per position instead of the two names.
     """
-    check(sorted(a) == sorted(b), f"{label}: the same answers are returned ({sorted(a)} vs {sorted(b)})")
+    return {str(i): a for i, a in enumerate(answers.values())}
+
+
+def concentration(answer):
+    """The one number that stands for an answer's reported concentration.
+
+    A noul is its own probability; a distribution is the winner's share, which is the same
+    quantity `winner_key` compares the sign of. Reading it here is measurement, not an oracle: a
+    concentration says how peaked a distribution is and nothing about whether the answer is right.
+    """
+    return answer["noul"] if "noul" in answer else max(answer["probabilities"].values())
+
+
+def check_same_decisions(a, b, label, keys=None, additive=()):
+    """Two answers must make the same decision, on exactly the properties the contract pins.
+
+    Pinned here, for each question: the type, the answer key set, the option set, and the winner
+    (an option key for a distribution, a polarity for a noul). Nothing about concentration is
+    compared: this is the whole of "the same answer" the repeatability rule in API.md defines, and
+    it holds on every architecture. `keys` names the subset of questions to compare, for the case
+    where one side answered a different question set. `additive` names the keys the contract lets
+    one side carry and the other not; `diagnostics: true` is the only such case, and it must be
+    named rather than assumed.
+    """
+    if keys is None:
+        check(sorted(a) == sorted(b), f"{label}: the same answers are returned ({sorted(a)} vs {sorted(b)})")
+        keys = sorted(a)
     extra = set(additive)
-    for qid in sorted(a):
+    for qid in keys:
+        check(qid in a and qid in b, f"{label}: {qid} is answered on both sides ({sorted(a)} / {sorted(b)})")
         x, y = a[qid], b[qid]
         check(x.get("type") == y.get("type"), f"{label}: {qid} keeps its type ({x.get('type')} vs {y.get('type')})")
         check(set(x) - extra == set(y) - extra,
               f"{label}: {qid} carries the same keys ({sorted(set(x) - extra)} vs {sorted(set(y) - extra)})")
         if "noul" in x:
-            delta = abs(x["noul"] - y["noul"])
             check(winner_key(x) == winner_key(y), f"{label}: {qid} keeps its polarity")
-            check(delta <= tol,
-                  f"{label}: {qid} noul within the producer bound ({delta:.4f} > {tol})")
             continue
         check(sorted(x["probabilities"]) == sorted(y["probabilities"]),
               f"{label}: {qid} covers the same options")
         check(winner_key(x) == winner_key(y),
               f"{label}: {qid} picks the same winner ({winner_key(x)[1]} vs {winner_key(y)[1]})")
+
+
+def check_answers_agree(a, b, label, tol=PRODUCER_DRIFT_TOL, additive=(), keys=None):
+    """Two answers to the same question set must agree on every decision and on the envelope.
+
+    Everything `check_same_decisions` pins, plus the reported concentration compared with the
+    documented producer-numerics bound: a recurrent prefix restore is exact in the answer and
+    approximate in the float. `tol` widens the concentration bound only; a caller that needs a
+    looser comparison (a session replay churns the cache harder than a plain repeat) says so,
+    and still gets the winner, the option set and the key set pinned.
+    """
+    check_same_decisions(a, b, label, keys=keys, additive=additive)
+    for qid in sorted(keys if keys is not None else a):
+        x, y = a[qid], b[qid]
+        if "noul" in x:
+            delta = abs(x["noul"] - y["noul"])
+            check(delta <= tol, f"{label}: {qid} noul within the producer bound ({delta:.4f} > {tol})")
+            continue
         delta = max_prob_delta(x["probabilities"], y["probabilities"])
         check(delta <= tol,
               f"{label}: {qid} probabilities within the producer bound ({delta:.4f} > {tol})")
@@ -777,6 +853,39 @@ def check_answers_agree_teeth():
     diag = copy()
     diag["dept"]["certainty"] = 0.8
     check_answers_agree(base, diag, "control: a named additive field", additive=DIAGNOSTICS_ADDITIVE_KEYS)
+
+    # the subset form: comparing a subset of the questions pins only those, so a caller that asked
+    # different question sets gets the shared questions checked instead of a key-set mismatch
+    subset = {"refund": copy()["refund"]}
+    check_answers_agree(base, subset, "control: a compared subset", keys=["refund"])
+    try:
+        check_answers_agree(base, subset, "control")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("the agreement control accepted an unnamed subset comparison")
+
+    # `check_same_decisions` is the concentration-free half, and it is the whole of what the
+    # repeatability rule promises: a concentration drift past any bound is accepted there, while
+    # the same pair is refused by `check_answers_agree`. A caller that must not depend on the
+    # producer's float behaviour uses it, so it needs its own teeth.
+    far = copy()
+    far["dept"]["probabilities"] = {"billing": 0.8 + PRODUCER_DRIFT_TOL * 4, "technical": 0.2 - PRODUCER_DRIFT_TOL * 4}
+    check_same_decisions(base, far, "control: concentration is not compared")
+    try:
+        check_answers_agree(base, far, "control")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("the agreement control accepted a concentration past the bound")
+    flipped = copy()
+    flipped["dept"]["probabilities"] = {"billing": 0.2, "technical": 0.8}
+    try:
+        check_same_decisions(base, flipped, "control")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("the decision check accepted a flipped winner")
 
 
 def run_adapter_checks(model, p_base_full):
@@ -998,6 +1107,149 @@ def run_permutations_profile_checks(model):
     return True
 
 
+def run_batching_isolation_checks(server):
+    """What the batched engine promises about *sibling* questions, and how it keeps that promise.
+
+    A request batches every question onto one shared, once-decoded prompt prefix, each on its own
+    forked KV sequence. Two consequences are observable from outside, and both are contracts rather
+    than quality claims:
+
+      * a question's answer does not depend on its siblings. Adding, removing or reordering the
+        others must not change its answer key, its option set or its winner.
+      * a question key is opaque. It is a handle, never rendered into the prompt, so renaming one
+        must change nothing at all at the default single order.
+
+    `check_same_decisions` pins the answer-level properties exactly: the answer key, the option set
+    and the winner. That is the whole of what API.md's repeatability rule promises, so the reported
+    concentration is measured and reported here but never gated. No `confidence` or `certainty` is
+    read as an oracle anywhere below: both are producer concentration, which says nothing about
+    whether an answer is right.
+    """
+    # one noul, one choice and one score, so a failure names the primitive that broke rather than
+    # the only primitive exercised
+    base = {
+        "refund": {"type": "noul", "instructions": "Should this be refunded?"},
+        "dept": {"type": "choice", "instructions": "Which team should handle this?",
+                 "criteria": {"billing": "payments and refunds", "technical": "software errors"}},
+        "urgency": {"type": "score", "instructions": "How urgent is this?",
+                    "criteria": ["low", "medium", "high"]},
+    }
+
+    def decide(questions, **extra):
+        status, text = server.post("/v1/decision",
+                                   json.dumps(dict({"model": "test", "state": DECISION_VALID["state"],
+                                                    "questions": questions, "diagnostics": True}, **extra)))
+        check(status == 200, f"isolation status {status}: {text[:200]}")
+        return json.loads(text)
+
+    # control: the same question twice in one request. Two identical question specs compile to one
+    # scoring field, so both answers come from the same decode and must be bit-identical on every
+    # architecture. This is the group that must NOT fail: if it did, every result below would be
+    # measuring the dedup rather than the isolation, and none of them could be trusted.
+    for spec in base.values():
+        dup = {"first": spec, "second": dict(spec)}
+        answers = decide(dup)["answers"]
+        check(set(answers) == {"first", "second"}, f"both copies are answered: {sorted(answers)}")
+        check(answers["first"] == answers["second"],
+              f"an identical question asked twice is answered identically: "
+              f"{answers['first']} vs {answers['second']}")
+
+    full = decide(base)
+
+    # 1. independence: for each question in turn, ask again without it, then again with the whole
+    #    set reordered so this question is neither first nor last.
+    #
+    #    What is pinned is the answer key, the option set and the winner - the whole of what
+    #    API.md's repeatability rule promises. The reported concentration is measured and reported,
+    #    never gated: changing which questions share a batch changes the decode's shape, so the
+    #    producer's reduction order changes with it and a near-tie can move by more than any bound
+    #    the repeatability rule licenses. That is producer numerics, and it is measured on the
+    #    reference GPU lane at up to ~0.12 (recurrent lfm2.5-350m) against ~0.002 on a dense one.
+    worst = [0.0, ""]
+    for qid in base:
+        survivors = {k: v for k, v in base.items() if k != qid}
+        without = decide(survivors)
+        order = list(base)
+        order.remove(qid)
+        order.append(qid)
+        reordered = decide({k: base[k] for k in order})
+
+        check(set(without["answers"]) == set(survivors),
+              f"the reduced set answers exactly its questions: {sorted(without['answers'])}")
+        check(set(reordered["answers"]) == set(base),
+              f"the reordered set answers the same questions: {sorted(reordered['answers'])}")
+        check_same_decisions(full["answers"], without["answers"],
+                             f"a question is independent of the removed {qid}", keys=survivors)
+        check_same_decisions(full["answers"], reordered["answers"],
+                             f"a question is independent of the position of {qid}", keys=list(base))
+        for label, other in (("removed", without), ("moved", reordered)):
+            for k in other["answers"]:
+                drift = abs(concentration(full["answers"][k]) - concentration(other["answers"][k]))
+                if drift > worst[0]:
+                    worst[0], worst[1] = drift, f"{k} when {qid} was {label}"
+
+    # a larger set is the same property: ask five questions, then the same five plus one the set
+    # did not have, and the five must not move
+    wide = dict(base)
+    wide["channel"] = {"type": "choice", "instructions": "Which channel reported it?",
+                       "criteria": {"email": "written", "phone": "spoken"}}
+    wide["severity"] = {"type": "score", "instructions": "How severe?",
+                        "criteria": ["minor", "moderate", "major"]}
+    before = decide(wide)
+    after = decide(dict(wide, extra_a=dict(base["refund"])))
+    check_same_decisions(before["answers"], after["answers"],
+                         "a question is independent of an added sibling", keys=list(wide))
+
+    # 2. key opacity, at the default single order. The question key is a handle: it selects the
+    #    answer's place in the `answers` map and nothing else. The option order is seeded from the
+    #    key, but only from pass 1 on, and this request is one pass, so renaming the keys must
+    #    produce the same answers - compared positionally, because the keys are what changed - and
+    #    the same rendered-suffix length, which changes if and only if a key reached the prompt.
+    # `common_json` keeps object keys in insertion order, so the renamed answers come back in the
+    # order they were asked, and position is the only identity the two runs share. Both sides are
+    # re-keyed positionally before the comparison, so the check compares the two answers and not
+    # the two names.
+    renamed = {"q_a": base["refund"], "q_b": base["dept"], "q_c": base["urgency"]}
+    opaque = decide(renamed)
+    pairs = list(zip(base, renamed))
+    check(list(opaque["answers"]) == list(renamed),
+          f"the answers come back in the order they were asked: {list(opaque['answers'])}")
+    check_same_decisions(positional(full["answers"]), positional(opaque["answers"]),
+                         "a renamed question key")
+    check(full["diagnostics"]["suffix_tokens"] == opaque["diagnostics"]["suffix_tokens"],
+          f"a question key is not rendered into the prompt: "
+          f"{full['diagnostics']['suffix_tokens']} vs {opaque['diagnostics']['suffix_tokens']}")
+
+    # 3. the permutation seeding, pinned in the direction that holds. At two passes the option
+    #    order is seeded from the question key, so renaming the keys legitimately changes which
+    #    answer comes out. What must not change is the shape of the response: one answer per
+    #    question, each covering the same options. This is behaviour preservation, not a quality
+    #    claim: order de-biasing at more than one pass trades a small measured cost for reduced
+    #    position bias, and that trade is a calibration decision, not a correctness one.
+    seeded_a = decide(base, permutations=2)
+    seeded_b = decide(renamed, permutations=2)
+    check(len(seeded_b["answers"]) == len(base), f"a permuted request answers every question: "
+                                                 f"{sorted(seeded_b['answers'])}")
+    check(seeded_a["diagnostics"]["permutations"] == 2 and seeded_b["diagnostics"]["permutations"] == 2,
+          f"both permuted requests applied two passes: "
+          f"{seeded_a['diagnostics']['permutations']}, {seeded_b['diagnostics']['permutations']}")
+    for original, opaque_key in pairs:
+        a, b = seeded_a["answers"][original], seeded_b["answers"][opaque_key]
+        check(a["type"] == b["type"], f"{original} keeps its type under the seeded key {opaque_key}")
+        if "noul" in a:
+            check(0.0 <= b["noul"] <= 1.0, f"{opaque_key} is still a probability: {b['noul']}")
+            continue
+        check(set(a["probabilities"]) == set(b["probabilities"]),
+              f"{opaque_key} still covers the same options at two passes: "
+              f"{sorted(b['probabilities'])}")
+        check(abs(sum(b["probabilities"].values()) - 1.0) < 1e-4,
+              f"{opaque_key} is still a distribution at two passes: {b['probabilities']}")
+
+    print("batching isolation checks passed: every sibling question kept its key, option set and "
+          f"winner (largest concentration drift {worst[0]:.4f} on {worst[1]}, measured not gated); "
+          "question keys opaque at one pass")
+
+
 def run_routing_checks(model):
     """The routing matrix for an untargeted stateless decision.
 
@@ -1110,6 +1362,26 @@ def main():
 
         if not run_permutations_profile_checks(model):
             return 1
+
+        # batching isolation: a question is independent of its siblings, and its key is opaque
+        iso = Server(model)
+        try:
+            iso.start()
+        except Exception as e:  # noqa: BLE001
+            iso.stop()
+            print(f"FAIL: batching isolation server start: {e}")
+            return 1
+        if not supports_letter_labels(iso):
+            iso.stop()
+            print(f"skip batching isolation on {os.path.basename(model)}: no usable answer labels")
+            return 0
+        try:
+            run_batching_isolation_checks(iso)
+        except Exception as e:  # noqa: BLE001
+            iso.stop()
+            print(f"FAIL: batching isolation: {e}")
+            return 1
+        iso.stop()
 
         # routing matrix for an untargeted stateless decision in a pool
         if not run_routing_checks(model):

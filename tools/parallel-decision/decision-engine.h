@@ -10,9 +10,10 @@
 // is copied from a saved partial state. Small fields score every divergence node of their token
 // trie at once and return the exact constrained distribution; larger fields walk the trie greedily.
 
-#include "llama.h"
 #include "json.h"
+#include "llama.h"
 
+#include <deque>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -73,11 +74,17 @@ struct compiled_fields {
     compiled_fields(const compiled_fields &) = delete;
     compiled_fields & operator=(const compiled_fields &) = delete;
 
-    size_t suffix_tokens        = 0; // per-field suffix tokens before the shared head is hoisted
-    size_t common_suffix_tokens = 0; // suffix head hoisted onto every trunk
-    size_t leaf_suffix_tokens   = 0; // what each branch decodes after the hoist
-    int    rows                 = 0; // batch rows the plan needs
-    int    branches             = 0; // round-1 branches of one context
+    size_t suffix_tokens        = 0;  // per-field suffix tokens before the shared head is hoisted
+    size_t common_suffix_tokens = 0;  // suffix head hoisted onto every trunk
+    size_t leaf_suffix_tokens   = 0;  // what each branch decodes after the hoist
+    int    rows                 = 0;  // batch rows the plan needs
+    int    branches             = 0;  // round-1 branches of one context
+
+    // The token cache's behavior while this plan was compiled. The cache is a pure function of
+    // (text, add_special) over the vocabulary, so these count cost, never correctness; they exist
+    // so an eviction policy can be read in production instead of guessed at.
+    size_t token_cache_hits   = 0;
+    size_t token_cache_misses = 0;
 
     struct impl;
     std::unique_ptr<impl> p;
@@ -103,17 +110,30 @@ struct result {
 // context_tokens and rows; timings and cache state cover the whole batch.
 struct batch_result {
     std::vector<result> items;
-    bool   cache_hit     = false;
-    bool   warm_hit      = false; // a resident warm prefix was forked instead of a cold prefill
-    size_t shared_tokens = 0;
-    int    rows          = 0;
-    int    rounds        = 0;
-    double prefill_ms    = 0;
-    double scoring_ms    = 0;
-    size_t suffix_tokens        = 0;
-    size_t common_suffix_tokens = 0;
-    size_t leaf_suffix_tokens   = 0;
+    bool                cache_hit            = false;
+    bool                warm_hit             = false;  // a resident warm prefix was forked instead of a cold prefill
+    size_t              shared_tokens        = 0;
+    int                 rows                 = 0;
+    int                 rounds               = 0;
+    double              prefill_ms           = 0;
+    double              scoring_ms           = 0;
+    size_t              suffix_tokens        = 0;
+    size_t              common_suffix_tokens = 0;
+    size_t              leaf_suffix_tokens   = 0;
+    size_t              token_cache_hits     = 0;
+    size_t              token_cache_misses   = 0;
 };
+
+// The token accounting one context of a decision cost: its own decoded evidence plus the shared
+// prefix, which is counted once per context. A decision generates nothing, so the output count is
+// always zero, and a prefix-cache hit charges the cached prefix as its cached tokens. Reported over
+// the engine's own record, so both front-ends report the same numbers for the same work.
+common_json decision_usage(const batch_result & batch, size_t context_index);
+
+// The batch timings, additive with `diagnostics` like every other reported number. `rounds` counts
+// the scoring passes a multi-round batch needed and `rows` the branch rows it decoded, which is
+// what makes a request's cost legible next to its answer.
+common_json decision_timings(const batch_result & batch);
 
 // Scores decisions on an existing context with the sequence ids [seq_base, seq_base + n_seqs):
 // one keeps the cached static prefix; the rest hold one trunk (prefix + context) per context in
@@ -277,16 +297,24 @@ class engine {
     // engine pool, each holding one session turn's token list decoded and kept resident. Only the
     // owner's scheduler thread touches them. Touched only through decide_warm.
     int n_warm_ = 0;
+
     struct warm_slot {
-        std::string tag;      // warm identity (session content hash); empty = free
-        llama_pos   pos = -1; // = tokens.size() when filled
+        std::string tag;             // warm identity (session content hash); empty = free
+        llama_pos   pos       = -1;  // = tokens.size() when filled
         int64_t     last_used = 0;
     };
+
     std::vector<warm_slot> warm_slots_;
-    int64_t warm_clock_ = 0;
+    int64_t                warm_clock_ = 0;
 
     mutable std::unordered_map<std::string, tokens_t> token_cache_;
-    static constexpr size_t                           token_cache_limit_ = 1024;
+    // Insertion order of token_cache_ keys, so eviction drops the oldest entry instead of the whole
+    // map. A miss clears nothing: the entries that would have hit stay resident. Because the cache
+    // is a pure function of (text, add_special) over the vocabulary, eviction can only change cost.
+    mutable std::deque<std::string>                   token_cache_order_;
+    mutable size_t                                    token_cache_hits_   = 0;
+    mutable size_t                                    token_cache_misses_ = 0;
+    static constexpr size_t                           token_cache_limit_  = 1024;
 
     std::function<bool()> stop_;
     std::function<void()> yield_;

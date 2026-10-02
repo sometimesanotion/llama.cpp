@@ -71,15 +71,14 @@ std::string decision_quantization(const llama_model * model, const std::string &
     return quant;
 }
 
-temperature_provenance decision_provenance_current(const std::string & model_name,
-                                                   const common_params & params,
-                                                   const llama_model * model,
-                                                   const common_chat_templates * tmpls, bool use_jinja) {
-    const auto parts = render_letter_prompt(tmpls, use_jinja, letter_system_text());
+temperature_provenance decision_provenance(const std::string &   model_name,
+                                           const common_params & params,
+                                           const llama_model *   model,
+                                           const std::string &   template_hash) {
     temperature_provenance current;
     current.model         = model_name;
     current.quantization  = decision_quantization(model, params.model.path);
-    current.template_hash = make_prefix_tag(parts.first, parts.second, LETTER_PROMPT_VERSION);
+    current.template_hash = template_hash;
     char flags[256];
     std::snprintf(flags, sizeof(flags), "fa=%d,k=%d,v=%d,unified=%d,swa=%d,ubatch=%u",
                   (int) params.flash_attn_type, (int) params.cache_type_k,
@@ -87,6 +86,16 @@ temperature_provenance decision_provenance_current(const std::string & model_nam
                   (int) params.swa_full, params.n_ubatch);
     current.backend_flags = flags;
     return current;
+}
+
+temperature_provenance decision_provenance_current(const std::string &           model_name,
+                                                   const common_params &         params,
+                                                   const llama_model *           model,
+                                                   const common_chat_templates * tmpls,
+                                                   bool                          use_jinja) {
+    const auto parts = render_letter_prompt(tmpls, use_jinja, letter_system_text());
+    return decision_provenance(model_name, params, model,
+                               make_prefix_tag(parts.first, parts.second, LETTER_PROMPT_VERSION));
 }
 
 const char * letter_system_text() {
@@ -251,23 +260,9 @@ const common_chat_templates * tmpls, bool use_jinja,
         : sources.full->decide_batch(plan, split.first, states, readout_opt);
 
     if (metrics) {
-        metrics->cache_hit      = b.cache_hit;
-        metrics->warm_hit       = b.warm_hit;
-        metrics->shared_tokens  = b.shared_tokens;
-        metrics->prefill_ms     = b.prefill_ms;
-        metrics->scoring_ms     = b.scoring_ms;
-        metrics->rows           = b.rows;
-        metrics->rounds         = b.rounds;
-        metrics->context_tokens = 0;
-        metrics->per_context_tokens.clear();
-        metrics->per_context_tokens.reserve(b.items.size());
-        for (const auto & item : b.items) {
-            metrics->context_tokens += item.context_tokens;
-            metrics->per_context_tokens.push_back(item.context_tokens);
-        }
-        metrics->suffix_tokens        = b.suffix_tokens;
-        metrics->common_suffix_tokens = b.common_suffix_tokens;
-        metrics->label_pool_size      = labels.size();
+        // the engine's own record, held rather than copied field by field, plus the one number only
+        // this readout knows: how many answer labels the model actually resolved
+        *metrics = readout_metrics{ b, labels.size() };
     }
 
     std::vector<std::vector<std::vector<float>>> all;

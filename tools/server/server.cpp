@@ -241,10 +241,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_embeddings        = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_embeddings(req); };
         routes.post_embeddings_oai    = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_embeddings_oai(req); };
         routes.post_rerank            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_rerank(req); };
-        routes.post_decision          = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_decision(req); };
-        // the strict-Jev route shares the decision dispatcher: the route has already marked the
-        // request body, so the same dispatch carries the restriction to the owning instance
-        routes.post_systemone         = routes.post_decision;
+        routes.post_decision               = [&instances_mgr](const server_http_req & req) {
+            return instances_mgr.handle_post_decision(req, /* jev_only = */ false);
+        };
+        // the strict-Jev route is a distinct binding, not an alias: the route says which shapes it
+        // accepts, and the pool carries that decision instead of recovering it from the request path
+        routes.post_systemone = [&instances_mgr](const server_http_req & req) {
+            return instances_mgr.handle_post_decision(req, /* jev_only = */ true);
+        };
         routes.post_session           = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_post_session(req); };
         routes.get_session            = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_get_session(req); };
         routes.delete_session         = [&instances_mgr](const server_http_req & req) { return instances_mgr.handle_delete_session(req); };

@@ -2645,6 +2645,104 @@ static void test_decision_session_budget_policy() {
     assert(decision_session_total_bytes({}) == 0);
 }
 
+// Whether a stored reference may be retired right now, without a server, a model or a lease. This
+// is the rule every path that drops a reference shares, so it is expressed here as a pure function
+// and the pool only performs what it returns. It is task validity - whether the store may be
+// mutated - and reads no answer.
+static void test_decision_session_retirement_policy() {
+    // nothing holds an ordinary reference, so it retires now and its adapter refs are released
+    assert(pick_decision_session_retirement(/* present = */ true, /* leased = */ false) ==
+           decision_session_retirement::now);
+
+    // an in-flight decision is never a victim: the reference is marked removed and finalized when
+    // the last lease drops, so the reader finishes before its tokens and refs are freed
+    assert(pick_decision_session_retirement(/* present = */ true, /* leased = */ true) ==
+           decision_session_retirement::deferred);
+
+    // a key the store does not hold is a no-op, whatever the caller's view of the lease says
+    assert(pick_decision_session_retirement(/* present = */ false, /* leased = */ false) ==
+           decision_session_retirement::absent);
+    assert(pick_decision_session_retirement(/* present = */ false, /* leased = */ true) ==
+           decision_session_retirement::absent);
+
+    // pinning and expiry decide candidacy, retirement decides death. The two views share one type,
+    // so table them together: a pinned unleased reference is never a victim but is retirable once
+    // something else picked it, and a leased one is skipped by both.
+    decision_session_ref pinned;
+    pinned.pinned = true;
+    decision_session_ref leased;
+    leased.leased = true;
+
+    std::vector<decision_session_ref> refs = { pinned, leased };
+    assert(pick_decision_session_victim(refs) == std::nullopt);
+    assert(pick_decision_session_retirement(true, pinned.leased) == decision_session_retirement::now);
+    assert(pick_decision_session_retirement(true, leased.leased) == decision_session_retirement::deferred);
+
+    // unpinning makes it a victim; the lease still outlives the eviction
+    pinned.pinned = false;
+    refs[0]       = pinned;
+    assert(pick_decision_session_victim(refs) == 0);
+    assert(pick_decision_session_retirement(true, refs[0].leased) == decision_session_retirement::now);
+}
+
+// The byte budget charges a view of the store and GET /v1/session reports a view of the same store,
+// so the two must agree on what a reference costs and on whether the store still holds it. They read
+// the same projection and the same liveness rule, so this table pins that agreement: every reference
+// the reported count skips is also one the budget does not charge, and no other.
+static void test_decision_session_projection_agreement() {
+    const auto ref = [](size_t bytes, bool pinned = false, bool leased = false, bool removed = false,
+                        bool replacing = false) {
+        decision_session_ref r;
+        r.bytes     = bytes;
+        r.pinned    = pinned;
+        r.leased    = leased;
+        r.removed   = removed;
+        r.replacing = replacing;
+        return r;
+    };
+
+    // every combination of the four facts that decide liveness and evictability, one reference each
+    for (int bits = 0; bits < 16; ++bits) {
+        const bool   pinned    = bits & 1;
+        const bool   leased    = bits & 2;
+        const bool   removed   = bits & 4;
+        const bool   replacing = bits & 8;
+        const size_t bytes     = 100 * (size_t) (bits + 1);
+
+        const std::vector<decision_session_ref> one = {
+            ref(bytes, pinned, leased, removed, replacing),
+        };
+
+        // the count the status reports and the bytes the budget charges come from one predicate
+        assert(decision_session_live_count(one) == (decision_session_live(one[0]) ? 1 : 0));
+        assert(decision_session_total_bytes(one) == (decision_session_live(one[0]) ? bytes : 0));
+
+        // a held reference is charged and counted but is never a victim, so the two questions the
+        // budget asks - what does this cost, may this go - stay independent
+        assert(decision_session_live(one[0]) == !(removed || replacing));
+        if (decision_session_live(one[0]) && !pinned && !leased) {
+            assert(pick_decision_session_victim(one) == 0);
+        } else if (!decision_session_live(one[0]) || pinned || leased) {
+            assert(pick_decision_session_victim(one) == std::nullopt);
+        }
+    }
+
+    // a store holding both kinds reports the live one and charges only for it
+    const std::vector<decision_session_ref> mixed = {
+        ref(100),                                                                      // live, evictable
+        ref(200, /* pinned = */ true),                                                 // live, held
+        ref(300, /* pinned = */ false, /* leased = */ false, /* removed = */ true),    // gone, awaiting its lease
+        ref(400, /* pinned = */ false, /* leased = */ false, /* replacing = */ true),  // about to be replaced
+    };
+    assert(decision_session_live_count(mixed) == 2);
+    assert(decision_session_total_bytes(mixed) == 300);
+    assert(pick_decision_session_victim(mixed) == 0);
+
+    // an empty store reports and charges nothing, which is what an untouched counter read must show
+    assert(decision_session_live_count({}) == 0);
+    assert(decision_session_total_bytes({}) == 0);
+}
+
 int main(int argc, char ** argv) {
     test_instances_parse_round_trip();
     test_instances_lora_multi_scale();
@@ -2667,6 +2765,8 @@ int main(int argc, char ** argv) {
     test_fanout_calibration();
     test_start_loops_starts_io_worker();
     test_decision_session_budget_policy();
+    test_decision_session_retirement_policy();
+    test_decision_session_projection_agreement();
 
     common_params params;
     std::string   adapter_path;

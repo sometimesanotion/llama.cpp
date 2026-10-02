@@ -66,8 +66,8 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
 void mean_permuted_passes(const compiled_schema & cs, result & r);
 
 // One scored field as a Jev-shaped answer: type, value, confidence, a full probabilities map keyed
-// by value, the value-space legend, and the `scored` mode. Under `diagnostics` a numeric field also
-// reports interval_p10_p90 and the applied aggregate. Pure.
+// by value, the value-space legend, and the `scored` mode. Under `diagnostics` a field also reports
+// `certainty`, and a numeric one the interval_p10_p90 band and the applied aggregate. Pure.
 common_json generic_field_record(const generic_field_spec & spec, const field_result & fr,
                                  const std::string & confidence_profile, bool diagnostics);
 
@@ -85,6 +85,17 @@ std::pair<std::string, std::string> render_schema_prompt(const common_chat_templ
 // the system text. Used to reject a cache hit produced under a different schema or template.
 std::string generic_cache_tag(const common_chat_templates * tmpls, bool use_jinja,
                               const std::string & system_text);
+
+// The chat template shape this readout frames, as a stable identity. The schema prompt's own system
+// text is per request (it carries the field catalogue), so it is deliberately left out: this is the
+// part of the prompt that does not change between two schemas.
+std::string generic_template_hash(const common_chat_templates * tmpls, bool use_jinja);
+
+// Identity of the generic schema readout contract: the tokenizer identity and the schema prompt
+// template. Deliberately a different hash from the letter readout's, because the two shapes frame
+// different prompts over the same engine, so a calibration recorded under one is never read as a
+// calibration of the other.
+std::string generic_contract_hash(const std::string & model_name, const std::string & template_hash, int vocab_size);
 
 // Session-framed field inputs: the schema catalogue is rendered as a fresh user turn (`before` /
 // `after` from split_user_turn) so a live-session fork answers the schema without re-prefilling

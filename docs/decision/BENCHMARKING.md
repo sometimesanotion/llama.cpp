@@ -203,6 +203,40 @@ Method rules:
 * Any latency claim must name the model, the quantization, the flash-attention
   setting and the backend. A bare millisecond figure is not a result.
 
+### 4.1 Field compilation cost
+
+`compile_fields` is off the request clock (it never decodes), but at the documented
+limits it can dominate the CPU time a request costs before the GPU does any work.
+It holds a per-engine token cache, an exact-field dedup, and a candidate-path
+collision check. Measured on the `qwen3.5-2b` tokenizer with the CPU scaffold, by
+compiling the field sets below through the env-gated `compile_fields cost probe`
+in `tests/test-decision-engine.cpp` (point `LLAMA_DECISION_BENCH_MODEL` at a real
+tokenizer and filter the harness to the probe):
+
+| workload | before | after |
+|---|---|---|
+| typical: 8 questions, 1 pass, 4 options, cold cache | 0.28 ms | 0.29 ms |
+| typical, warm cache | 0.01 ms | 0.01-0.02 ms |
+| worst: 256 questions, 8 passes, 255 options | 3962 ms | 3893 ms |
+
+The typical case does not regress, which is the acceptance condition. The worst
+case does not move within run-to-run noise, and the reason is worth recording: the
+token cache reports **522236 misses and 4 hits** on that field set, because every
+`(suffix, candidate)` pair is distinct, so the cache cannot hit there and the
+eviction policy only changes how the overflow is discarded. The wall time is
+dominated by the O(K^2) candidate-path collision check and the trie build, which
+are deliberately left in place; see the follow-up note in the roadmap. The cache
+and dedup changes are therefore a bounded-memory and expected-comparison-count fix,
+not a wall-time win at that size. A workload whose tokenizations repeat is where
+the cache policy pays; the warm row is that case.
+
+**Current tree baseline.** Re-measured with the probe on the ROCm build with the
+`qwen3.5-2b` tokenizer: the typical case is 0.42 ms cold (32 tokenizations, 0
+hits) and the worst case is 5006 ms (522240 tokenizations, 0 hits). The worst
+case is dominated by the O(K^2) candidate-path collision loop in
+`engine::compile_fields`, not by the token cache or the dedup, because every
+`(suffix, candidate)` pair is distinct at that size.
+
 ## 5. Accuracy
 
 The labeled corpus is `tests/decision-baseline/accuracy_corpus.json` (letter
@@ -388,6 +422,222 @@ are easy to test wrongly:
 * **A leased reference is skipped, not deferred.** It is never reaped late. To
   observe the lease deterministically, wait for the resolve to stamp
   `last_used_ms` rather than assuming a decode duration.
+
+### 8.1 The scheduler acknowledgement budget
+
+After a session decision is dispatched, a pool-owned release worker waits for the
+sidecar's scheduler to acknowledge that the task is finished, then drops the lease
+on the store entry. The client response does not wait for any of it. That wait is
+bounded by `DECISION_SCHEDULER_ACK_BUDGET_MS` (`common/common.h`), and the
+measurement behind the constant is recorded here.
+
+**What it measures.** The interval from posting the acknowledgement op to its
+return. It is a liveness property of the executor and nothing else; it is never
+compared against a reported distribution measure, and it is deliberately not
+derived from `--decision-timeout-ms`.
+
+**How to reproduce.** Start `llama-server` with `-lv 5` (the duration is logged at
+debug level as `decision drain took Nms of a Bms budget`) and run a session
+decision. A stateless decision takes no drain at all, which is itself the first
+control: the instrument is not on that path.
+
+Reference lane, ROCm on an RX 7900 XT (gfx1100), `--decision-seqs 8`, the
+concurrency cap at its default of 4 unless noted:
+
+| workload | lfm2.5-350m (recurrent) | qwen3.5-2b (hybrid) | gemma-4-e4b-it (dense) |
+|---|---|---|---|
+| clean session decision, one at a time | p50 0 ms, max 1 ms | p50 0 ms, max 0 ms | p50 0 ms, max 1 ms |
+| 4 concurrent decisions on one session, 3 questions | p50 32 ms, p99 95 ms, max 95 ms | p50 126 ms, p99 378 ms, max 378 ms | p50 263 ms, p99 786 ms, max 786 ms |
+| 4 concurrent, 32 five-level questions and a long prefix | - | - | p50 868 ms, p99 2602 ms, max 2602 ms |
+| 16 concurrent with 3 decision sequences | - | - | max 2404 ms (the drain tail) |
+
+**The control group that must not time out** is the first row: a decision that
+completes normally on the smallest model, and on the largest at the configured
+`--decision-seqs`, both drain in about a millisecond. If either approaches the
+budget, the budget is wrong, not the workload.
+
+**What sets the tail** is the second and third rows, and it is not the cancelled
+decision. A client that disconnects mid-decode has its task cancelled out of the
+queue before it runs, so its drain returns immediately (measured 0 ms at cancel
+delays from 50 ms to 1.5 s on a 707 ms decision). The tail is the *siblings*: a
+drain queues behind whatever else is on the single sidecar scheduler thread, so
+its length scales with the remaining decisions in flight, roughly one to three
+times a single decision on a saturated queue.
+
+**How the constant was chosen.** The measured p99.9 of the heaviest workload
+above is 2602 ms. The budget is **30000 ms**, about 11x that, which leaves room
+for a slower host while staying inside the regime where the wait is a bounded
+management-plane wait rather than a wedged thread. It is not a multiple of the
+decision deadline: that deadline is producer-facing and may already be spent by
+the time the drain runs, which is exactly why reusing it would prove nothing.
+
+**The failure mode is inverted on purpose.** A drain that cannot be observed
+inside the budget keeps the lease, the entry's adapter references and the
+transient snapshot key, and logs at error level. An unobserved task is
+indistinguishable from a running one, so the only safe reading of "the wait was
+too long" is "we could not prove the reader is finished". The cost is a retained
+reference - visible in `GET /v1/session/{id}` as `bytes` and in the store's
+counters, and clearable by `DELETE` - rather than adapter memory a running
+decode still points at.
+
+One detail worth knowing before trusting the number: the op's own deadline is
+only consulted where the result queue's poll expires, and on a busy context
+other results keep waking that poll, so a deadline can pass without the wait
+returning. The budget is therefore enforced against the measured elapsed time as
+well as the returned result, and both must agree that the scheduler answered
+inside it.
+
+### 8.2 Baseline findings: the release drain and the compile path
+
+Two costs are measured before the release path and the candidate-path check are
+changed, so a later comparison has a fixed before.
+
+**Release drain.** A session decision holds a lease through
+`decision_lease_guard`. Its destructor calls
+`release_decision_snapshot_after_dispatch` on the HTTP thread, which posts
+`decision_drain_ack` through `instance_op` and waits up to
+`scheduler_ack_budget_ms()`. Only when the sidecar's scheduler is observed does it
+erase the transient `decision_snapshot_resolve_` key, decrement the lease and call
+`release_decision_refs`; an unobserved wait keeps all three. The wait therefore
+sits on the client's critical path after the answer exists, and the measured tail
+is the table in 8.1.
+
+**Collision check.** `engine::compile_fields` runs a pairwise loop over the
+candidate `paths` of every field and rejects a field whose options tokenize to a
+colliding path. `decision_field::build_nodes` computes the same relation on the
+trie it builds immediately after, so the pairwise loop is a second implementation
+of the invariant. At the documented worst case the loop dominates the compile
+wall time in 4.1.
+
+### 8.3 Release worker calibration
+
+The post-dispatch drain and the store release run on one pool-owned, non-scheduler
+worker behind a bounded FIFO (`server_instances::release_loop`). Four thresholds
+govern it, and all four bound **executor liveness or queue capacity**. None of
+them is a quality gate: no reported `confidence`, `certainty` or any other
+distribution measure is compared against any of them, and none of them caches,
+routes, admits or persists an answer.
+
+A queued job carries a backoff deadline rather than making the worker sleep, and
+the worker runs the first job whose deadline has passed. That is what keeps one
+job's backoff off the whole queue. A job that cannot observe the scheduler is
+never abandoned: after the short ladder it is reported once and parked on the long
+interval, still retrying, because a reference and the snapshot it holds are
+retained memory until something observes the reader finishing.
+
+| Constant | Frozen value | Bounds |
+|---|---|---|
+| `release_fast_attempts` | 5 | short-ladder attempts before a job is reported as retained and moved to the long interval |
+| `release_retry_backoff_ms` | 50 | a short-ladder retry's backoff |
+| `release_retained_retry_ms` | 60000 | a parked job's retry interval until the scheduler is observed |
+| `max_release_jobs` | 128 | deepest pending queue; a full queue falls back to the inline release rather than dropping a lease |
+
+**Where to read them.** `GET /v1/session/{id}` reports the worker's counters in a
+nested `counters.release` block, next to the session store's own counters:
+
+```json
+"counters": { "n_snapshots": 1, "n_reuses": 16, "n_releases": 0,
+              "n_sessions": 1, "bytes_total": 3188, "n_pending": 0,
+              "release": { "jobs": 16, "retries": 0, "retained": 0, "inline": 0,
+                           "queue_high": 14, "bytes_pending": 0, "bytes_high": 47820 } }
+```
+
+`jobs` are leases whose drain was observed and whose references were released;
+`retries` are unobserved drains that were re-queued (including the one that parks a
+job); `retained` are jobs that spent the short ladder and are now parked, still
+holding their lease, their adapter references and their transient snapshot key;
+`inline` are leases released on the HTTP thread because the queue was stopped or
+full; `queue_high` and `bytes_high` are high-water marks and `bytes_pending` the
+snapshot bytes held by unfinished jobs right now. A `bytes_pending` that never
+returns to zero is a retained snapshot, which is the one number on this path that
+represents memory rather than work.
+
+**How to reproduce.** Both arms run inside
+`tools/server/tests/test_decision_session_concurrency.py` and print their own
+measurements:
+
+```sh
+export LLAMA_SERVER_BIN=$PWD/build-decision/bin/llama-server
+LLAMA_SERVER_TEST_MODEL=$MODEL python3 tools/server/tests/test_decision_session_concurrency.py
+```
+
+The workload is `_drain_scenario`: one session, then 16 concurrent decisions of 32
+five-level questions against a long prefix with 3 sidecar sequences and
+`LLAMA_DECISION_MAX_QUEUE=32`.
+
+**Control group, which must not fire.** The shipped budget observes every drain on
+its first attempt, so a normal session workload must produce **zero** retries,
+zero retained leases and zero inline fallbacks. This is asserted, not merely
+measured: if any of the three is nonzero the shipped budget is mistuned and the
+test fails rather than absorbing the regression. Reference lane, ROCm:
+
+| | lfm2.5-350m | qwen3.5-2b | gemma-4-e4b-it |
+|---|---|---|---|
+| jobs / retries / retained / inline | 16 / 0 / 0 / 0 | 16 / 0 / 0 / 0 | 16 / 0 / 0 / 0 |
+| retry rate per job | 0.00 | 0.00 | 0.00 |
+| peak pending queue depth | 13-14 | 14 | 14 |
+| peak pending snapshot bytes | 44632-47820 | 47700 | 47880 |
+| pending bytes after the storm settles | 0 | 0 | 0 |
+| transient resolve keys vs. pre-storm baseline | equal | equal | equal |
+
+The two marked ranges are arrival-timing dependent (the drain op is FIFO behind
+the sidecar's own queue, so the depth depends on how far the storm got before the
+worker caught up); the control properties that must not move are the three
+zero-valued rows.
+
+**Stress arm, which must fire.** The forced arm sets
+`LLAMA_DECISION_SCHEDULER_ACK_BUDGET_MS=-1`, the never-observe sentinel, so every
+drain fails and every job walks the short ladder and parks:
+
+| | lfm2.5-350m | qwen3.5-2b | gemma-4-e4b-it |
+|---|---|---|---|
+| parked leases | 16 | 16 | 16 |
+| retries | 80 | 80 | 80 |
+| pending snapshot bytes still held | 51008 | 50880 | 51072 |
+| peak pending queue depth | 16 | 16 | 16 |
+
+`80 = 16 x release_fast_attempts`, so every job parks exactly at the end of its
+short ladder, and the retained bytes are all 16 snapshots: the failure is fully
+accounted rather than only logged. The queue depth is the whole storm at once,
+which is the point of moving the backoff into a deadline - before that change this
+arm measured a depth of 1 to 7, because a worker sleeping inside one job's backoff
+serialised the queue behind it and the depth was an artifact of the sleep rather
+than a count of the leases actually held.
+
+**How the constants were frozen.**
+
+* *Queue cap = 128.* The pending depth cannot exceed the number of leases held at
+  once, and the pool's own admission gate bounds that at `2 x
+  --decision-max-queue` (the 529 threshold; above the cap a decision is 429). The
+  reference lane ran with `LLAMA_DECISION_MAX_QUEUE=32`, so the largest admissible
+  burst is 64 and the measured peak was 13-14. 128 is 2x the largest admissible
+  burst and 9x the measured peak, so the inline fallback - which reintroduces the
+  pre-change client-side wait - is unreachable in normal operation. R4's
+  provisional 64 was exactly the admissible burst at this queue setting, leaving no
+  headroom; 128 removes that edge.
+* *Short ladder = 5 attempts.* The condition being retried is a sidecar scheduler
+  briefly behind its own queue, and the drain op is FIFO behind the decision tasks,
+  so the useful question is how long a job may wait for the queue to move. Five
+  attempts is 250 ms of short backoff on top of the first attempt. The measured
+  retry rate of 0.00 per job says the ladder is a tail mechanism, so the tail is
+  what bounds it. The ladder no longer terminates a job: it only decides when a job
+  is *reported* and moved to the long interval.
+* *Backoff = 50 ms.* The queue moves in units of one scheduler task, and a single
+  decision measures 17 ms / 59 ms / 83 ms on the three reference models, so 50 ms
+  is one to three task times: long enough that the retry lands after the queue has
+  moved, short enough that it stays far inside the 30 s budget. Nothing in the
+  measurement supports a longer pause, and a longer one only widens the window in
+  which a pending job holds its snapshot.
+* *Parked interval = 60 s.* The condition that parks a job is the drain op's result
+  not arriving inside a 30 s budget, which is not a condition that clears in
+  milliseconds. 60 s trades self-heal latency against the one resource a parked job
+  still costs: each retry holds the single worker for up to one budget, so a
+  permanently unobservable scheduler keeps the worker busy roughly half the time
+  while it retries. That is the deliberate backstop - the queue cap and the inline
+  fallback sit behind it, so even that case degrades to a slower release rather than
+  to a dropped lease. An operator erase does not wait for the interval: it wakes the
+  parked job immediately, which the stress arm asserts (a growth in `retries`
+  inside 5 s, against a 60 s interval, can only be the wake).
 
 ## 9. Reproducibility baselines
 

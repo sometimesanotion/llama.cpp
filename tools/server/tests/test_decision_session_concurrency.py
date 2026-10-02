@@ -319,44 +319,20 @@ def run_sidecar_specific_checks(model):
 
 # Resident warm-prefix calibration lane: the sidecar keeps a bounded set of resident session
 # prefixes; the first decision on a turn cold-prefills (warm_hit false), a repeat forks the resident
-# prefix (warm_hit true) and must be bit-identical to its own miss. The control group (never-repeated
+# prefix (warm_hit true) and must match its own miss. The control group (never-repeated
 # sessions) must show zero warm hits; the repeated group must show hits.
-def answers_close(a, b, tol):
-    """The answers agree within `tol` on every numeric field and exactly on every non-numeric one.
-    The winners (choice key, noul value, score index) must be unchanged; only the reported
-    concentration (probabilities and the derived diagnostics) may move within `tol`. This is the
-    documented warm-restore tolerance: on the qwen hybrid model the recurrent warm-restore drifts the
-    score probabilities and their derived interval/median by up to ~0.05 between a cold miss and a
-    warm hit (a known producer-numerics matter, flaky from ~0 to ~0.05 run to run). A hit never
-    changes a winner, only the reported concentration; lfm and gemma are effectively wire-identical."""
-    if set(a) != set(b):
-        return False
-    for qid in a:
-        if set(a[qid]) != set(b[qid]):
-            return False
-        for k, v in a[qid].items():
-            bv = b[qid][k]
-            if isinstance(v, dict):
-                if set(v) != set(bv):
-                    return False
-                for kk, vv in v.items():
-                    if isinstance(vv, float) and abs(vv - bv[kk]) > tol:
-                        return False
-                continue
-            if isinstance(v, (list, tuple)):
-                if len(v) != len(bv):
-                    return False
-                for x, y in zip(v, bv):
-                    if isinstance(x, float) and abs(x - y) > tol:
-                        return False
-                continue
-            if isinstance(v, float):
-                if abs(v - bv) > tol:
-                    return False
-                continue
-            if v != bv:
-                return False
-    return True
+#
+# The comparison is the envelope suite's single policy, not a second one: it pins the winner, the
+# option set and the answer key set exactly and widens only the concentration by the documented
+# producer-numerics bound. A warm hit on the qwen hybrid model drifts the score probabilities by up
+# to ~0.05 between a cold miss and a warm hit (a producer-numerics matter, flaky from ~0 to ~0.05 run
+# to run); a hit never changes a winner, only the reported concentration, and lfm and gemma are
+# effectively wire-identical.
+WARM_RESTORE_TOL = 0.1
+
+
+def check_warm_answers_agree(cold, warm, label):
+    env.check_answers_agree(cold, warm, label, tol=WARM_RESTORE_TOL)
 
 
 def run_warm_cache_checks(model):
@@ -411,8 +387,8 @@ def run_warm_cache_checks(model):
         env.check(hit2 is True, f"repeated group third decision is warm: {hit2}")
         # a warm hit never changes a winner; probabilities stay within the documented qwen
         # recurrent warm-restore tolerance (measured up to ~0.05 in the derived diagnostics, bound 0.1)
-        env.check(answers_close(ans1, ans0, 0.1), "warm hit answer matches the cold miss within the documented tolerance")
-        env.check(answers_close(ans2, ans0, 0.1), "warm repeat answer matches the cold miss within the documented tolerance")
+        check_warm_answers_agree(ans0, ans1, "warm hit answer matches the cold miss within the documented tolerance")
+        check_warm_answers_agree(ans0, ans2, "warm repeat answer matches the cold miss within the documented tolerance")
         print(f"warm cache: control hits={control_hits}, repeated group hit rate=2/2, "
               f"hit answers within the documented tolerance on {os.path.basename(model)}")
         return True
@@ -982,6 +958,549 @@ def run_identity_checks(model):
         srv.stop()
 
 
+# Retirement of a stored reference while an in-flight decision is reading it. The store may only
+# drop a reference nothing holds: an in-flight decision's task still points at the snapshot's tokens
+# and at the entry's pool-owned adapter pointers, so a create that replaced the entry would free
+# memory a running decode is using. The gate refuses that create; the reference survives; the
+# counters return to their pre-test values, so a stranded lease is detectable rather than merely
+# unlikely.
+#
+# The lease is observed rather than assumed: a resolve stamps last_used_ms, so waiting for that stamp
+# to move is the moment the reference is provably held, and the queued decisions keep it held for
+# several decodes. The sidecar runs one scheduler thread, so the lease outlives one decode.
+RACE_DECISIONS = 3
+# long enough that the sidecar decode outlives the racing create, short enough that the reference
+# fits the smallest reference model's context window
+RACE_EVIDENCE = "The race evidence sentence. " * 230
+
+
+def race_server_args(lora=None):
+    args = ["--instance", "main:ctx=8192:parallel=4:default",
+            "--decision-sidecar-ctx", "16384",
+            "--slots", "--jinja", "--slot-save-path", tempfile.mkdtemp()]
+    if lora is not None:
+        args += ["--lora", lora]
+    return args
+
+
+def run_retirement_race_checks(model, lora=None, label="retirement race"):
+    srv = env.Server(model, race_server_args(lora))
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        print(f"skip {label} on {os.path.basename(model)}: {e}")
+        return True
+    if not env.supports_letter_labels(srv):
+        srv.stop()
+        print(f"skip {label} on {os.path.basename(model)}: no usable answer labels")
+        return True
+
+    def prefill(slot):
+        env.prefill_slot(srv, slot, env.LETTER_SYSTEM, "State:\n" + RACE_EVIDENCE + "\n")
+
+    def decide(sid):
+        return srv.post("/v1/decision", json.dumps(dict(env.DECISION_VALID, session_id=sid)))
+
+    def create(slot):
+        return srv.post("/v1/session", json.dumps({"id_slot": slot, "instance": "main"}))
+
+    def session(sid):
+        status, text = env.http("GET", f"http://127.0.0.1:{srv.port}/v1/session/{sid}")
+        env.check(status == 200, f"{label}: the raced reference is gone: {status} {text[:200]}")
+        return json.loads(text)
+
+    def counters(sid):
+        return session(sid)["counters"]
+
+    # the slot the in-flight decisions hold, and one with nothing in flight for the control group
+    raced, control = 0, 1
+    if lora is not None:
+        # an adapter-scoped reference on its own slot: the entry holds a pool-owned ref, which is
+        # what a premature retirement would free underneath the running decode
+        raced, control = 2, 3
+
+    try:
+        # the chat instance is built by the first prefill, which the pool's adapter write requires:
+        # writing to an unbuilt window has no context to apply the scale to
+        prefill(raced)
+        if lora is not None:
+            status, text = srv.post("/lora-adapters", json.dumps([{"id": 0, "scale": 1.0}]))
+            env.check(status == 200, f"{label}: adapter scale status {status}: {text[:200]}")
+
+        status, text = create(raced)
+        env.check(status == 200, f"{label}: session create status {status}: {text[:200]}")
+        sid = json.loads(text)["session_id"]
+        if lora is not None:
+            env.check(session(sid).get("captured") is True,
+                      f"{label}: the adapter-scoped reference captured the completed turn")
+
+        # the adapter is detached before the race: the entry's ref is then the only thing keeping
+        # the pool's adapter alive, so releasing it early is observable rather than latent
+        if lora is not None:
+            status, text = srv.post("/lora-adapters", json.dumps([{"id": 0, "scale": 0.0}]))
+            env.check(status == 200, f"{label}: adapter detach status {status}: {text[:200]}")
+
+        before = counters(sid)
+        stamped = session(sid)["last_used_ms"]
+
+        outs = {}
+
+        def run_leased(i):
+            outs[i] = decide(sid)
+
+        threads = [threading.Thread(target=run_leased, args=(i,)) for i in range(RACE_DECISIONS)]
+        for t in threads:
+            t.start()
+        deadline = time.time() + 60.0
+        while time.time() < deadline and any(t.is_alive() for t in threads):
+            if (session(sid)["last_used_ms"] or 0) > stamped:
+                break
+            time.sleep(0.005)
+        env.check(any(t.is_alive() for t in threads) and (session(sid)["last_used_ms"] or 0) > stamped,
+                  f"{label}: the decisions hold their lease: stamped {stamped}, now "
+                  f"{session(sid)['last_used_ms']}, alive {[t.is_alive() for t in threads]}, "
+                  f"out {list(outs.values())}")
+
+        # positive, MUST refuse: replacing a reference an in-flight decision holds would free the
+        # memory that decision is reading. The refusal names the reader so the client can retry.
+        status, text = create(raced)
+        env.check(status == 422, f"{label}: a create racing an in-flight decision is a 422: {status} {text[:200]}")
+        env.check("in-flight" in text, f"{label}: the 422 names the in-flight decision: {text[:200]}")
+
+        # the reference is intact and the store has not grown: the refused create captured nothing
+        mid = counters(sid)
+        env.check(mid["n_sessions"] == before["n_sessions"],
+                  f"{label}: a refused create does not grow the store: {before} -> {mid}")
+        env.check(mid["bytes_total"] == before["bytes_total"],
+                  f"{label}: a refused create does not change the charged bytes: {before} -> {mid}")
+        env.check(mid["n_snapshots"] == before["n_snapshots"],
+                  f"{label}: a refused create captures nothing: {before} -> {mid}")
+
+        # control group: the same create against a slot with no in-flight decision must succeed,
+        # which is what proves the new gate is scoped to the raced slot and fires no spuriously
+        prefill(control)
+        status, text = create(control)
+        env.check(status == 200, f"{label}: the uncontended create status {status}: {text[:200]}")
+        control_sid = json.loads(text)["session_id"]
+        control_counters = counters(control_sid)
+        env.check(control_counters["n_snapshots"] == before["n_snapshots"] + 1,
+                  f"{label}: the uncontended create captured once: {before} -> {control_counters}")
+        env.check(control_counters["n_sessions"] == before["n_sessions"] + 1,
+                  f"{label}: the uncontended create added one reference: {control_counters}")
+
+        for t in threads:
+            t.join()
+        env.check(all(outs[i][0] == 200 for i in outs),
+                  f"{label}: every raced decision answered from its own snapshot copy: {outs}")
+
+        # steady state: the control reference is erased and the store is exactly what it was. A
+        # stranded lease shows up here as a reference that never goes away and bytes that never drop.
+        status, text = env.http("DELETE", f"http://127.0.0.1:{srv.port}/v1/session/{control_sid}")
+        env.check(status == 200, f"{label}: control erase status {status}: {text[:200]}")
+        after = counters(sid)
+        env.check(after["n_sessions"] == before["n_sessions"],
+                  f"{label}: the store is back to its pre-race size: {before} -> {after}")
+        env.check(after["bytes_total"] == before["bytes_total"],
+                  f"{label}: the store is back to its pre-race bytes: {before} -> {after}")
+        env.check(after["n_releases"] == before["n_releases"] + 1,
+                  f"{label}: only the explicit erase released a reference: {before} -> {after}")
+
+        print(f"{label}: a create racing an in-flight decision on the same slot was refused 422, the "
+              f"uncontended create on another slot succeeded, and the store returned to "
+              f"{after['n_sessions']} reference(s) / {after['bytes_total']} bytes on "
+              f"{os.path.basename(model)}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL: {label}: {e}")
+        return False
+    finally:
+        srv.stop()
+
+
+# A bounded drain of a dispatched decision must fail CLOSED. The drain's only job is to prove the
+# reader is finished, so when the sidecar scheduler cannot be observed in time the lease, the
+# entry's adapter references and the transient snapshot key are all kept: an unobserved task is
+# indistinguishable from a running one. The observable outcome is a retained reference - still
+# reported, still charged, still erasable - instead of memory a decode may still be reading.
+#
+# The expiry branch is driven by an environment override of the budget, because it is otherwise
+# unreachable on a healthy server: the recorded p99.9 of the drain is seconds, not minutes. What
+# forces it is the workload the drain tail comes from in the first place - concurrent decisions on
+# one session, whose drains queue behind their siblings on the single sidecar scheduler thread. The
+# sidecar is given few decision sequences on purpose, so those siblings cannot all be batched into
+# one pass and the queue behind a drain is seconds rather than milliseconds. The scheduler is only
+# ever observed at its one-second poll boundary, so a drain under that would still succeed.
+#
+# The control group is the same workload at the shipped budget, where every drain is observed and
+# the reference is therefore reapable again. One scenario reaps it, the other cannot, and that
+# difference is the whole claim: the lease was held in exactly one of them.
+# A negative budget is the fail-closed sentinel: the drain never observes the scheduler, so the
+# worker retries, gives up and keeps the lease. The old positive value (1 ms) relied on the drain
+# racing a busy scheduler, which asynchronous release no longer guarantees.
+DRAIN_OVERRIDE_MS = -1
+DRAIN_DECISIONS = 16
+DRAIN_SEQUENCES = 3
+DRAIN_QUEUE_CAP = 32
+DRAIN_TTL_MS = 900
+DRAIN_QUESTIONS = 32
+DRAIN_EVIDENCE = "The drain evidence sentence. " * 150
+
+
+def drain_server_args():
+    # --decision-seqs is repeated on purpose: the last one wins, and three sequences are what force
+    # the sidecar to decode the concurrent siblings in waves instead of one batch
+    return ["--instance", "main:ctx=8192:parallel=4:default",
+            "--decision-sidecar-ctx", "16384", "--decision-seqs", str(DRAIN_SEQUENCES),
+            "--slots", "--jinja", "--slot-save-path", tempfile.mkdtemp()]
+
+
+def drain_decision_body(sid):
+    body = dict(env.DECISION_VALID, state=DRAIN_EVIDENCE, session_id=sid)
+    for i in range(DRAIN_QUESTIONS):
+        body["questions"]["d%02d" % i] = {
+            "type": "score", "instructions": "Rate aspect %d of the evidence." % i,
+            "criteria": ["bad", "poor", "ok", "good", "great"]}
+    return body
+
+
+def _fire_drain_storm(srv, body, n):
+    """Fire `n` concurrent decisions on one session and return {index: (status, elapsed_ms)}.
+
+    The elapsed time is what the client saw. It is the measurement the release-lag check reads: a
+    response must not carry the post-dispatch drain tail.
+    """
+    out = {}
+
+    def decide(i):
+        t0 = time.time()
+        status, _ = srv.post("/v1/decision", json.dumps(body))
+        out[i] = (status, (time.time() - t0) * 1000.0)
+
+    threads = [threading.Thread(target=decide, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+# how long the release worker is given to settle a storm before a check calls it stuck. The worker
+# only does executor work per job, so a normal storm settles in well under this.
+RELEASE_SETTLE_S = 30.0
+
+# How long an operator erase is given to be seen waking the worker's parked releases. It must be far
+# below the parked retry period (60 s) or the assertion below could pass without the wake.
+RELEASE_WAKE_S = 5.0
+
+
+def _await_counters(srv, sid, ready, timeout=RELEASE_SETTLE_S):
+    """Poll one session's counters until `ready(counters)` holds; return the last counters seen.
+
+    The release worker runs after the responses, so every property this file asserts about the
+    eventual release state is a poll, not an immediate read. `ready` receives the `counters` object
+    of `GET /v1/session/{id}`, which carries the session store's own counters plus the release
+    worker's `release` block.
+    """
+    url = f"http://127.0.0.1:{srv.port}/v1/session/{sid}"
+    deadline = time.time() + timeout
+    counters = None
+    while True:
+        status, text = env.http("GET", url)
+        counters = json.loads(text)["counters"] if status == 200 else None
+        if counters is not None and ready(counters):
+            return counters
+        if time.time() >= deadline:
+            return counters
+        time.sleep(0.05)
+
+
+def _released_all(n):
+    """Settled once every lease the storm took has left the worker, released or retained."""
+    return lambda c: (c["release"]["jobs"] + c["release"]["retained"] + c["release"]["inline"]) >= n
+
+
+def _drain_scenario(model, label, overrides):
+    """One drain scenario.
+
+    Returns {"survived_reap": bool, "expiries": int, "skip": reason or None, "counters_before":
+    baseline, "counters_after": the counters read the moment the responses returned, "counters_done":
+    the counters once the worker has settled}. Raises on a failed assertion, so the caller decides
+    how a failure is reported.
+    """
+    log_dir = tempfile.mkdtemp()
+    log_path = os.path.join(log_dir, "server.log")
+    full = dict(overrides)
+    full["LLAMA_DECISION_MAX_QUEUE"] = str(DRAIN_QUEUE_CAP)
+    # this scenario is about the drain, not the decision deadline: the storm is deliberately larger
+    # than a default deadline wants to be judged against
+    full["LLAMA_DECISION_TIMEOUT_MS"] = "600000"
+    srv = env.Server(model, drain_server_args(), env_overrides=full, log_path=log_path)
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        return {"skip": f"server did not start on {os.path.basename(model)}: {e}", "survived_reap": None,
+                "expiries": 0, "counters_after": None, "counters_before": None, "counters_done": None}
+    if not env.supports_letter_labels(srv):
+        srv.stop()
+        return {"skip": f"no usable answer labels on {os.path.basename(model)}", "survived_reap": None,
+                "expiries": 0, "counters_after": None, "counters_before": None, "counters_done": None}
+
+    def get_session(sid):
+        return env.http("GET", f"http://127.0.0.1:{srv.port}/v1/session/{sid}")
+
+    def expiries_logged():
+        with open(log_path, "r", errors="replace") as f:
+            return [line for line in f if "exceeded its" in line and "ms budget" in line]
+
+    try:
+        env.prefill_slot(srv, 1, env.LETTER_SYSTEM, "State:\n" + DRAIN_EVIDENCE + "\n")
+        status, text = srv.post("/v1/session", json.dumps(
+            {"id_slot": 1, "instance": "main", "policy": {"ttl_ms": DRAIN_TTL_MS}}))
+        env.check(status == 200, f"{label}: session create status {status}: {text[:200]}")
+        sid = json.loads(text)["session_id"]
+        before = json.loads(get_session(sid)[1])
+        body = drain_decision_body(sid)
+
+        outs = _fire_drain_storm(srv, body, DRAIN_DECISIONS)
+        env.check(all(outs[i][0] == 200 for i in outs),
+                  f"{label}: every decision answered before its drain: "
+                  f"{sorted(outs[i][0] for i in outs)}")
+
+        # the counter snapshot taken right after the responses. The transient pending count is the
+        # observable that the answer was returned before its release: with the fail-closed sentinel
+        # the drain can never complete, so a nonzero count proves the response did not wait for it.
+        counters_after = json.loads(get_session(sid)[1])["counters"]
+        # ... and the same counters once the worker has taken every lease the storm took. Every
+        # property of the eventual state is read here, because release is asynchronous.
+        counters_done = _await_counters(srv, sid, _released_all(DRAIN_DECISIONS))
+
+        # a resolve stamps last_used_ms, so the ttl horizon starts at the last decision
+        time.sleep(DRAIN_TTL_MS / 1000.0 + 0.4)
+        # the reaper runs from the create point, which is the only trigger this scenario needs
+        env.prefill_slot(srv, 2, env.LETTER_SYSTEM, "State:\nreaper trigger\n")
+        status, text = srv.post("/v1/session", json.dumps(
+            {"id_slot": 2, "instance": "main", "policy": {"ttl_ms": DRAIN_TTL_MS * 10}}))
+        env.check(status == 200, f"{label}: reaper trigger create status {status}: {text[:200]}")
+        trigger_sid = json.loads(text)["session_id"]
+        trigger = json.loads(get_session(trigger_sid)[1])
+
+        survived = get_session(sid)[0] == 200
+        if survived:
+            kept = json.loads(get_session(sid)[1])
+            env.check(kept["bytes"] > 0, f"{label}: the retained reference still reports its bytes: {kept}")
+            env.check(kept["counters"]["bytes_total"] >= kept["bytes"],
+                      f"{label}: the retained reference is still charged: {kept}")
+            # an operator can always clear it, which is what makes a retained reference safe
+            status, text = env.http("DELETE", f"http://127.0.0.1:{srv.port}/v1/session/{sid}")
+            env.check(status == 200, f"{label}: a retained reference is erasable: {status} {text[:160]}")
+            env.check(get_session(sid)[0] == 404, f"{label}: the erase took effect")
+            # The erase wakes the parked releases instead of leaving them on the long interval. The
+            # parked retry period is 60 s and this assert fires within 5 s, so the growth in retries
+            # can only be the wake DELETE performed - and it must release nothing here, because the
+            # sentinel still makes the scheduler unobservable.
+            before_wake = counters_done["release"]
+            woken = _await_counters(srv, trigger_sid,
+                                    lambda c: c["release"]["retries"] >= before_wake["retries"] + DRAIN_DECISIONS,
+                                    timeout=RELEASE_WAKE_S)
+            env.check(woken["release"]["retries"] >= before_wake["retries"] + DRAIN_DECISIONS,
+                      f"{label}: an operator erase wakes every parked release: {before_wake} -> "
+                      f"{woken['release']}")
+            env.check(woken["n_pending"] == counters_done["n_pending"]
+                      and woken["release"]["bytes_pending"] == counters_done["release"]["bytes_pending"]
+                      and woken["release"]["jobs"] == counters_done["release"]["jobs"],
+                      f"{label}: a wake that still cannot observe the scheduler releases nothing: "
+                      f"{woken}")
+        else:
+            # the reference left the store through the normal expiry path, so the counters moved
+            live = json.loads(get_session(trigger_sid)[1])
+            env.check(live["counters"]["n_releases"] >= before["counters"]["n_releases"] + 1,
+                      f"{label}: the expiry released a reference: {before['counters']} -> "
+                      f"{live['counters']}")
+
+        # the store does not grow: this scenario created two references, so once the storm's one is
+        # gone the store holds exactly the trigger's, in live count and in charged bytes. This is the
+        # same assertion in both branches, and it is what keeps a fail-closed drain from being a leak
+        # rather than a retained-but-clearable reference.
+        empty = json.loads(get_session(trigger_sid)[1])
+        env.check(empty["counters"]["n_sessions"] == 1 and empty["counters"]["bytes_total"] == trigger["bytes"],
+                  f"{label}: the store holds only the untouched reference: {empty['counters']} "
+                  f"(trigger {trigger['bytes']} bytes)")
+        if survived:
+            # a retained lease keeps its transient resolve key, and no request clears it: the erase
+            # above removed the reference, not the snapshot the retained job still points at. This
+            # pins the documented behavior (API.md 2.4) rather than the wishful one - if this ever
+            # goes to zero, the doc and the byte accounting move with it.
+            env.check(empty["counters"]["n_pending"] == counters_done["n_pending"] > 0
+                      and empty["counters"]["release"]["bytes_pending"] == counters_done["release"]["bytes_pending"],
+                      f"{label}: a retained snapshot outlives the erase of its reference: "
+                      f"{empty['counters']['n_pending']} key(s), "
+                      f"{empty['counters']['release']['bytes_pending']} byte(s)")
+        else:
+            # the control group: the same erase with no retained lease leaves nothing behind
+            env.check(empty["counters"]["n_pending"] == 0
+                      and empty["counters"]["release"]["bytes_pending"] == 0,
+                      f"{label}: a released storm leaves no transient state behind: {empty['counters']}")
+        status, text = env.http("DELETE", f"http://127.0.0.1:{srv.port}/v1/session/{trigger_sid}")
+        env.check(status == 200, f"{label}: the trigger reference is erasable: {status} {text[:160]}")
+        env.check(get_session(trigger_sid)[0] == 404, f"{label}: the last erase took effect")
+
+        return {"survived_reap": survived, "expiries": len(expiries_logged()), "skip": None,
+                "counters_after": counters_after, "counters_before": before["counters"],
+                "counters_done": counters_done}
+    finally:
+        srv.stop()
+
+
+def run_drain_fail_closed_checks(model):
+    try:
+        # positive, MUST retain: the budget is shorter than any drain this workload can produce, so
+        # the drains that have siblings behind them expire and the reference keeps its lease.
+        forced = _drain_scenario(model, "drain fail-closed",
+                                 {"LLAMA_DECISION_SCHEDULER_ACK_BUDGET_MS": str(DRAIN_OVERRIDE_MS)})
+        if forced["skip"]:
+            print(f"skip drain fail-closed: {forced['skip']}")
+            return True
+        env.check(forced["expiries"] > 0,
+                  "an unobservable drain is reported at error level, so an operator can see it")
+        env.check(forced["survived_reap"] is True,
+                  "a drain that could not be observed retains the reference instead of releasing it")
+        # the response returned before its release: the sentinel makes the drain unobservable, so a
+        # nonzero pending count at the moment the responses returned proves the client was not held
+        # for the post-dispatch drain.
+        env.check(forced["counters_after"] is not None and forced["counters_after"]["n_pending"] > 0,
+                  f"a decision response returns while its drain is still queued: {forced['counters_after']}")
+        # the fail-closed outcome is accounted, not only logged: every lease the storm took is
+        # retained, and the bytes its snapshot still holds stay on the pending gauge, so the leak is
+        # measurable from the status endpoint.
+        forced_rel = forced["counters_done"]["release"]
+        env.check(forced_rel["retained"] == DRAIN_DECISIONS,
+                  f"an unobservable drain retains every lease it took: {forced_rel}")
+        env.check(forced_rel["jobs"] == 0 and forced_rel["bytes_pending"] > 0,
+                  f"a retained lease still holds its snapshot bytes: {forced_rel}")
+
+        # control group, MUST release: the same workload at the shipped budget drains normally, so
+        # the lease is dropped and the expired reference is a victim again.
+        control = _drain_scenario(model, "drain control", {})
+        if control["skip"]:
+            print(f"skip drain control: {control['skip']}")
+            return True
+        env.check(control["expiries"] == 0,
+                  f"the shipped budget observes every drain: {control['expiries']} expiries logged")
+        env.check(control["survived_reap"] is False,
+                  "the shipped budget drops the lease, so the expired reference is reaped")
+        # the calibration's control group: at the shipped budget a drain is observed on its first
+        # attempt, so the retry ladder and the retention cap must never fire. If either does, the
+        # budget is mistuned and this fails rather than silently absorbing a regression.
+        control_rel = control["counters_done"]["release"]
+        env.check(control_rel["retries"] == 0,
+                  f"the shipped budget never retries a drain: {control_rel}")
+        env.check(control_rel["retained"] == 0,
+                  f"the shipped budget retains nothing: {control_rel}")
+        env.check(control_rel["jobs"] == DRAIN_DECISIONS,
+                  f"the worker released every lease the storm took: {control_rel}")
+        env.check(control_rel["inline"] == 0,
+                  f"the release queue absorbed every lease without the inline fallback: {control_rel}")
+        env.check(control_rel["bytes_pending"] == 0,
+                  f"no snapshot bytes are held once the worker has caught up: {control_rel}")
+        # the transient resolve map is back at its pre-request size, which is the stranded-lease fix:
+        # a released decision leaves nothing behind for the store to hold until restart.
+        env.check(control["counters_done"]["n_pending"] == control["counters_before"]["n_pending"],
+                  f"the transient resolve map returned to its baseline: "
+                  f"{control['counters_before']} -> {control['counters_done']}")
+        env.check(control["counters_done"]["n_sessions"] == control["counters_before"]["n_sessions"],
+                  f"a successful storm does not grow the store: "
+                  f"{control['counters_before']} -> {control['counters_done']}")
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL: drain fail-closed checks: {e}")
+        return False
+    print(f"drain fail-closed on {os.path.basename(model)}: unobservable drain retained "
+          f"{forced_rel['retained']} lease(s) after {forced_rel['retries']} retries, holding "
+          f"{forced_rel['bytes_pending']}/{forced_rel['bytes_high']} pending byte(s) at queue depth "
+          f"{forced_rel['queue_high']}; the shipped budget released {control_rel['jobs']} with "
+          f"{control_rel['retries']} retries, {control_rel['retained']} retained, "
+          f"{control_rel['inline']} inline, queue depth {control_rel['queue_high']}, "
+          f"peak {control_rel['bytes_high']} pending byte(s)")
+    return True
+
+
+# A session decision answer must not carry the post-dispatch drain tail. The shipped budget is
+# 30000 ms, so a response that waited the full drain cannot come in under it. This is a sanity
+# ceiling, not the primary evidence: the storm's own compute can dominate the response time. The
+# primary evidence is the pending count below, which is nonzero right after the responses only
+# because the release still runs after them. An inline release would have drained and erased before
+# returning, leaving the count at zero.
+ASYNC_RESPONSE_MS = 30000
+
+
+def run_async_release_checks(model):
+    """A session decision returns before its drain, and the release worker eventually erases the
+    transient key. Both are task-value liveness properties; neither reads a producer-concentration
+    number."""
+    log_dir = tempfile.mkdtemp()
+    log_path = os.path.join(log_dir, "server.log")
+    srv = env.Server(model, drain_server_args(), env_overrides={
+        "LLAMA_DECISION_MAX_QUEUE": str(DRAIN_QUEUE_CAP),
+        # this check is about the drain, not the decision deadline
+        "LLAMA_DECISION_TIMEOUT_MS": "600000",
+    }, log_path=log_path)
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.stop()
+        print(f"skip async release: server did not start on {os.path.basename(model)}: {e}")
+        return True
+    try:
+        if not env.supports_letter_labels(srv):
+            print(f"skip async release: no usable answer labels on {os.path.basename(model)}")
+            return True
+        env.prefill_slot(srv, 1, env.LETTER_SYSTEM, "State:\n" + DRAIN_EVIDENCE + "\n")
+        status, text = srv.post("/v1/session", json.dumps({"id_slot": 1, "instance": "main"}))
+        env.check(status == 200, f"async release: session create status {status}: {text[:200]}")
+        sid = json.loads(text)["session_id"]
+        before = json.loads(env.http("GET", f"http://127.0.0.1:{srv.port}/v1/session/{sid}")[1])["counters"]
+        body = drain_decision_body(sid)
+
+        outs = _fire_drain_storm(srv, body, DRAIN_DECISIONS)
+        env.check(all(outs[i][0] == 200 for i in outs),
+                  f"async release: every decision answered: {sorted(outs[i][0] for i in outs)}")
+        max_ms = max(ms for _, ms in outs.values())
+        env.check(max_ms < ASYNC_RESPONSE_MS,
+                  f"a session decision does not carry the drain tail: max {max_ms:.0f} ms")
+
+        # The release worker catches up and erases the transient keys. Under the shipped budget the
+        # drain is observed, so the reference returns to an unleased state: n_pending drops back to
+        # its pre-storm value while the reference itself stays, because its turn has not advanced. A
+        # key that never clears is the stranded lease this milestone removes.
+        settled = _await_counters(srv, sid, _released_all(DRAIN_DECISIONS))
+        env.check(settled is not None and settled["n_pending"] == before["n_pending"],
+                  f"the release worker erased the transient keys back to the baseline: "
+                  f"{before['n_pending']} -> {settled and settled['n_pending']}")
+        # the store holds the same one reference it held before the storm
+        env.check(settled is not None and settled["n_sessions"] == before["n_sessions"]
+                  and settled["bytes_total"] == before["bytes_total"],
+                  f"a successful storm neither grows nor shrinks the store: "
+                  f"{before} -> {settled}")
+        # the calibration's control group: the shipped budget observes every drain on the first
+        # attempt, so nothing is retried, nothing is retained and the queue never overflows into the
+        # inline fallback. A regression here is a mistuned budget, and this is where it surfaces.
+        rel = settled["release"]
+        env.check(rel["retries"] == 0 and rel["retained"] == 0 and rel["inline"] == 0,
+                  f"the shipped budget retries and retains nothing: {rel}")
+        env.check(rel["jobs"] == DRAIN_DECISIONS,
+                  f"the worker released every lease the storm took: {rel}")
+        env.check(rel["bytes_pending"] == 0,
+                  f"no snapshot bytes are held once the worker has caught up: {rel}")
+    finally:
+        srv.stop()
+    print(f"async release: {DRAIN_DECISIONS} decisions returned under the drain budget while the "
+          f"release worker cleared the transient keys on {os.path.basename(model)} "
+          f"(jobs {rel['jobs']}, retries {rel['retries']}, retained {rel['retained']}, "
+          f"inline {rel['inline']}, queue_high {rel['queue_high']}, bytes_high {rel['bytes_high']})")
+    return True
+
+
 def main():
     if not os.path.isfile(env.SERVER_BIN):
         print(f"SKIP: server binary not found at {env.SERVER_BIN}")
@@ -1015,6 +1534,20 @@ def main():
             return 1
         if not run_byte_budget_checks(model):
             return 1
+        if not run_retirement_race_checks(model):
+            return 1
+        if not run_drain_fail_closed_checks(model):
+            return 1
+        if not run_async_release_checks(model):
+            return 1
+        # adapter-lifetime regression: the entry's pool-owned adapter ref is the only thing keeping
+        # the adapter alive here, so a premature retirement is a use-after-free rather than a leak.
+        # Run it against build-asan when that build is configured; otherwise it is still a check.
+        lora_path = env.build_test_lora(model)
+        if lora_path is not None:
+            if not run_retirement_race_checks(model, lora=lora_path,
+                                              label="adapter-lifetime retirement race"):
+                return 1
     return 0
 
 

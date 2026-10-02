@@ -250,7 +250,8 @@ Guaranteed:
   written by a decision, and a decision never decodes on the slot's context.
 - Admission bounds concurrent decisions, not their duration: 413 (body too
   large), 429 / 529 (queue full), 499 (client cancel), 503 + `Retry-After`
-  (server-side deadline via `--decision-timeout-ms`), 422 (over-budget or
+  (server-side deadline via `--decision-timeout-ms`, or a pool transient),
+  422 (over-budget or
   semantically invalid).
 - Chat and decisions **run concurrently on separate contexts** rather than
   serializing. The cost is device contention, which is measurable; the old
@@ -328,7 +329,7 @@ that sit on top of these.
 | `--decision-sidecar-ctx N` | 0 | sidecar window size; 0 means the largest configured instance window, so the longest turn a chat instance can produce still replays |
 | `--decision-sidecar-prebuild` | off | build the sidecar context at startup instead of on the first decision |
 | `--decision-max-queue N` | 4 | concurrent decision cap; past it 429, past twice it 529 |
-| `--decision-timeout-ms N` | 0 (none) | server-side deadline for a whole decision; on expiry 503 + `Retry-After`, never a partial answer |
+| `--decision-timeout-ms N` | 60000 | server-side deadline for a whole decision, calibrated as `max(30 s, 4x p99 cold-prefill)` on the reference GPU; on expiry 503 + `Retry-After`, never a partial answer. `0` disables it |
 | `--decision-warm-budget-mb N` | 0 (off) | KV budget for the sidecar's resident session warm prefixes. With a positive budget the sidecar keeps recent session turns resident and forks them on a repeat instead of re-prefilling. A hit answers the same winner and option set as a miss on every model; on a recurrent or hybrid model the host-state restore can move the reported concentration by up to ~0.05, which is the documented repeatability rule, never the answer. A warm fork is admitted only if its peak fits beside every *other* resident prefix; one that does not is a 422 before the cache is touched |
 | `--decision-session-ttl MS` | 0 (no expiry) | default TTL for created sessions. A **reaper**, not a read filter: it runs at the create and resolve points, never from a timer thread |
 | `--decision-session-budget-mb N` | 0 (unlimited) | byte budget for the sidecar's owned token snapshots. Pressure evicts the least-recently-used unpinned, unleased reference and retries; a create is refused only when every remaining reference is pinned or in flight. The unit is mebibytes of token bytes, so the smallest expressible budget is 1 MiB = 262144 tokens |
@@ -387,8 +388,10 @@ artifacts that own a number, and the known upstream failure in
 - Other instances stay within their undisturbed latency under decision load.
 - Master-vs-branch default path stays identical: with `--decision-seqs` and
   `--instance` absent, `/props`, chat output, and `n_seq_max` match master; the
-  only divergence is `/v1/decision` returning 400 "decisions are disabled"
-  instead of master's 404.
+  only divergence is `/v1/decision` returning 501 "decisions are disabled"
+  (`DECISION_DISABLED_MESSAGE`, `ERROR_TYPE_NOT_SUPPORTED`) instead of master's
+  404. `DECISION_DISABLED_MESSAGE` (`tools/server/server-common.h`) is the single
+  source of the refusal wording; the pool and a single-context server both read it.
 
 ### 8.3 Interpreting memory
 

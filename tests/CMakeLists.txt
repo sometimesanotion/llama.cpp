@@ -303,6 +303,25 @@ if (Python3_Interpreter_FOUND)
         LLAMA_DECISION_TEST_BIN=$<TARGET_FILE:test-decision-engine>
         ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/parallel-decision/tests/test_temperature.py)
     set_tests_properties(test-decision-temperature PROPERTIES LABELS "temperature")
+
+    # the wire-level decision suites drive a real server, so they need its path. Without a model
+    # asset (LLAMA_SERVER_TEST_MODEL) each one exits 0 having reported a skip, which is the
+    # documented behaviour of the scripts; point that variable at a model to have them assert.
+    # the target lives in tools/, configured after tests/, so guard on the option: the
+    # $<TARGET_FILE:...> generator expression resolves at generate time
+    if (LLAMA_BUILD_SERVER)
+        foreach (suite accuracy admission agentic envelope generic session_concurrency systemone)
+            add_test(NAME test-decision-py-${suite} COMMAND ${CMAKE_COMMAND} -E env
+                LLAMA_SERVER_BIN=$<TARGET_FILE:llama-server>
+                LLAMA_SERVER_BIN_PATH=$<TARGET_FILE:llama-server>
+                ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/server/tests/test_decision_${suite}.py)
+            # one GPU and one server port per suite: serialize so a parallel ctest run cannot
+            # interleave two model loads or collide on a port
+            set_tests_properties(test-decision-py-${suite} PROPERTIES
+                LABELS "decision"
+                RESOURCE_LOCK decision_server)
+        endforeach()
+    endif()
 endif()
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)

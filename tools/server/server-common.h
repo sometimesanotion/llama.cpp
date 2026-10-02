@@ -117,15 +117,21 @@ json format_error_response(const std::string & message, const enum error_type ty
 // of re-parsing a rendered body, so the class -> status mapping stays in one place.
 int error_status(const enum error_type type);
 
-// The strict-Jev decision route. /v1/decision is the superset and also serves the generic `schema`
-// shape; this one serves the Jev contract alone, so a `schema` body is refused there.
-static const char * const DECISION_JEV_PATH = "/v1/systemone";
-
-// The request mark DECISION_JEV_PATH sets to pin the Jev contract. It travels in the body, the way
-// the pool's `__decision_snapshot_key` does, so one decision handler serves both routes through
-// whichever dispatcher is installed: the pool's, or the single context's own. A client can only
-// make a request stricter by sending the mark itself, never looser.
+// The mark that pins the Jev contract on a decision request, which is what makes a `schema` body a
+// 400 on the strict route. The server sets it for a request that arrived on that route; a client
+// may set it to make its own request stricter, never looser. It travels in the body, the way the
+// pool's `__decision_snapshot_key` does, so one decision handler serves both routes through
+// whichever dispatcher is installed: the pool's, or the single context's own. Which route was
+// invoked is decided by the route binding, never by comparing the request path, because a
+// deployment chooses the mount point and the contract must not depend on it.
 static const char * const DECISION_JEV_ONLY_KEY = "__decision_jev_only";
+
+// The refusal for a decision route on a server with no decision executor. The pool and a
+// single-context server each build their own response and cannot call into each other, so the
+// wording lives here and both read it; a client must not see two different explanations for the
+// same condition.
+static const char * const DECISION_DISABLED_MESSAGE =
+    "decisions are disabled: start the server with --decision-seqs N (N >= 3)";
 
 // The default decision request body cap, in bytes, when LLAMA_DECISION_MAX_BODY does not override
 // it. 2 MiB matches openjev-sglang and is ample for an evidence document; raise it deliberately.

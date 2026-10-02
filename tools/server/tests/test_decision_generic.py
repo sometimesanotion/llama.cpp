@@ -479,12 +479,183 @@ def run_checks(server):
         env.check("turn" in text, f"the refusal names turn: {text[:160]}")
 
 
+# The envelope key set, i.e. everything outside the answer records themselves. Both front-ends answer
+# through one envelope, so a caller switching a field from a Jev primitive to a typed schema sees
+# the answer's shape change and nothing else move. This is the superset claim, spelled out as a key
+# comparison rather than prose.
+def envelope_keys(doc):
+    keys = set(doc)
+    keys.discard("answers")
+    return keys
+
+
+# The Jev questions that mean the same thing as `SYM_SCHEMA` below, so the two shapes can be asked
+# the same question about the same evidence and their envelopes compared.
+SYM_QUESTIONS = {
+    "severity": {"type": "choice", "instructions": "incident severity",
+                 "criteria": {"low": "low", "medium": "medium", "high": "high"}},
+    "count": {"type": "score", "instructions": "affected rows",
+              "criteria": ["0", "1", "2", "3"]},
+}
+
+SYM_SCHEMA = {
+    "severity": {"type": "enum", "description": "incident severity", "enum": ["low", "medium", "high"]},
+    "count": {"type": "integer", "description": "affected rows", "minimum": 0, "maximum": 3},
+}
+
+
+def run_envelope_checks(server):
+    """The generic shape reports the same envelope as the Jev shape, not a thinner one.
+
+    The answer records genuinely differ - a typed `value` over a field's value space instead of a
+    Jev `choice`/`score` - and that difference is the feature. Everything around them is identical
+    work that both front-ends must report identically, or a client using the escape hatch has to
+    accept a worse envelope than a Jev client does.
+    """
+    # 1. The opt-in diagnostics object: the same keys the Jev shape reports, and its own prompt
+    #    version, because the two shapes frame different prompts over the same engine.
+    status, text = post_schema(server, SYM_SCHEMA, diagnostics=True)
+    env.check(status == 200, f"the diagnostics status {status}: {text[:200]}")
+    if status != 200:
+        return
+    diag_doc = json.loads(text)
+    for key in ("contract_hash", "prompt_version", "prefill_ms", "scoring_ms", "suffix_tokens",
+                "common_suffix_tokens", "leaf_suffix_tokens", "label_pool_size", "permutations",
+                "adapters_configured", "adapter_scope", "model", "quantization", "template_hash",
+                "backend_flags", "token_cache_hits", "token_cache_misses"):
+        env.check(key in diag_doc["diagnostics"], f"the generic diagnostics carry {key}")
+    env.check(diag_doc["diagnostics"]["prompt_version"] == "schema-v1",
+              f"the generic readout names its own prompt version: "
+              f"{diag_doc['diagnostics'].get('prompt_version')}")
+    env.check(diag_doc["diagnostics"]["adapter_scope"] == "base",
+              "a stateless decision decodes on the base model")
+    env.check(diag_doc["diagnostics"]["suffix_tokens"] > 0,
+              f"the generic plan reports its suffix tokens: {diag_doc['diagnostics']['suffix_tokens']}")
+
+    # 2. `certainty` is additive: absent by default, present on a numeric field under diagnostics,
+    #    and equal to the winner's share of the reported distribution.
+    plain_status, plain_text = post_schema(server, SYM_SCHEMA)
+    env.check(plain_status == 200, f"the default status {plain_status}: {plain_text[:200]}")
+    if plain_status != 200:
+        return
+    plain = json.loads(plain_text)
+    env.check("certainty" not in plain["answers"]["count"],
+              "certainty is diagnostics-only on a generic field")
+    rec = diag_doc["answers"]["count"]
+    env.check("certainty" in rec, "a numeric field carries certainty under diagnostics")
+    env.check(abs(rec["certainty"] - max(rec["probabilities"].values())) < 1e-9,
+              f"certainty is the winner's share: {rec.get('certainty')} vs {rec['probabilities']}")
+
+    # 3. timings: additive with the opt-in, absent otherwise. Checked here as well as in the
+    #    structural pass above because it is the envelope, not the answer, that carries them.
+    env.check("timings" in diag_doc, "the opt-in response carries timings")
+    env.check("timings" not in plain, "the default response carries no timings")
+
+    # 4. Session symmetry: the same schema answered from a session reports the fork the Jev shape
+    #    reports for the same session. This is the check that fails before the shared envelope
+    #    exists: the generic branch had no diagnostics block and no session fields at all.
+    env.prefill_slot(server, 0, env.LETTER_SYSTEM, "State:\n" + STATE + "\n")
+    status, g_session_text = post_schema(server, SYM_SCHEMA, id_slot=0)
+    env.check(status == 200, f"the generic session status {status}: {g_session_text[:200]}")
+    jev_body = {"model": "test", "state": STATE, "questions": SYM_QUESTIONS, "id_slot": 0}
+    status, j_session_text = server.post("/v1/decision", json.dumps(jev_body))
+    env.check(status == 200, f"the Jev session status {status}: {j_session_text[:200]}")
+    if status != 200:
+        return
+    g_session = json.loads(g_session_text)
+    j_session = json.loads(j_session_text)
+    env.check(g_session.get("session_fork") is True,
+              f"a generic session decision reports its fork: {sorted(g_session)}")
+    env.check(envelope_keys(g_session) == envelope_keys(j_session),
+              f"the two shapes report the same session envelope: "
+              f"{sorted(envelope_keys(g_session))} vs {sorted(envelope_keys(j_session))}")
+    env.check(g_session["source_slot"] == j_session["source_slot"],
+              f"both shapes name the same source slot: {g_session['source_slot']} vs "
+              f"{j_session['source_slot']}")
+    env.check(g_session["session_pos"] == j_session["session_pos"],
+              f"both shapes report the same fork position: {g_session['session_pos']} vs "
+              f"{j_session['session_pos']}")
+    env.check(g_session["usage"]["output_tokens"] == 0,
+              "a generic session decision still generates nothing")
+
+    # 5. Cross-shape golden: one schema and one question set that mean the same thing, answered on
+    #    the same server, share the envelope key set outside the answer records. The default and the
+    #    opt-in are both compared, because both are gates on the same emitter.
+    for extra, label in (({}, "default"), ({"diagnostics": True}, "diagnostics")):
+        status, g_text = post_schema(server, SYM_SCHEMA, **extra)
+        jev_body = dict({"model": "test", "state": STATE, "questions": SYM_QUESTIONS}, **extra)
+        j_status, j_text = server.post("/v1/decision", json.dumps(jev_body))
+        env.check(status == 200 and j_status == 200,
+                  f"the cross-shape pair ({label}) answered: {status} {j_status}")
+        if status != 200 or j_status != 200:
+            continue
+        g_doc, j_doc = json.loads(g_text), json.loads(j_text)
+        env.check(envelope_keys(g_doc) == envelope_keys(j_doc),
+                  f"the two shapes share one {label} envelope: "
+                  f"{sorted(envelope_keys(g_doc))} vs {sorted(envelope_keys(j_doc))}")
+        env.check(g_doc["usage"]["output_tokens"] == j_doc["usage"]["output_tokens"] == 0,
+                  "both shapes report a zero output count")
+
+    # 6. One entry in a `contexts` request still answers with the `contexts` array. The key names
+    #    the request shape, not how many answers came back, and both shapes agree on that: a
+    #    single-state request answers `answers`, a `contexts` request answers `contexts`.
+    for shape, request in (("schema", body_for(SYM_SCHEMA, contexts=[STATE])),
+                           ("questions", {"model": "test", "contexts": [STATE],
+                                         "questions": SYM_QUESTIONS})):
+        status, text = server.post("/v1/decision", json.dumps(request))
+        env.check(status == 200, f"the one-context {shape} request answered: {status} {text[:160]}")
+        if status != 200:
+            continue
+        doc = json.loads(text)
+        env.check(set(doc) == {"model", "contexts"},
+                  f"a one-entry {shape} contexts request answers with the array: {sorted(doc)}")
+        env.check(len(doc["contexts"]) == 1, f"the {shape} array carries its one entry")
+
+
 def sidecar_args():
     # the sidecar executor is the default decision placement when a pool exists, so the session
     # checks below run against the configuration the branch actually deploys
     return ["--instance", "main:ctx=8192:parallel=2:default",
             "--instance", "other:ctx=512:parallel=1",
             "--slots", "--jinja", "--slot-save-path", tempfile.mkdtemp()]
+
+
+def run_prefix_checks(model):
+    """The generic shape stays on the superset route whatever the deployment mounts it under.
+
+    This is the anti-regression half of the mount-point checks: routing a request by anything
+    other than the route that was invoked can either refuse the generic shape by mistake or
+    admit it on the strict route. Only the superset may serve it.
+    """
+    schema = {"dept": {"type": "enum", "description": "owning team",
+                       "enum": ["billing", "technical"]}}
+    for prefix in ("", "/api", "/api/v1"):
+        server = env.Server(model, sidecar_args(), api_prefix=prefix)
+        try:
+            server.start()
+        except Exception as e:  # noqa: BLE001
+            server.stop()
+            print(f"skip prefix {prefix!r}: {e}")
+            return
+        try:
+            status, text = server.post(prefix + "/v1/decision", json.dumps(body_for(schema)))
+            env.check(status == 200,
+                      f"prefix {prefix!r}: the superset route serves a schema body: {status} {text[:160]}")
+            if status != 200:
+                continue
+            doc = json.loads(text)
+            env.check(set(doc) == {"model", "answers", "usage"},
+                      f"prefix {prefix!r}: the schema answer is the Jev envelope: {sorted(doc)}")
+            env.check(set(doc["answers"]) == {"dept"},
+                      f"prefix {prefix!r}: every field is answered ({sorted(doc['answers'])})")
+            check_record(doc["answers"]["dept"], ["billing", "technical"], False,
+                         f"prefix {prefix!r} dept")
+
+            status, text = server.post(prefix + "/v1/systemone", json.dumps(body_for(schema)))
+            env.check(status == 400,
+                      f"prefix {prefix!r}: the strict route still refuses a schema body: {status} {text[:160]}")
+        finally:
+            server.stop()
 
 
 def main():
@@ -521,11 +692,18 @@ def run_models(candidates):
             continue
         try:
             run_checks(server)
+            run_envelope_checks(server)
         except Exception as e:  # noqa: BLE001
             server.stop()
             print(f"FAIL: generic schema checks: {e}")
             return 1
+        # one model resident at a time: the mount-point checks each start their own server
         server.stop()
+        try:
+            run_prefix_checks(model)
+        except Exception as e:  # noqa: BLE001
+            print(f"FAIL: generic schema mount-point checks: {e}")
+            return 1
         print("decision generic schema checks passed")
         return 0
     print("SKIP: no candidate model supports letter labels; set LLAMA_SERVER_TEST_MODEL")

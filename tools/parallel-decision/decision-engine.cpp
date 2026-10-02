@@ -164,7 +164,32 @@ struct decision_field {
     }
 };
 
-} // namespace
+// A content digest of a field over (suffix, paths, temperature, use_tree), used only to bucket
+// dedup candidates: fields that share a digest are confirmed with the exact comparison, so a
+// collision costs one comparison and can never merge two different fields. fnv1a64 is the
+// project's one hash primitive.
+uint64_t field_digest(const decision_field & f) {
+    std::string buf;
+    auto        append = [&buf](const void * data, size_t n) {
+        buf.append(static_cast<const char *>(data), n);
+    };
+    if (!f.suffix.empty()) {
+        append(f.suffix.data(), f.suffix.size() * sizeof(llama_token));
+    }
+    buf.push_back('\x1f');
+    for (const auto & p : f.paths) {
+        if (!p.empty()) {
+            append(p.data(), p.size() * sizeof(llama_token));
+        }
+        buf.push_back('\x1e');
+    }
+    buf.push_back('\x1f');
+    append(&f.temperature, sizeof(float));
+    buf.push_back((char) (f.use_tree ? 1 : 0));
+    return fnv1a64(buf);
+}
+
+}  // namespace
 
 // The plan's private layout: the deduplicated fields plus the input-to-field map and the suffix
 // head that was hoisted onto the trunk. Hidden here so the trie stays an implementation detail.
@@ -442,19 +467,25 @@ void engine::check_cancel() const {
 
 tokens_t engine::tokenize(const std::string & text, bool add_special) const {
     const std::string key = (add_special ? "\x01" : "\x00") + text;
-    const auto it = token_cache_.find(key);
+    const auto        it  = token_cache_.find(key);
     if (it != token_cache_.end()) {
+        ++token_cache_hits_;
         return it->second;
     }
-    tokens_t toks = common_tokenize(vocab, text, add_special, /*parse_special=*/ true);
+    ++token_cache_misses_;
+    tokens_t          toks = common_tokenize(vocab, text, add_special, /*parse_special=*/true);
     // a chat template may already start with the BOS text; keep a single BOS
-    const llama_token bos = llama_vocab_bos(vocab);
+    const llama_token bos  = llama_vocab_bos(vocab);
     if (toks.size() >= 2 && toks[0] == bos && toks[1] == bos) {
         toks.erase(toks.begin());
     }
+    // Evict the oldest entry rather than clearing the map, so the entries that would have hit
+    // survive. A hit means the same prompt was tokenized before, never that a score was right.
     if (token_cache_.size() >= token_cache_limit_) {
-        token_cache_.clear();
+        token_cache_.erase(token_cache_order_.front());
+        token_cache_order_.pop_front();
     }
+    token_cache_order_.push_back(key);
     token_cache_.emplace(key, toks);
     return toks;
 }
@@ -776,13 +807,19 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
     std::vector<decision_field> & fields      = plan.p->fields;
     std::vector<size_t> &         field_first = plan.p->field_first;
 
-    int branches = 0; // round-1 branches of one context
+    const size_t                                      cache_hits0   = token_cache_hits_;
+    const size_t                                      cache_misses0 = token_cache_misses_;
+    // dedup candidates bucketed by content digest, so the exact comparison runs only inside a
+    // bucket: O(fields) expected instead of O(fields^2)
+    std::unordered_map<uint64_t, std::vector<size_t>> field_buckets;
+
+    int branches = 0;  // round-1 branches of one context
     for (const auto & in : inputs) {
         const size_t n = in.candidates.size();
         if (n < 1 || n > 255) {
             throw std::invalid_argument("each field needs 1-255 allowed values");
         }
-        tokens_t suffix;
+        tokens_t              suffix;
         std::vector<tokens_t> paths;
         {
             // Tokenise each complete "suffix + value + terminator" and split at the longest token
@@ -820,9 +857,11 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
         field.temperature = in.temperature;
         field.build_nodes();
         field.use_tree = opt.mode == "tree" ? true : opt.mode == "greedy" ? false : n <= opt.tree_max;
-        // exact-token dedup: identical fields (suffix, paths, temperature, mode) score once
-        size_t canon = fields.size();
-        for (size_t u = 0; u < fields.size(); ++u) {
+        // exact-token dedup: identical fields (suffix, paths, temperature, mode) score once. The
+        // digest is only a filter; the exact comparison inside the bucket is what decides.
+        size_t canon   = fields.size();
+        auto & bucket  = field_buckets[field_digest(field)];
+        for (size_t u : bucket) {
             if (fields[u].temperature == field.temperature && fields[u].use_tree == field.use_tree &&
                 fields[u].suffix == field.suffix && fields[u].paths == field.paths) {
                 canon = u;
@@ -832,6 +871,7 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
         if (canon == fields.size()) {
             branches += field.use_tree ? (int) field.node_prefix.size() : 1;
             fields.push_back(std::move(field));
+            bucket.push_back(fields.size() - 1);
         }
         field_first.push_back(canon);
     }
@@ -879,6 +919,8 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
     plan.leaf_suffix_tokens   = leaf_suffix_tokens;
     plan.rows                 = total;
     plan.branches             = branches;
+    plan.token_cache_hits     = token_cache_hits_ - cache_hits0;
+    plan.token_cache_misses   = token_cache_misses_ - cache_misses0;
     plan.p->plan_common       = std::move(plan_common);
     return plan;
 }
@@ -896,13 +938,18 @@ batch_result engine::decide_batch(const compiled_fields &          plan,
     if (plan.p == nullptr) {
         throw std::runtime_error("the decision plan is empty");
     }
-    const tokens_t shared = tokenize(shared_text, true);
+    const size_t          cache_hits0   = token_cache_hits_;
+    const size_t          cache_misses0 = token_cache_misses_;
+    const tokens_t        shared        = tokenize(shared_text, true);
     std::vector<tokens_t> prefixes;
     prefixes.reserve(contexts.size());
     for (const auto & text : contexts) {
         prefixes.push_back(tokenize(text, shared.empty()));
     }
-    return decide_batch_tokens(shared, prefixes, plan, opt);
+    batch_result out = decide_batch_tokens(shared, prefixes, plan, opt);
+    out.token_cache_hits += token_cache_hits_ - cache_hits0;
+    out.token_cache_misses += token_cache_misses_ - cache_misses0;
+    return out;
 }
 
 batch_result engine::decide_batch_tokens(const tokens_t &              shared,
@@ -948,6 +995,8 @@ batch_result engine::decide_batch_tokens(const tokens_t &              shared,
     out.suffix_tokens        = suffix_tokens;
     out.common_suffix_tokens = plan_common.size();
     out.leaf_suffix_tokens   = leaf_suffix_tokens;
+    out.token_cache_hits     = plan.token_cache_hits;
+    out.token_cache_misses   = plan.token_cache_misses;
     out.items.resize(contexts.size());
 
     size_t max_tail = 0;
@@ -1157,8 +1206,10 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     llama_synchronize(ctx);
     check_cancel();
 
+    const size_t cache_hits0   = token_cache_hits_;
+    const size_t cache_misses0 = token_cache_misses_;
     // only the plan's suffix head is left to decode: the source already carries the session text
-    tokens_t head = tokenize(tail_before_common, false);
+    tokens_t     head          = tokenize(tail_before_common, false);
     head.insert(head.end(), plan.p->plan_common.begin(), plan.p->plan_common.end());
 
     batch_result out;
@@ -1167,9 +1218,11 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     out.suffix_tokens        = plan.suffix_tokens;
     out.common_suffix_tokens = plan.common_suffix_tokens;
     out.leaf_suffix_tokens   = plan.leaf_suffix_tokens;
+    out.token_cache_hits     = plan.token_cache_hits + (token_cache_hits_ - cache_hits0);
+    out.token_cache_misses   = plan.token_cache_misses + (token_cache_misses_ - cache_misses0);
     out.items.resize(1);
 
-    const size_t max_branch = max_branch_tokens(plan);
+    const size_t max_branch  = max_branch_tokens(plan);
     // The source occupies cells up to base_pos and the trunk copies them, so the peak is the
     // source plus the head and the branch suffixes decoded above it. The source's own cells are
     // already inside that peak, so only the OTHER resident warm prefixes are subtracted from the
@@ -1208,6 +1261,29 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     run_trunk_wave(out, plan, runs, opt.bypass);
 
     return out;
+}
+
+common_json decision_usage(const batch_result & batch, size_t context_index) {
+    const size_t context_tokens = context_index < batch.items.size() ? batch.items[context_index].context_tokens : 0;
+    common_json  usage          = common_json::object();
+    usage["input_tokens"]       = (long long) (batch.shared_tokens + context_tokens);
+    usage["output_tokens"]      = 0;
+    usage["cached_tokens"]      = (long long) (batch.cache_hit ? batch.shared_tokens : 0);
+    usage["state_cache_hit"]    = batch.cache_hit;
+    return usage;
+}
+
+common_json decision_timings(const batch_result & batch) {
+    common_json timings   = common_json::object();
+    timings["prefill_ms"] = batch.prefill_ms;
+    timings["scoring_ms"] = batch.scoring_ms;
+    timings["total_ms"]   = batch.prefill_ms + batch.scoring_ms;
+    timings["rounds"]     = batch.rounds;
+    timings["rows"]       = batch.rows;
+    // the batch's wall time per context, so a multi-context request can be read per context
+    timings["per_decision_ms"] =
+        batch.items.empty() ? 0.0 : (batch.prefill_ms + batch.scoring_ms) / (double) batch.items.size();
+    return timings;
 }
 
 } // namespace llama_decision

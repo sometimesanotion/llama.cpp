@@ -790,6 +790,21 @@ struct common_params {
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
 
+// How long an HTTP thread waits for a decision-owning scheduler to acknowledge that the work it
+// posted is finished, in ms. Two waits use it: draining a dispatched session decision off the
+// sidecar executor, and capturing a slot's tokens on a chat instance's scheduler.
+//
+// It bounds the liveness of a scheduler, never an answer, so it is deliberately not a multiple of
+// decision_timeout_ms: that deadline is producer-facing and may already be spent by the time the
+// drain runs, which would make the bound expire instantly and prove nothing. Expiry here means
+// "we could not prove the reader is finished", so every path fails closed and keeps the resources
+// in question; see the call sites for what each one retains.
+//
+// Calibrated from the recorded p99.9 of the drain over stateless, session and cancelled decisions
+// plus a control group on the smallest and largest reference models; see
+// docs/decision/BENCHMARKING.md.
+constexpr int64_t DECISION_SCHEDULER_ACK_BUDGET_MS = 30000;
+
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
