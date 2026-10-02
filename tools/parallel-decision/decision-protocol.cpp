@@ -198,6 +198,20 @@ std::string canonical_type(const std::string & t) {
     return t;
 }
 
+// The `temperatures` key a question or field type reads. A type is already its own key for the Jev
+// primitives and the numeric extensions; the generic shape's other two types map onto the primitive
+// that scores them (a boolean is a binary judgement, an enum a categorical choice), so the wire's
+// five keys stay the whole vocabulary and no second per-type map exists.
+std::string temperature_type_key(const std::string & t) {
+    if (t == "boolean") {
+        return "noul";
+    }
+    if (t == "enum") {
+        return "choice";
+    }
+    return canonical_type(t);
+}
+
 // Validates a "temperatures" object: known keys only, each a number > 0. When `out` is given the
 // parsed values are stored; otherwise the object is only checked. Shared by the request parser and
 // the standalone temperature profile so the two cannot drift.
@@ -510,14 +524,19 @@ void validate_temperature_profile(const temperature_profile & profile, const tem
     }
 }
 
-double question_temperature(const decision_request & req, const decision_question & q) {
-    if (req.temperatures.is_object() && req.temperatures.contains(q.type)) {
-        const common_json & v = req.temperatures.at(q.type);
+double producer_knobs::for_type(const std::string & type) const {
+    const std::string key = temperature_type_key(type);
+    if (temperatures.is_object() && temperatures.contains(key)) {
+        const common_json & v = temperatures.at(key);
         if (v.is_number()) {
             return v.get<double>();
         }
     }
-    return req.temperature;
+    return temperature;
+}
+
+double question_temperature(const decision_request & req, const decision_question & q) {
+    return req.envelope.knobs.for_type(q.type);
 }
 
 session_ref parse_session_ref(const common_json & body) {
@@ -540,7 +559,8 @@ session_ref parse_session_ref(const common_json & body) {
         if (*slot < 0) {
             throw semantic_error("id_slot must be >= 0");
         }
-        ref.id_slot = (int) *slot;
+        // the slot number itself is the pool's to resolve from the body; here it only marks a
+        // session reference as present
         ref.present = true;
     }
     if (const std::optional<long long> pos = read_integer(body, "session_pos")) {
@@ -615,103 +635,135 @@ std::vector<numeric_grid_value> numeric_grid(double lo, double hi, double step) 
     return out;
 }
 
-decision_request parse_decision_request(const common_json & body) {
+request_shape select_request_shape(const common_json & body) {
     if (!body.is_object()) {
-        throw semantic_error("request must be an object");
+        return request_shape::none;
     }
-    // Unknown top-level fields are tolerated for Jev compatibility; unknown fields inside a
-    // question are still refused by parse_question.
+    const bool has_questions = body.contains("questions");
+    const bool has_schema    = body.contains("schema");
+    if (has_questions && has_schema) {
+        throw std::invalid_argument("request must be either questions or schema, not both");
+    }
+    if (has_schema) {
+        return request_shape::generic;
+    }
+    if (has_questions || body.contains("state")) {
+        return request_shape::jev;
+    }
+    return request_shape::none;
+}
 
-    decision_request req;
-
+decision_envelope parse_decision_envelope(const common_json & body) {
+    decision_envelope env;
     // The model is required: an external router in front of this server selects the model, and
     // the response echoes it back. Jev requires it too, so a missing field is a 422 naming it.
     const std::optional<std::string> model = read_string(body, "model");
     if (!model) {
         throw semantic_error("model is required");
     }
-    req.model = *model;
-
-    if (body.contains("contexts") && !body.at("contexts").is_null()) {
-        if (!body.at("contexts").is_array() || body.at("contexts").empty() ||
-            body.at("contexts").size() > DECISION_MAX_CONTEXTS) {
-            throw semantic_error("contexts must hold 1-" + std::to_string(DECISION_MAX_CONTEXTS) + " entries");
-        }
-        if (body.contains("state") && !body.at("state").is_null()) {
-            throw semantic_error("provide either state or contexts, not both");
-        }
-        for (const auto & c : body.at("contexts")) {
-            if (!c.is_string() || c.get<std::string>().empty()) {
-                throw semantic_error("every entry of contexts must be a non-empty string");
-            }
-            req.contexts.push_back(c);
-        }
-    } else {
-        if (!body.contains("state")) {
-            throw semantic_error("state (or contexts) is required");
-        }
-        req.state = body.at("state");
-        validate_state(req.state);
-    }
-
-    if (!body.contains("questions") || !body.at("questions").is_object()) {
-        throw semantic_error("questions must be an object");
-    }
-    const common_json & qs = body.at("questions");
-    if (qs.size() < DECISION_MIN_QUESTIONS || qs.size() > DECISION_MAX_QUESTIONS) {
-        throw semantic_error("questions must hold " + std::to_string(DECISION_MIN_QUESTIONS) + "-" +
-                             std::to_string(DECISION_MAX_QUESTIONS) + " entries");
-    }
-    for (const auto & e : qs.items()) {
-        req.questions.push_back(parse_question(e.key(), e.value()));
-    }
+    env.model    = *model;
+    env.evidence = parse_evidence(body);
+    env.session  = parse_session_ref(body);
 
     if (const std::optional<double> t = read_number(body, "temperature")) {
         if (!(*t > 0.0)) {
             throw semantic_error("temperature must be > 0");
         }
-        req.temperature = *t;
+        env.knobs.temperature = *t;
     }
-
     if (body.contains("temperatures") && !body.at("temperatures").is_null()) {
         read_temperatures(body.at("temperatures"), nullptr);
-        req.temperatures = body.at("temperatures");
+        env.knobs.temperatures = body.at("temperatures");
     }
-
     if (const std::optional<long long> perms = read_integer(body, "permutations")) {
-        req.permutations = (int) *perms;
-        if (req.permutations < 1) {
+        env.knobs.permutations = (int) *perms;
+        if (env.knobs.permutations < 1) {
             throw semantic_error("permutations must be >= 1");
         }
-        if (req.permutations > DECISION_MAX_PERMUTATIONS) {
-            req.permutations = DECISION_MAX_PERMUTATIONS; // accepted but capped: more passes only add cost
+        if (env.knobs.permutations > DECISION_MAX_PERMUTATIONS) {
+            env.knobs.permutations = DECISION_MAX_PERMUTATIONS; // accepted but capped: more passes only add cost
         }
     }
-
-    if (const std::optional<bool> diag = read_bool(body, "diagnostics")) {
-        req.diagnostics = *diag;
-    }
-
     if (const std::optional<std::string> profile = read_string(body, "confidence_profile")) {
-        req.confidence_profile = *profile;
-        if (req.confidence_profile != "local" && req.confidence_profile != "jev") {
+        env.knobs.confidence_profile = *profile;
+        if (env.knobs.confidence_profile != "local" && env.knobs.confidence_profile != "jev") {
             throw semantic_error("confidence_profile must be local or jev");
         }
     }
+    if (const std::optional<bool> diag = read_bool(body, "diagnostics")) {
+        env.diagnostics = *diag;
+    }
+    return env;
+}
 
-    req.session = parse_session_ref(body);
+decision_request parse_decision_request(const common_json & body) {
+    if (!body.is_object()) {
+        throw semantic_error("request must be an object");
+    }
+    // Unknown top-level fields are tolerated for Jev compatibility; unknown fields inside a
+    // question are still refused by parse_question.
+    decision_request req;
+    req.shape    = select_request_shape(body);
+    req.envelope = parse_decision_envelope(body);
+    const bool generic = req.shape == request_shape::generic;
 
+    // Exactly one evidence source. The rule is one, but where it is stated and how it reads differ:
+    // a Jev request must always carry `state` or `contexts`, even on a session fork, because the
+    // shape requires it and the transcript is answered from the session instead; a generic request
+    // may name a session instead. Each shape therefore states the rule next to its own required
+    // parts, after the shared fields are parsed.
+    const bool has_evidence = req.envelope.evidence.state_present || !req.envelope.evidence.contexts.empty();
+
+    if (!generic) {
+        if (!has_evidence) {
+            throw semantic_error("state (or contexts) is required");
+        }
+        if (!body.contains("questions") || !body.at("questions").is_object()) {
+            throw semantic_error("questions must be an object");
+        }
+        const common_json & qs = body.at("questions");
+        if (qs.size() < DECISION_MIN_QUESTIONS || qs.size() > DECISION_MAX_QUESTIONS) {
+            throw semantic_error("questions must hold " + std::to_string(DECISION_MIN_QUESTIONS) + "-" +
+                                 std::to_string(DECISION_MAX_QUESTIONS) + " entries");
+        }
+        for (const auto & e : qs.items()) {
+            req.questions.push_back(parse_question(e.key(), e.value()));
+        }
+        return req;
+    }
+
+    // The schema-only fields. They are read for this shape alone, so a `mode` or `tree_max` on a
+    // Jev body stays an ignored unknown top-level field, exactly as it is today.
+    if (!body.contains("schema") || !body.at("schema").is_object()) {
+        throw semantic_error("\"schema\" must be an object");
+    }
+    req.schema = body.at("schema");
+    if (!has_evidence && !req.envelope.session.present) {
+        throw semantic_error("state (or contexts or id_slot) is required");
+    }
+    if (const std::optional<std::string> ins = read_string(body, "instructions")) {
+        req.instructions = *ins;
+    }
+    if (const std::optional<std::string> mode = read_string(body, "mode")) {
+        req.mode = *mode;
+        if (req.mode != "auto" && req.mode != "tree" && req.mode != "greedy") {
+            throw semantic_error("mode must be auto, tree or greedy");
+        }
+    }
+    if (const std::optional<long long> tree_max = read_integer(body, "tree_max")) {
+        req.tree_max = (size_t) *tree_max;
+    }
+    if (const std::optional<bool> cache = read_bool(body, "cache_prompt")) {
+        req.allow_cache = *cache;
+    }
     return req;
 }
 
-std::vector<std::vector<float>> uniform_probs(const decision_request & req) {
-    std::vector<std::vector<float>> out;
-    out.reserve(req.questions.size());
-    for (const auto & q : req.questions) {
-        const float p = q.options.empty() ? 0.0f : 1.0f / (float) q.options.size();
-        out.emplace_back(q.options.size(), p);
+void require_adapter_scope(const std::string & scope, int apply_status) {
+    if (apply_status == 0) {
+        return;
     }
-    return out;
+    throw semantic_error("the requested adapter scope is not available: " + (scope.empty() ? "base" : scope));
 }
 
 std::string sha256_hex(const std::string & text) {
@@ -819,14 +871,22 @@ common_json assemble_decision_response(const decision_request & req,
                                   const std::string & model,
                                   const common_json & usage,
                                   const common_json * diagnostics) {
-    const auto uniform = uniform_probs(req);
-
     common_json answers = common_json::object();
     for (size_t qi = 0; qi < req.questions.size(); ++qi) {
         const decision_question & q = req.questions[qi];
-        std::vector<float> p = (qi < probs.size() && !probs[qi].empty()) ? probs[qi] : uniform[qi];
+        // One score per option, always. A missing or mis-sized vector means the producer returned
+        // the wrong thing, so it is refused rather than papered over with a distribution nobody
+        // scored: a uniform substitute would look like a well-formed answer and would hide the
+        // defect from the accuracy harness.
+        if (qi >= probs.size()) {
+            throw std::runtime_error("decision assembly: no scores for question \"" + q.id + "\" with " +
+                                     std::to_string(q.options.size()) + " options");
+        }
+        const std::vector<float> & p = probs[qi];
         if (p.size() != q.options.size()) {
-            p = uniform[qi];
+            throw std::runtime_error("decision assembly: question \"" + q.id + "\" has " +
+                                     std::to_string(q.options.size()) + " options but " +
+                                     std::to_string(p.size()) + " scores");
         }
 
         common_json a = common_json::object();
@@ -849,9 +909,9 @@ common_json assemble_decision_response(const decision_request & req,
                     best = i;
                 }
             }
-const common_json conc = concentration_metrics(p, req.confidence_profile);
+const common_json conc = concentration_metrics(p, req.envelope.knobs.confidence_profile);
             a["confidence"] = conc.at("confidence");
-            if (req.diagnostics) {
+            if (req.envelope.diagnostics) {
                 a["certainty"] = conc.at("certainty");             // max(p); additive
             }
 
@@ -869,7 +929,7 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
                 // additive spread summaries over Jev: the skew-robust median and the 10th-90th
                 // percentile band. They are diagnostics-only, so the default envelope stays the
                 // strict Jev ScoreAnswer shape.
-                if (req.diagnostics) {
+                if (req.envelope.diagnostics) {
                     common_json band = common_json::array();
                     band.push_back(score_quantile(p, 0.10));
                     band.push_back(score_quantile(p, 0.90));
@@ -900,7 +960,7 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
                     }
                     a["aggregate"] = agg;
                 }
-                if (req.diagnostics) {
+                if (req.envelope.diagnostics) {
                     common_json band = common_json::array();
                     band.push_back(value_quantile(p, values, 0.10));
                     band.push_back(value_quantile(p, values, 0.90));
@@ -917,7 +977,7 @@ const common_json conc = concentration_metrics(p, req.confidence_profile);
     out["answers"] = answers;
     // The strict Jev envelope carries only input/output tokens. The extra counters are additive
     // diagnostics, so drop them unless the caller opted in.
-    if (req.diagnostics) {
+    if (req.envelope.diagnostics) {
         out["usage"] = usage;
     } else {
         common_json jev_usage = common_json::object();

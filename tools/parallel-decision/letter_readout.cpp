@@ -196,7 +196,7 @@ const common_chat_templates * tmpls, bool use_jinja,
 
     // One scoring field per (question, pass): pass 0 keeps the caller's order, later passes
     // present the same options in distinct seeded orders so the mean is order-de-biased.
-    const int n_perm = std::clamp(req.permutations, 1, 8);
+    const int n_perm = std::clamp(req.envelope.knobs.permutations, 1, 8);
 
     std::vector<field_input>        fields;
     std::vector<std::vector<size_t>> field_order;    // per field: candidate position -> original option
@@ -233,13 +233,13 @@ const common_chat_templates * tmpls, bool use_jinja,
     // the text and continues the transcript, so the list is empty there.
     std::vector<std::string> states;
     if (!session) {
-        if (!req.contexts.empty()) {
-            states.reserve(req.contexts.size());
-            for (const auto & c : req.contexts) {
+        if (!req.envelope.evidence.contexts.empty()) {
+            states.reserve(req.envelope.evidence.contexts.size());
+            for (const auto & c : req.envelope.evidence.contexts) {
                 states.push_back(render_state(c));
             }
         } else {
-            states.push_back(render_state(req.state));
+            states.push_back(render_state(req.envelope.evidence.state));
         }
     }
 
@@ -267,7 +267,6 @@ const common_chat_templates * tmpls, bool use_jinja,
         }
         metrics->suffix_tokens        = b.suffix_tokens;
         metrics->common_suffix_tokens = b.common_suffix_tokens;
-        metrics->leaf_suffix_tokens   = b.leaf_suffix_tokens;
         metrics->label_pool_size      = labels.size();
     }
 

@@ -127,29 +127,13 @@ std::vector<double> numeric_values(const generic_field_spec & f) {
 
 } // namespace
 
-request_shape select_request_shape(const common_json & body) {
-    if (!body.is_object()) {
-        return request_shape::none;
-    }
-    const bool has_questions = body.contains("questions");
-    const bool has_schema    = body.contains("schema");
-    if (has_questions && has_schema) {
-        throw std::invalid_argument("request must be either questions or schema, not both");
-    }
-    if (has_schema) {
-        return request_shape::generic;
-    }
-    if (has_questions || body.contains("state")) {
-        return request_shape::jev;
-    }
-    return request_shape::none;
-}
-
-compiled_schema compile_schema(const common_json & schema, const std::string & instructions) {
+compiled_schema compile_schema(const common_json & schema, const std::string & instructions,
+                               const producer_knobs & knobs) {
     if (!schema.is_object()) {
         throw semantic_error("\"schema\" must be an object");
     }
     compiled_schema cs;
+    cs.knobs = knobs;
     const bool json_schema = schema.contains("properties");
     const common_json & props = json_schema ? schema.at("properties") : schema;
     if (!props.is_object() || props.size() < 1 || props.size() > 32) {
@@ -173,25 +157,7 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
     }
 
     std::string catalog;
-    for (size_t si = 0; si < cs.specs.size(); ++si) {
-        const generic_field_spec & f = cs.specs[si];
-        // the value's common leading characters are fixed in the suffix; only the rest is scored
-        std::string common = f.encoded[0];
-        for (const auto & v : f.encoded) {
-            size_t c = 0;
-            while (c < std::min(common.size(), v.size()) && common[c] == v[c]) {
-                ++c;
-            }
-            common.resize(c);
-        }
-        cs.specs[si].common = common;
-        field_input in;
-        in.suffix = "  " + json_text(f.name) + ": " + common;
-        for (const auto & v : f.encoded) {
-            in.candidates.push_back(v.substr(common.size()));
-        }
-        cs.inputs.push_back(std::move(in));
-
+    for (const auto & f : cs.specs) {
         std::string allowed;
         for (size_t i = 0; i < f.encoded.size(); ++i) {
             allowed += (i ? ", " : "") + f.encoded[i];
@@ -202,7 +168,79 @@ compiled_schema compile_schema(const common_json & schema, const std::string & i
     cs.catalogue   = catalog;
     cs.system_text = "Select the requested field value from its allowed values, based on the context. "
                      "Respond with the JSON value only.\n\nFields:\n" + catalog + "\n" + instructions;
+
+    // One scoring field per (pass, field), pass-major. The candidate texts are the whole encoded
+    // value: the engine splits the shared head of `suffix + candidate` at a token boundary, so a
+    // value-space prefix needs no second, character-level split here.
+    cs.passes = std::max(1, knobs.permutations);
+    cs.field_order.reserve(cs.specs.size() * (size_t) cs.passes);
+    cs.field_spec.reserve(cs.specs.size() * (size_t) cs.passes);
+    cs.inputs.reserve(cs.specs.size() * (size_t) cs.passes);
+    for (int pass = 0; pass < cs.passes; ++pass) {
+        for (size_t si = 0; si < cs.specs.size(); ++si) {
+            const generic_field_spec &   f    = cs.specs[si];
+            const std::vector<size_t>    order = permutation_order(f.encoded.size(), f.name, pass);
+            field_input in;
+            in.suffix      = "  " + json_text(f.name) + ": ";
+            in.temperature = (float) knobs.for_type(f.type);
+            in.candidates.reserve(order.size());
+            for (size_t i : order) {
+                in.candidates.push_back(f.encoded[i]);
+            }
+            cs.inputs.push_back(std::move(in));
+            cs.field_order.push_back(order);
+            cs.field_spec.push_back(si);
+        }
+    }
     return cs;
+}
+
+std::vector<field_input> compiled_schema::scoring_inputs(const std::string & head) const {
+    if (head.empty()) {
+        return inputs;
+    }
+    std::vector<field_input> out;
+    out.reserve(inputs.size());
+    for (size_t f = 0; f < inputs.size(); ++f) {
+        field_input in  = inputs[f];
+        in.suffix        = head + in.suffix;
+        out.push_back(std::move(in));
+    }
+    return out;
+}
+
+void mean_permuted_passes(const compiled_schema & cs, result & r) {
+    const size_t n_specs = cs.specs.size();
+    if (cs.passes <= 1 || r.fields.size() != n_specs * (size_t) cs.passes) {
+        return;
+    }
+    std::vector<field_result> folded(n_specs);
+    for (size_t si = 0; si < n_specs; ++si) {
+        const size_t n_values = cs.specs[si].values.size();
+        std::vector<float> acc(n_values, 0.0f);
+        bool scored_distribution = false;
+        int  nodes              = 0;
+        for (int pass = 0; pass < cs.passes; ++pass) {
+            const field_result &       fr    = r.fields[(size_t) pass * n_specs + si];
+            const std::vector<size_t> & order = cs.field_order[(size_t) pass * n_specs + si];
+            nodes += fr.scored_nodes;
+            if (fr.probs.size() == n_values && order.size() == n_values) {
+                scored_distribution = true;
+                for (size_t i = 0; i < n_values; ++i) {
+                    acc[order[i]] += fr.probs[i] / (float) cs.passes;
+                }
+            } else if (fr.winner >= 0 && (size_t) fr.winner < order.size()) {
+                acc[order[fr.winner]] += 1.0f / (float) cs.passes;
+            }
+        }
+        folded[si].scored_nodes = nodes;
+        folded[si].winner       = acc.empty() ? -1
+                                             : (int) (std::max_element(acc.begin(), acc.end()) - acc.begin());
+        // passes that were all greedy produced no distribution, so none is reported: the record
+        // shows the point mass the passes agreed on, as it does for a single greedy pass
+        folded[si].probs = scored_distribution ? std::move(acc) : std::vector<float>();
+    }
+    r.fields = std::move(folded);
 }
 
 // The probability/legend key for an allowed value. A string value keys itself; anything else keys
@@ -221,7 +259,8 @@ static std::string generic_value_key(const common_json & v) {
 //   scored        "tree" for a real distribution, "argmax" for a greedy-scored field
 // The spread summaries (aggregate, interval_p10_p90) are diagnostics-only, matching the Jev path,
 // so the default answer carries no off-envelope field.
-common_json generic_field_record(const generic_field_spec & spec, const field_result & fr, bool diagnostics) {
+common_json generic_field_record(const generic_field_spec & spec, const field_result & fr,
+                                 const std::string & confidence_profile, bool diagnostics) {
     const int idx = fr.winner;
     if (idx < 0 || idx >= (int) spec.values.size()) {
         throw std::runtime_error("field \"" + spec.name + "\" has no selected value");
@@ -252,7 +291,7 @@ common_json generic_field_record(const generic_field_spec & spec, const field_re
     common_json f = common_json::object();
     f["type"]         = spec.type;
     f["value"]        = spec.values[idx];
-    const common_json conc = concentration_metrics(p, "jev");
+    const common_json conc = concentration_metrics(p, confidence_profile);
     f["confidence"]   = conc.at("confidence");
     f["probabilities"] = probs_obj;
     f["legend"]       = legend;
@@ -281,14 +320,16 @@ common_json generic_field_record(const generic_field_spec & spec, const field_re
 }
 
 // One context's scored fields as a Jev `answers` map, keyed by field name. A single context emits
-// this at the top level; several contexts are wrapped in the documented `contexts` array.
+// this at the top level; several contexts are wrapped in the documented `contexts` array. The order
+// -de-bias passes, if any, are folded first, so this stays the single owner of the value space.
 common_json assemble(const compiled_schema & cs, const result & r, bool diagnostics) {
     common_json answers = common_json::object();
     for (size_t i = 0; i < cs.specs.size(); ++i) {
         if (i >= r.fields.size()) {
             throw std::runtime_error("the scored result is missing field \"" + cs.specs[i].name + "\"");
         }
-        answers[cs.specs[i].name] = generic_field_record(cs.specs[i], r.fields[i], diagnostics);
+        answers[cs.specs[i].name] =
+            generic_field_record(cs.specs[i], r.fields[i], cs.knobs.confidence_profile, diagnostics);
     }
     return answers;
 }
@@ -309,72 +350,11 @@ std::string generic_cache_tag(const common_chat_templates * tmpls, bool use_jinj
     return make_prefix_tag(system_text, split.second, GENERIC_PROMPT_VERSION);
 }
 
-generic_request parse_generic_request(const common_json & body) {
-    if (!body.is_object()) {
-        throw semantic_error("request must be an object");
-    }
-    generic_request req;
-
-    // the model is required and echoed back, matching the Jev contract
-    const std::optional<std::string> model = read_string(body, "model");
-    if (!model) {
-        throw semantic_error("model is required");
-    }
-    req.model = *model;
-
-    if (!body.contains("schema") || !body.at("schema").is_object()) {
-        throw semantic_error("\"schema\" must be an object");
-    }
-    req.schema = body.at("schema");
-
-    if (const std::optional<std::string> ins = read_string(body, "instructions")) {
-        req.instructions = *ins;
-    }
-
-    // the evidence source (state/contexts/session) is orthogonal to the front-end
-    req.evidence = parse_evidence(body);
-    req.session  = parse_session_ref(body);
-    if (!req.evidence.state_present && req.evidence.contexts.empty() && !req.session.present) {
-        throw semantic_error("state (or contexts or id_slot) is required");
-    }
-
-    // the same opt-in the Jev path uses: without it the answer stays on the shared envelope
-    if (const std::optional<bool> diag = read_bool(body, "diagnostics")) {
-        req.diagnostics = *diag;
-    }
-
-    if (const std::optional<std::string> mode = read_string(body, "mode")) {
-        req.mode = *mode;
-        if (req.mode != "auto" && req.mode != "tree" && req.mode != "greedy") {
-            throw semantic_error("mode must be auto, tree or greedy");
-        }
-    }
-    if (const std::optional<long long> tree_max = read_integer(body, "tree_max")) {
-        req.tree_max = (size_t) *tree_max;
-    }
-    if (const std::optional<bool> cache = read_bool(body, "cache_prompt")) {
-        req.allow_cache = *cache;
-    }
-
-    return req;
-}
-
 std::vector<field_input> session_field_inputs(const compiled_schema & cs,
                                               const std::string & before, const std::string & after) {
-    std::vector<field_input> out;
-    out.reserve(cs.specs.size());
-    for (size_t i = 0; i < cs.specs.size(); ++i) {
-        const generic_field_spec & f = cs.specs[i];
-        const field_input &        in = cs.inputs[i];
-        // the fresh user turn carries the catalogue, then the JSON answer opens after the
-        // assistant-open (`after`); every suffix shares this framing so the plan hoists it
-        field_input framed;
-        framed.suffix      = before + "\n" + cs.catalogue + "\n" + after + "{\n  " + json_text(f.name) + ": " + f.common;
-        framed.candidates  = in.candidates;
-        framed.temperature = in.temperature;
-        out.push_back(std::move(framed));
-    }
-    return out;
+    // the fresh user turn carries the catalogue, then the JSON answer opens after the assistant
+    // open (`after`); every suffix shares this framing so the plan hoists it
+    return cs.scoring_inputs(before + "\n" + cs.catalogue + "\n" + after + "{\n");
 }
 
 } // namespace llama_decision

@@ -1,206 +1,145 @@
-> Non-normative design notes, KV background, and benchmarks. The normative
-> contract is `docs/decision/API.md`.
+# The decision endpoint
 
-## What the /v1/decision endpoint is really trying to do:
+This is the introduction. It says what `POST /v1/decision` is for, how it is
+shaped, why it is fast, and where every claim is documented in full.
 
-At its core, this work adds a new kind of query to llama-server:
-/v1/decision, which is not "generate text" but "pick an answer from a fixed
-list." Instead of asking the model to produce a sentence, you hand it a JSON
-object — a state (the situation being judged) and a set of questions, each
-with a small finite set of allowed answers (true/false, a choice among
-options, or a score level).  The model scores each allowed answer and
-returns probabilities, e.g.  "this ticket is 92% a refund question."
+| document | what it owns |
+|---|---|
+| `API.md` | **the contract**: routes, the combined request shape, the response envelope, errors, limits, and the environment overrides. Normative. |
+| `JEV-API.md` | the upstream Jev "System One" specification, transcribed. Reference only; the conformance gate is written against it. |
+| `BENCHMARKING.md` | how to measure and validate: accuracy, speed, stability, and the frozen artifacts that own a number. |
+| `OBJECTIVE_MULTI_CONTEXT.md` | the instance-pool and decision-merge goals, and where the design landed. Non-normative. |
+| `OBJECTIVE.md` | the historical comparison against a reference decision engine, kept as the reasoning behind several choices. |
+| `tools/parallel-decision/README.md` | the engine and the two front-ends, one level down. |
 
-The request has two mutually exclusive front-ends over one shared engine (a
-body using both is a 400). The primary "state + questions" shape carries a
-`state` and a `questions` map; each question carries required `instructions`
-and is typed `noul` (true/false), `choice` (pick one of 2-255 options),
-`score` (pick a 0..K-1 level on a 2-10 scale), or the numeric `integer` /
-`number` extension, and the server scores one
-next-token choice over verified single-token letter labels, sharing one
-framed state prefix across all questions.  The generic typed-schema shape
-("schema") supplies a JSON Schema or compact typed fields
-(boolean/enum/integer/number) and walks the schema's value trie in one
-batched pass.  Both front-ends terminate at the same `field_input[]` plan, so
-the two contracts cannot drift.  A request may also ask for a permutation
-de-bias pass (`permutations: N`), which shuffles option order and averages,
-so no one fixed ordering biases the scores.  A request may also carry an
-`id_slot` or a first-class `session_id` (and optional `turn`) to answer about a
-live chat slot through an owned reference, without re-prefilling the
-transcript.
+## What it does
 
-This is classification-style work — routing, triage, RAG ranking, structured
-extraction — where you care about which option wins, not about fluent prose. 
-The whole feature is an attempt to make that cheap and deterministic, in
-three ways:
+Not "generate text", but "pick an answer from a fixed list". You hand the server
+an opaque evidence document and a set of typed questions; it returns one
+closed-world distribution per question and generates nothing at all
+(`usage.output_tokens` is always 0).
 
-1.  One batched forward pass instead of many.  The engine lays out every
-question, every candidate, and every branch (each candidate's unique tail
-tokens) as separate sequences, decodes them all in a single batched
-llama_decode, and reads one scored row per branch.  A decision costs roughly
-one decode step, no matter how many options exist.
+```
+POST /v1/decision
+state + N questions -> N answer distributions, no sampling
+```
 
-2.  Full-vocabulary logits on the shared context.  The engine reads one
-output row per branch from the shared context's logits.  There is no second
-classifier-only context and no answer head: the feature serves every request
-with the one context chat uses, so a decision cannot duplicate the KV cache.
+This is classification work - routing, triage, structured extraction, RAG
+ranking - where what matters is which option wins, not whether the prose is
+fluent. The endpoint exists to make that cheap and repeatable.
 
-3.  Faster branch forking.  To evaluate many branches at once, the engine
-needs many copies of the same "so far" context.  The branch makes
-saving/restoring a sequence's state much cheaper: it keeps the state on the
-GPU and stages the device-to-device copies on the backend's stream with a
-single sync, instead of one synchronous copy (and one cudaStreamSynchronize)
-per tensor.
+The state is treated as **data**, never as instructions: it is framed as
+evidence, `<` is escaped, and the prompt tells the model that state content is
+not instructions.
 
-Plus a lot of bookkeeping that makes this safe in production: a preflight
-check that rejects requests that can't fit the context, admission control
-(413/429/529), a contract hash that refuses to serve a decision if the
-tokenizer/prompt-template identity changed, an optional calibrated
-temperature file, and per-model caching of the answer-label pool.
+## One endpoint, two front-ends, one envelope
 
-Beyond 413/429/529, the endpoint returns 422 for a semantic or capacity
-error, 499 when the client disconnects, and 501 when the
-loaded model cannot serve decisions at all (for example its vocabulary has no
-usable single-token answer labels, or a pinned contract does not match).
+`/v1/decision` serves both request shapes, selected by the body's top-level
+shape. A body carrying both is a 400.
 
-The optional temperature profile is loaded with `--decision-temperature
-FILE`: it maps `noul`/`choice`/`score` temperatures to non-default values,
-and is only honored when the file's recorded provenance (model, quantization,
-template hash, backend flags) matches the running configuration — a stale
-profile is a server configuration error, never silently applied.  The
-contract identity can be pinned with `--decision-contract HASH`; a mismatch
-refuses the decision path.  The default response is the strict Jev envelope
-(`model`, `answers`, `usage` with only input/output tokens); passing
-`"diagnostics": true` adds the `diagnostics` identity (contract_hash,
-prompt_version, timings, and the provenance of the readout) and `certainty`,
-so callers can see exactly how an answer was produced without changing the
-answers themselves.
+| body has | front-end | answered with |
+|---|---|---|
+| `questions` | the Jev shape: `state` (or `contexts`) plus a map of typed questions | `answers`, keyed by question id |
+| `schema` | the generic typed-schema shape: a JSON Schema or compact typed fields | the same `answers` map, keyed by field name, each answer extended with `value` |
 
-## How the KV cache interacts with /v1/decision
+The Jev question types are `noul` (binary), `choice` (one of 2-255 options),
+`score` (an ordered level on a 2-10 scale), plus the numeric `integer` /
+`number` extension over a typed value grid. The generic field types are `enum`,
+`boolean`, `integer`, `number`.
 
-The KV cache is where the model stores what it has seen so far.  The
-decision engine leans on it heavily, and the server forces the "unified" KV
-cache when decisions are enabled (--decision-seqs N automatically sets
-kv_unified = true).  In a unified cache, all live sequences draw from one
-shared pool of cells, and — critically — the code's seq_cp can make a branch
-share the same physical cells as its parent instead of copying them, as long
-as they're in the same stream.  So the layout for a decision request looks
-like this:
+Both front-ends compile to the *same* `field_input[]` plan and terminate at the
+*same* engine, one envelope parser, one request type. That is structural, not a
+convention: there is no second scorer, no second evidence validator and no
+second copy of the producer knobs, so the two contracts cannot drift. The
+generic front-end earns its place by expressing what the letter readout cannot:
+a field wider than the model's realized answer-label pool, and typed value grids
+with numeric aggregates.
 
-- A dedicated snapshot sequence holds the static prefix (system prompt +
-chat template up to the question).  It persists across requests, so a repeat
-request with the same prefix is a cache hit: the prefix is never re-decoded. 
+`POST /v1/systemone` is the strict Jev contract alone and refuses a `schema`
+body with a 400 naming `/v1/decision`, so a Jev client works by swapping a base
+URL and nothing else. `POST /decision` is a deprecated alias for the canonical
+handler.
 
-- Each trunk sequence forks off the snapshot (shares its cells) and decodes
-one context (the state) plus a common suffix head.
+## Why it is fast
 
-- Each branch sequence forks off its trunk and decodes only its own unique tail
-  — the few tokens that distinguish one candidate answer from another — writing
-  only those new cells into the shared pool.
+Four things, in order of how much they matter.
 
-- At the scored position, the engine reads one output row per branch, so the
-  whole request is served by: one prefix decode (on first use), one decode per
-  context, and one batched decode for the branch tails.
+1. **One batched forward pass.** The engine lays out every question, every
+   candidate and every branch (each candidate's unique tail tokens) as separate
+   sequences, decodes them all in a single batched `llama_decode`, and reads one
+   scored row per branch. Each branch costs one row of a *shared* full-vocabulary
+   matmul rather than a decode step of its own, so the cost grows with the number
+   of scored rows instead of with the number of sequential steps - which is why a
+   64-option question is not 64 times a 1-option one.
+2. **A dedicated executor.** Every decision, stateless and session, runs on the
+   internal `__decision__` sidecar executor: its own context and its own
+   scheduler thread. Chat contexts are never written, stalled or resized by
+   decision work. The engine still reads **full-vocabulary logits** - there is no
+   classifier-only context and no answer head - but on a context that chat does
+   not share, so a decision cannot corrupt chat KV state and a long decision
+   cannot stall a long chat turn.
+3. **Cheap branch forking.** Evaluating many branches at once needs many copies
+   of the same "so far" context. The branch keeps sequence state on the device
+   and stages device-to-device copies on the backend's stream behind a single
+   synchronisation, instead of one synchronous copy per tensor, and moves
+   transposed cache regions as one bulk strided transfer rather than thousands
+   of tiny ones.
+4. **Prefix caching.** The framed instructions prefix is cached per request
+   identity and reused, so a repeat request does not re-decode it. On a
+   recurrent or hybrid model a resident prefix is restored from a host-format
+   snapshot, which is far cheaper than a cold prefill; `API.md` section 3.1
+   records the measured ratio and the drift that costs.
 
-The decision sequences live above the chat slots (ids `n_parallel` ..
-`n_parallel + n_seq_decision`), on the same shared context chat uses.  There
-is no separate decision context.
+Plus the bookkeeping that makes it safe to run in production: a peak-KV
+preflight that refuses an over-budget request **before** any cache is touched,
+admission control, a contract hash that refuses to serve a decision whose
+tokenizer or prompt-template identity has changed, an optional calibrated
+temperature file with provenance, and a per-model answer-label pool.
 
-> Sidecar note (roadmap M0-M9): this shared-context description is historical.
-> With `--decision-seqs` set, decisions run on the internal `__decision__`
-> sidecar executor - its own context and scheduler thread, forced `kv_unified`
-> only on itself - and chat contexts carry no decision sequences. Sessions are
-> eager token snapshots replayed on the sidecar, which is the only executor.
-> The shared-context engine pool, arena, yield, and session registry that this
-> section describes have been removed from the tree.
+## Where the numbers are
 
-## Is the KV cache updated by decision queries?
+There are no headline latencies in this file. Speed, accuracy and stability are
+measured, and the numbers live with the method that produced them in
+`BENCHMARKING.md` and in the frozen artifacts under `tests/decision-baseline/`.
+A number quoted without its model, quantization, prompt template and backend
+flags is not comparable to any other number, which is why this document quotes
+none.
 
-Yes — decisions are real decodes and they do write to the KV cache.  The
-model's forward pass on the trunk context and on each branch tail populates
-new KV cells, exactly like generation would.  But the branch is careful
-about whose cache it touches and what survives:
+## Live-session decisions
 
-- Decisions write into the same unified pool as chat, but into
-    reserved sequence ids above the chat slots (n_parallel ..  n_parallel +
-    n_seq_decision), so chat's slots and their KV are never overwritten.
+A request carrying `id_slot`, or a first-class `session_id`, is answered about a
+chat slot that already holds decoded state. The pool takes an **owned token
+snapshot** of that slot's completed turn - the token list plus the enabled
+adapter scope - through a read-only op on the owning instance's scheduler, so no
+KV pointer, sequence id or context handle leaves that instance. The sidecar
+replays the owned tokens into its own context and scores there. The source slot
+is only ever read, never forked and never written.
 
-  - After scoring, the engine removes the branch and trunk sequences
-    (llama_memory_seq_rm), reclaiming their cells.  Only the snapshot
-    sequence's prefix survives, so the next matching query can reuse it.
+Later decisions in the same turn reuse the snapshot, so the answer survives the
+origin slot being cleared and reused by `cache_idle_slots`. One retained turn
+per slot; the opaque `turn` tag pins it and a mismatched `turn` is a 422, never
+a silent answer about a different turn. A `session_id` outlives the reused
+`id_slot` with a create / get / patch / erase lifecycle over `/v1/session`,
+which also owns the store's byte budget and TTL policy.
 
-  - A session decision replays the slot's owned token snapshot (the sidecar's
-    `tokens` backend: the owned token list plus adapter scope, re-prefilled into
-    the sidecar context on demand; `clone`/`file` are a 501 capability refusal),
-    never the live slot: the source slot's KV is never read for scoring and
-    never written. There is no in-context session lane: it was removed with the
-    session registry and the arena.
+## What it will refuse
 
-  - A preflight check estimates peak KV use and returns 422 rather than ever
-    partially overwriting the cache, and a cancelled request leaves the pool
-    dirty but the next decision clears it before reuse.
+422 for a semantic or capacity error, 413 for an over-size body, 429/529 with
+`Retry-After` for a full queue, 499 when the client disconnects, 501 when the
+loaded model cannot serve decisions at all (no usable single-token answer
+labels, or a pinned contract that does not match), and 500 for an internal
+failure. The path never truncates: an over-limit request is rejected, never
+silently clipped. `API.md` section 4 owns the full table.
 
-So the short answer: decisions do update the KV cache, but transiently, in a
-reserved range, with self-cleanup - the design's whole point is that a
-decision never disturbs the state chat depends on.
+Two rules the rest of the system is built on:
 
-## Live-session decisions (owned token snapshot)
-
-A request with `id_slot` or a first-class `session_id` answers about a chat
-slot that already holds decoded state.  The server does not fork the live slot
-and does not re-prefill the transcript.  Instead the pool captures the slot's
-completed turn as an owned token snapshot: the token list plus the enabled
-adapter scope, copied out through a read-only op on the owning instance's
-scheduler, so no KV pointer, sequence id, or context handle leaves that
-instance.  The sidecar executor re-prefills the owned tokens into its own
-context and scores there.  Later decisions in the same turn reuse the snapshot,
-so the answer survives the origin slot being cleared and reused by
-`cache_idle_slots`.  One retained turn per slot: when the slot decodes past the
-reference's position (a new completed turn), the reference is released before
-the next decision.  The optional `turn` tag pins the retained turn; a
-mismatched `turn` is a 422, never a silent answer about a different turn.  The
-trigger is a cost decision (fire on the first decision for a turn, reuse the
-snapshot), never a confidence decision.  A decision on an in-flight slot is a
-422 (the turn is not complete).
-
-`session_id` handles live outside the reused `id_slot` with a
-create/query/pin/erase lifecycle over `/v1/session`.  Under a configured byte
-budget (`--decision-session-budget-mb`), the store evicts the
-least-recently-used unpinned, unleased reference to fit a capture, and a
-configured TTL reaps expired unpinned references; the defaults (unlimited
-budget, no expiry) never evict.  A slot save or restore carries only the slot's
-token and KV state: a retained session is a live sidecar handle and is not part
-of a slot file.
-
-## What the benchmarks say: /v1/decision versus chat
-
-The reported warm numbers (GPU, ROCm 7900 XT, flash attention off for
-bit-reproducibility) for the full-logits readout are:
-
-- LFM2.5-350M ~70 ms, LFM2.5-2.6B ~108 ms, Qwen3.5-2B 118 ms, Qwen3.5-9B 252
-  ms, Gemma-e4b 70 ms, Gemma-4-12B-QAT 129 ms.
-
-Read against chat, the key structural difference is cost per token.  A chat
-completion is a loop: decode one token, sample it, feed it back, repeat —
-the cost is proportional to the number of generated tokens (tens to
-hundreds).  A decision is a single batched decode that produces every
-candidate's score at once, plus a prefill for the context.  So a decision's
-latency is roughly one token-generation step, and it does not scale with the
-number of options or fields — all branches ride in the same batch.  That's
-why even a 9B model answers in ~250 ms warm, while producing a 50-token chat
-reply from the same model would take roughly an order of magnitude longer.
-
-## Three optimizations drive the gap:
-
-- the batched branch decode turns every candidate's score into one shared
-  decode step (the full-vocabulary logits matmul is the cost, and it is
-  shared across all branches);
-
-- the async state restore turns per-tensor synchronous copies into one
-  staged stream drain (measured ~4x on this operation); and
-
-- prefix caching removes the prefill cost on repeat calls.
-
-One honest caveat documented with the numbers: these are warm timings with a
-cached prefix, on a specific GPU, and with flash attention disabled on ROCm
-because it is not bit-reproducible.
+- **Producer concentration never gates anything.** `confidence` and `certainty`
+  are pure functions of the returned `probabilities`. They describe how peaked an
+  answer distribution is, not whether it is right - a model can be maximally
+  confident and wrong. They never gate admission, caching, routing or
+  persistence. Everything that does gate is on the other axis: fork-state
+  equality, capacity preflights, adapter-scope application, snapshot identity,
+  memory budgets.
+- **Probabilities are conditional on the options you supplied.** They do not
+  measure the chance that every option is wrong. Say so in every model card and
+  every API document.

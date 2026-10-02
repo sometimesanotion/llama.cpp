@@ -2591,6 +2591,60 @@ static void test_start_loops_starts_io_worker() {
     mgr.terminate();
 }
 
+// The session store's byte-budget policy, without a server, a model or a budget flag. The wire
+// suite can only reach the evicting path when a pool holds more token bytes than the smallest
+// expressible budget (--decision-session-budget-mb is in mebibytes of tokens.size() * 4, so one
+// mebibyte is 262144 tokens), which a mid-size dense model cannot host. These cases therefore carry
+// the ordering and the skip rules, and the wire suite carries the wiring.
+static void test_decision_session_budget_policy() {
+    const auto ref = [](size_t bytes, int64_t last_used_ms, bool pinned = false, bool leased = false,
+                        bool removed = false, bool replacing = false) {
+        decision_session_ref r;
+        r.bytes        = bytes;
+        r.last_used_ms = last_used_ms;
+        r.pinned       = pinned;
+        r.leased       = leased;
+        r.removed      = removed;
+        r.replacing    = replacing;
+        return r;
+    };
+
+    // the charged total is every live reference; a reference whose turn ended and one that is about
+    // to be replaced are not charged, a pinned or in-flight one is still charged
+    std::vector<decision_session_ref> refs = {
+        ref(100, 10, /* pinned = */ false, /* leased = */ false, /* removed = */ false, /* replacing = */ false),
+        ref(200, 20, /* pinned = */ true,  /* leased = */ false, /* removed = */ false, /* replacing = */ false),
+        ref(300, 5,  /* pinned = */ false, /* leased = */ true,  /* removed = */ false, /* replacing = */ false),
+        ref(400, 1,  /* pinned = */ false, /* leased = */ false, /* removed = */ true,  /* replacing = */ false),
+        ref(500, 2,  /* pinned = */ false, /* leased = */ false, /* removed = */ false, /* replacing = */ true),
+    };
+    assert(decision_session_total_bytes(refs) == 600); // 100 + 200 + 300
+
+    // least recently used, and never a pinned, leased, removed or replaced reference
+    assert(pick_decision_session_victim(refs) == 0);
+
+    // with two evictable references the least recently used one wins, not the first in store order
+    refs[2].leased = false;
+    assert(pick_decision_session_victim(refs) == 2);
+    refs[2].leased = true;
+
+    // every remaining reference is held, so there is no victim and the admission must be refused
+    refs[0].pinned = true;
+    assert(pick_decision_session_victim(refs) == std::nullopt);
+
+    // a held reference is skipped, not deferred: the next evictable one is chosen instead
+    refs.push_back(ref(600, 99, /* pinned = */ false, /* leased = */ false, /* removed = */ false, /* replacing = */ false));
+    assert(pick_decision_session_victim(refs) == 5);
+
+    // the budget is mebibytes of owned token bytes, so the smallest expressible budget is 1 MiB and
+    // the whole tier needs that many tokens to be reachable at all
+    assert(1024u * 1024u / sizeof(llama_token) == 262144);
+
+    // an empty store has no victim, so an over-budget admission on an empty store is a refusal
+    assert(pick_decision_session_victim({}) == std::nullopt);
+    assert(decision_session_total_bytes({}) == 0);
+}
+
 int main(int argc, char ** argv) {
     test_instances_parse_round_trip();
     test_instances_lora_multi_scale();
@@ -2612,6 +2666,7 @@ int main(int argc, char ** argv) {
     test_resolve_honors_explicit_instance();
     test_fanout_calibration();
     test_start_loops_starts_io_worker();
+    test_decision_session_budget_policy();
 
     common_params params;
     std::string   adapter_path;
@@ -2627,6 +2682,14 @@ int main(int argc, char ** argv) {
     // registry, which segfaults in some container toolchains
     params.cpuparams.n_threads       = 4;
     params.cpuparams_batch.n_threads = 4;
+
+    // These tests exercise the pool over chat instances only and never enable the decision
+    // endpoint, so they state the sidecar off the way arg parsing does: decision_sidecar is
+    // derived from --decision-seqs, and a server without it runs no sidecar. Hand-built params
+    // that never went through arg parsing keep the struct default (true), which pairs a sidecar
+    // with zero decision sequences and is exactly the combination server_instances::load
+    // refuses - so it has to be stated here rather than inherited.
+    params.decision_sidecar = false;
 
     if (params.model.path.empty()) {
         fprintf(stderr, "WARNING: no model file provided. Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to run the borrowed-model test.\n");

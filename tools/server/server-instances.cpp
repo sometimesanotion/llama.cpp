@@ -1443,6 +1443,9 @@ void server_instances::start_instance_loop_locked(server_instance & inst) {
     }
     inst.loop_thread = std::thread([&inst]() { inst.ctx_server->start_loop(); });
     inst.loop_started = true;
+    // take thread ownership here, the one place a scheduler thread is created: false
+    // means a thread is running and owes a join, and the teardown sites consume it
+    inst.scheduler_joined = false;
 }
 
 bool server_instances::build_context_default(server_instance & inst) {
@@ -2372,32 +2375,6 @@ server_http_res_ptr server_instances::handle_post_rerank(const server_http_req &
     return dispatch(req, [](server_routes & routes, const server_http_req & req) { return routes.post_rerank(req); });
 }
 
-// A decision request that carries a live-session reference must be pinned to the instance that
-// owns the slot: the retained turn lives in one context and is not portable to another. Only a
-// body/query slot or session handle marks a request as session-pinned; a malformed body is
-// reported by the owning instance's handler, never here.
-// does the ORIGINAL request (before handle_post_decision stamps a pool id) name a routing
-// target? a request is targeted when it carries instance / snapshot / session / slot fields, or
-// a model field that is not the bare pool id and not a Jev alias. a bare pool id or a Jev alias
-// is echo-only: it never decides placement, so it is not a target.
-static bool decision_request_target_specified(const server_http_req & req, const std::string & base_name) {
-    auto model_names_target = [&](const std::string & model) {
-        return !model.empty() && model != base_name && model != "jev-latest" && model != "jev-preview";
-    };
-    try {
-        const json body = json::parse(req.body);
-        if (body.is_object()) {
-            if (!json_value(body, "instance", std::string()).empty()) return true;
-            if (!json_value(body, "snapshot", std::string()).empty()) return true;
-            if (model_names_target(json_value(body, "model", std::string()))) return true;
-        }
-    } catch (const std::exception &) {
-        // not targeted here: the instance handler reports the parse error
-    }
-    if (!req.get_param("instance").empty()) return true;
-    if (!req.get_param("snapshot").empty()) return true;
-    return model_names_target(req.get_param("model"));
-}
 
 static bool decision_request_is_session_pinned(const server_http_req & req) {
     try {
@@ -2616,52 +2593,48 @@ server_http_res_ptr server_instances::handle_post_session_sidecar(const server_h
     const std::pair<std::string, int> key = std::make_pair(inst->cfg.name, id_slot);
     std::string session_id;
     std::vector<common_adapter_lora_info> stale_loras;
+    server_http_res_ptr refusal;
     {
         std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        // expiry is proactive, so it runs here and not on the read path
+        stale_loras = reap_expired_decision_sessions_locked();
         // creating a session for a slot replaces any reference the slot already holds; its refs
         // are released after this lock is dropped (never across the store lock)
-        stale_loras = finalize_decision_session_locked(key);
+        auto replaced = finalize_decision_session_locked(key);
+        stale_loras.insert(stale_loras.end(), replaced.begin(), replaced.end());
         // token-snapshot budget: --decision-session-budget-mb caps the total owned token bytes
-        // across all retained references (0 = unlimited). an over-budget create is refused, never
-        // truncated; the LRU eviction tier that frees a reference under pressure is the warm tier.
-        if (params.decision_session_budget_mb > 0) {
-            const size_t budget = (size_t) params.decision_session_budget_mb * 1024u * 1024u;
-            size_t total = op_res->tokens.size() * sizeof(llama_token);
-            for (const auto & kv : decision_sessions_) {
-                if (kv.second.removed) {
-                    continue;
-                }
-                total += kv.second.tokens.size() * sizeof(llama_token);
-            }
-            if (total > budget) {
-                return make_error("creating this session snapshot would exceed the --decision-session-budget-mb "
-                                  "budget (" + std::to_string(total) + " > " + std::to_string(budget) + " bytes); "
-                                  "delete sessions or raise the budget", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
-            }
+        // across all retained references (0 = unlimited). Under pressure the least-recently-used
+        // unpinned, unleased reference is evicted and this one is admitted; only when every
+        // remaining reference is pinned or in flight is the request refused, never truncated.
+        refusal = admit_decision_session_locked(key, op_res->tokens, "creating this session snapshot",
+                                                stale_loras);
+        if (refusal == nullptr) {
+            decision_session_entry entry;
+            entry.instance      = inst->cfg.name;
+            entry.id_slot       = id_slot;
+            entry.turn          = body.value("turn", std::string());
+            entry.base_pos      = op_res->base_pos;
+            entry.tokens        = std::move(op_res->tokens);
+            entry.loras         = loras;
+            entry.adapter_scope = scope_str;
+            entry.content_hash  = decision_content_hash_of(entry.tokens, op_res->lora_scope);
+            entry.turn_counter  = decision_slot_turns_[key];
+            entry.created_ms    = now_ms();
+            entry.last_used_ms  = entry.created_ms;
+            entry.pinned        = pinned;
+            entry.ttl_ms        = ttl_ms;
+            session_id = mint_decision_handle_locked("ses_");
+            entry.session_id = session_id;
+            decision_sessions_[key] = std::move(entry);
+            decision_session_index_[session_id] = key;
+            decision_n_snapshots_++;
         }
-        decision_session_entry entry;
-        entry.instance      = inst->cfg.name;
-        entry.id_slot       = id_slot;
-        entry.turn          = body.value("turn", std::string());
-        entry.base_pos      = op_res->base_pos;
-        entry.tokens        = std::move(op_res->tokens);
-        entry.loras         = loras;
-        entry.adapter_scope = scope_str;
-        entry.content_hash  = decision_content_hash_of(entry.tokens, op_res->lora_scope);
-        entry.turn_counter  = decision_slot_turns_[key];
-        entry.created_ms    = now_ms();
-        entry.last_used_ms  = entry.created_ms;
-        entry.pinned        = pinned;
-        entry.ttl_ms        = ttl_ms;
-        session_id = "ses_" + std::to_string(llama_decision::fnv1a64(
-            std::to_string(entry.created_ms) + decision_session_key(inst->cfg.name, id_slot))) ;
-        entry.session_id = session_id;
-        decision_sessions_[key] = std::move(entry);
-        decision_session_index_[session_id] = key;
     }
-    if (!stale_loras.empty()) {
-        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
-        release_adapter_set(stale_loras);
+    // the reaper's and the replaced reference's refs are dropped here, after the store lock, and
+    // on the refusal path too: a refusal must not leak the references it collected
+    release_decision_refs(stale_loras);
+    if (refusal) {
+        return refusal;
     }
 
     json out;
@@ -2690,6 +2663,7 @@ server_http_res_ptr server_instances::handle_get_session_sidecar(const server_ht
             return make_error("session " + sid + " does not exist", ERROR_TYPE_NOT_FOUND);
         }
         const decision_session_entry & entry = it->second;
+        const decision_store_stats stats = decision_store_stats_locked();
         out["session_id"]   = sid;
         out["id_slot"]      = entry.id_slot;
         out["instance"]     = entry.instance;
@@ -2698,15 +2672,15 @@ server_http_res_ptr server_instances::handle_get_session_sidecar(const server_ht
         out["pinned"]       = entry.pinned;
         out["ttl_ms"]       = (long long) entry.ttl_ms;
         out["captured"]     = true;
-        out["bytes"]        = (long long) (entry.tokens.size() * sizeof(llama_token));
+        out["bytes"]        = (long long) decision_session_bytes(entry);
         out["created_ms"]   = (long long) entry.created_ms;
         out["last_used_ms"] = (long long) entry.last_used_ms;
         out["counters"]     = {
-            { "n_snapshots", (long long) decision_sessions_.size() },
-            { "n_reuses",    0LL },
-            { "n_releases",  0LL },
-            { "n_sessions",  (long long) decision_sessions_.size() },
-            { "bytes_total", (long long) entry.tokens.size() * sizeof(llama_token) },
+            { "n_snapshots", (long long) decision_n_snapshots_ },
+            { "n_reuses",    (long long) decision_n_reuses_ },
+            { "n_releases",  (long long) decision_n_releases_ },
+            { "n_sessions",  (long long) stats.n_sessions },
+            { "bytes_total", (long long) stats.bytes_total },
         };
     }
     return make_ok(out);
@@ -2807,6 +2781,16 @@ std::string server_instances::decision_session_key(const std::string & instance,
     return instance + ":" + std::to_string(id_slot);
 }
 
+size_t server_instances::decision_session_bytes(const decision_session_entry & entry) {
+    return entry.tokens.size() * sizeof(llama_token);
+}
+
+std::string server_instances::mint_decision_handle_locked(const std::string & prefix) {
+    char seq[24];
+    std::snprintf(seq, sizeof(seq), "%016llx", (unsigned long long) ++decision_handle_seq_);
+    return prefix + seq;
+}
+
 std::string server_instances::decision_adapter_scope_of(const std::vector<std::pair<std::string, float>> & scope) {
     if (scope.empty()) {
         return std::string();
@@ -2877,6 +2861,7 @@ std::vector<common_adapter_lora_info> server_instances::finalize_decision_sessio
     if (!entry.session_id.empty()) {
         decision_session_index_.erase(entry.session_id);
     }
+    decision_n_releases_++;
     // the refs are released by the caller AFTER the store lock is dropped: releasing needs
     // mutex_mgmt, and this store lock may be held on a scheduler thread (a release hook) where a
     // management op waiting on this scheduler thread also holds mutex_mgmt
@@ -2891,10 +2876,137 @@ void server_instances::erase_decision_session(const std::pair<std::string, int> 
         std::lock_guard<std::mutex> lock(mutex_decision_sessions);
         loras = finalize_decision_session_locked(key);
     }
-    if (!loras.empty()) {
+    release_decision_refs(loras);
+}
+
+// Ref release needs mutex_mgmt, and a store mutation may hold the store lock on a scheduler
+// thread (a slot release hook) where a management op waiting on that thread already holds
+// mutex_mgmt. Every store mutation therefore collects the refs under the store lock and hands
+// them here, after it is dropped.
+void server_instances::release_decision_refs(std::vector<common_adapter_lora_info> & loras) {
+    if (loras.empty()) {
+        return;
+    }
+    {
         std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
         release_adapter_set(loras);
     }
+    loras.clear();
+}
+
+// TTL is a reaper, not a read filter: expiry is proactive, so a client that creates sessions and
+// never reads them again still releases their bytes. It runs where the store is already taken
+// (the create and resolve points) and never from a timer thread. A pinned reference and a leased
+// reference are skipped, never deferred, so an in-flight decision always outlives its own ttl.
+std::vector<common_adapter_lora_info> server_instances::reap_expired_decision_sessions_locked() {
+    const int64_t now = now_ms();
+    std::vector<std::pair<std::string, int>> victims;
+    for (const auto & kv : decision_sessions_) {
+        const decision_session_entry & entry = kv.second;
+        if (entry.ttl_ms <= 0 || entry.pinned || entry.lease_count > 0) {
+            continue;
+        }
+        if (now - entry.last_used_ms > entry.ttl_ms) {
+            victims.push_back(kv.first);
+        }
+    }
+    std::vector<common_adapter_lora_info> loras;
+    for (const auto & key : victims) {
+        auto refs = finalize_decision_session_locked(key);
+        loras.insert(loras.end(), refs.begin(), refs.end());
+    }
+    return loras;
+}
+
+// --decision-session-budget-mb bounds the owned token bytes the store holds. Pressure evicts, in
+// order, until the incoming reference fits: evicting is cheaper than refusing a client whose own
+// reference would fit. A pinned reference and one held by an in-flight decision are never victims,
+// so the only outcome left when every remaining reference is held is the refusal. This is a host
+// memory bound and reads no answer, no distribution and no producer score.
+size_t decision_session_total_bytes(const std::vector<decision_session_ref> & refs) {
+    size_t total = 0;
+    for (const auto & ref : refs) {
+        if (!ref.removed && !ref.replacing) {
+            total += ref.bytes;
+        }
+    }
+    return total;
+}
+
+std::optional<size_t> pick_decision_session_victim(const std::vector<decision_session_ref> & refs) {
+    std::optional<size_t> victim;
+    for (size_t i = 0; i < refs.size(); ++i) {
+        if (refs[i].pinned || refs[i].leased || refs[i].removed || refs[i].replacing) {
+            continue;
+        }
+        if (!victim || refs[i].last_used_ms < refs[*victim].last_used_ms) {
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+server_http_res_ptr server_instances::admit_decision_session_locked(const std::pair<std::string, int> & exclude,
+                                                                  const std::vector<llama_token> & incoming,
+                                                                  const std::string & subject,
+                                                                  std::vector<common_adapter_lora_info> & evicted) {
+    if (params.decision_session_budget_mb <= 0) {
+        return nullptr;
+    }
+    // one view per store entry, in store order, with the key each one belongs to, so the pure policy
+    // above decides and this function only performs what it returns
+    std::vector<decision_session_ref> refs;
+    std::vector<std::pair<std::string, int>> keys;
+    refs.reserve(decision_sessions_.size());
+    keys.reserve(decision_sessions_.size());
+    for (const auto & kv : decision_sessions_) {
+        decision_session_ref ref;
+        ref.bytes        = decision_session_bytes(kv.second);
+        ref.last_used_ms = kv.second.last_used_ms;
+        ref.pinned       = kv.second.pinned;
+        ref.leased       = kv.second.lease_count > 0;
+        ref.removed      = kv.second.removed;
+        ref.replacing    = kv.first == exclude;
+        refs.push_back(ref);
+        keys.push_back(kv.first);
+    }
+    const size_t budget = (size_t) params.decision_session_budget_mb * 1024u * 1024u;
+    size_t total = incoming.size() * sizeof(llama_token) + decision_session_total_bytes(refs);
+    while (total > budget) {
+        std::optional<size_t> victim = pick_decision_session_victim(refs);
+        if (!victim) {
+            return make_error(subject + " would exceed the --decision-session-budget-mb budget (" +
+                              std::to_string(total) + " > " + std::to_string(budget) + " bytes); "
+                              "delete sessions or raise the budget", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+        }
+        total -= refs[*victim].bytes;
+        auto refs_out = finalize_decision_session_locked(keys[*victim]);
+        evicted.insert(evicted.end(), refs_out.begin(), refs_out.end());
+        refs.erase(refs.begin() + *victim);
+        keys.erase(keys.begin() + *victim);
+    }
+    return nullptr;
+}
+
+server_instances::decision_store_stats server_instances::decision_store_stats_locked() const {
+    // the same view and the same charged-bytes rule the budget uses, so a client reading the
+    // counters sees exactly what the budget is measuring
+    std::vector<decision_session_ref> refs;
+    refs.reserve(decision_sessions_.size());
+    for (const auto & kv : decision_sessions_) {
+        decision_session_ref ref;
+        ref.bytes   = decision_session_bytes(kv.second);
+        ref.removed = kv.second.removed;
+        refs.push_back(ref);
+    }
+    decision_store_stats stats;
+    for (const auto & ref : refs) {
+        if (!ref.removed) {
+            stats.n_sessions++;
+        }
+    }
+    stats.bytes_total = decision_session_total_bytes(refs);
+    return stats;
 }
 
 void server_instances::on_decision_slot_release(const std::string & instance, int id_slot) {
@@ -2924,10 +3036,7 @@ void server_instances::decision_sessions_clear() {
         decision_slot_turns_.clear();
         decision_snapshot_resolve_.clear();
     }
-    if (!loras.empty()) {
-        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
-        release_adapter_set(loras);
-    }
+    release_decision_refs(loras);
 }
 
 std::shared_ptr<server_decision_snapshot> server_instances::decision_snapshot_by_key(const std::string & key) {
@@ -3000,6 +3109,64 @@ server_http_res_ptr server_instances::decision_snapshot_op(const std::shared_ptr
     return nullptr;
 }
 
+// Resolve a first-class session handle. This is one of the two points the TTL reaper runs from, so
+// a handle whose reference has expired is reported as an unknown session. The snapshot is an owned
+// copy: the store keeps its own tokens, and an eviction under this lease cannot pull them out from
+// under the in-flight decision.
+server_http_res_ptr server_instances::resolve_decision_session(const std::string & session_id,
+                                                              const std::string & instance_field,
+                                                              const std::string & model_field,
+                                                              const std::shared_ptr<server_decision_snapshot> & snap,
+                                                              std::pair<std::string, int> & key_out) {
+    std::vector<common_adapter_lora_info> reaped;
+    server_http_res_ptr refusal;
+    {
+        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        reaped = reap_expired_decision_sessions_locked();
+        auto idx = decision_session_index_.find(session_id);
+        if (idx == decision_session_index_.end()) {
+            refusal = make_error("session " + session_id + " does not exist", ERROR_TYPE_NOT_FOUND);
+        } else {
+            key_out = idx->second;
+            auto it = decision_sessions_.find(key_out);
+            if (it == decision_sessions_.end()) {
+                refusal = make_error("session " + session_id + " does not exist", ERROR_TYPE_NOT_FOUND);
+            } else {
+                decision_session_entry & entry = it->second;
+                if (entry.removed || decision_slot_turns_[key_out] != entry.turn_counter) {
+                    // the slot advanced past the captured turn: never answer from an old turn
+                    refusal = make_error("session " + session_id + " is stale: the source slot's turn ended; "
+                                         "create a new session", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
+                } else if (!instance_field.empty() && instance_field != entry.instance) {
+                    refusal = make_error("session " + session_id + " belongs to instance '" + entry.instance +
+                                         "', not '" + instance_field + "'", ERROR_TYPE_INVALID_REQUEST);
+                } else if (!model_field.empty() && model_field != base_name) {
+                    const auto comps = string_split<std::string>(model_field, ':');
+                    if (comps.size() >= 2 && comps[0] == base_name && comps.back() != entry.instance) {
+                        refusal = make_error("session " + session_id + " belongs to instance '" + entry.instance +
+                                             "', not '" + comps.back() + "'", ERROR_TYPE_INVALID_REQUEST);
+                    }
+                }
+                if (refusal == nullptr) {
+                    snap->tokens        = entry.tokens;
+                    snap->loras         = entry.loras;
+                    snap->adapter_scope = entry.adapter_scope;
+                    snap->source_slot   = entry.id_slot;
+                    snap->turn          = entry.turn;
+                    snap->session_id    = session_id;
+                    snap->base_pos      = entry.base_pos;
+                    snap->warm_tag      = entry.content_hash;
+                    entry.last_used_ms  = now_ms();
+                    ++entry.lease_count;
+                    decision_n_reuses_++;
+                }
+            }
+        }
+    }
+    release_decision_refs(reaped);
+    return refusal;
+}
+
 server_http_res_ptr server_instances::attach_decision_snapshot(const json & body, server_http_req & routed,
                                                                std::pair<std::string, int> & lease_out) {
     const std::string session_id = body.value("session_id", std::string());
@@ -3013,43 +3180,10 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
 
     if (!session_id.empty()) {
         // first-class session: the pool store is the single owner
-        std::lock_guard<std::mutex> lock(mutex_decision_sessions);
-        auto idx = decision_session_index_.find(session_id);
-        if (idx == decision_session_index_.end()) {
-            return make_error("session " + session_id + " does not exist", ERROR_TYPE_NOT_FOUND);
+        if (server_http_res_ptr err = resolve_decision_session(
+                session_id, instance_field, model_field, snap, key)) {
+            return err;
         }
-        key = idx->second;
-        auto it = decision_sessions_.find(key);
-        if (it == decision_sessions_.end()) {
-            return make_error("session " + session_id + " does not exist", ERROR_TYPE_NOT_FOUND);
-        }
-        decision_session_entry & entry = it->second;
-        if (entry.removed || decision_slot_turns_[key] != entry.turn_counter) {
-            // the slot advanced past the captured turn: never answer from an old turn
-            return make_error("session " + session_id + " is stale: the source slot's turn ended; "
-                              "create a new session", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
-        }
-        if (!instance_field.empty() && instance_field != entry.instance) {
-            return make_error("session " + session_id + " belongs to instance '" + entry.instance +
-                              "', not '" + instance_field + "'", ERROR_TYPE_INVALID_REQUEST);
-        }
-        if (!model_field.empty() && model_field != base_name) {
-            const auto comps = string_split<std::string>(model_field, ':');
-            if (comps.size() >= 2 && comps[0] == base_name && comps.back() != entry.instance) {
-                return make_error("session " + session_id + " belongs to instance '" + entry.instance +
-                                  "', not '" + comps.back() + "'", ERROR_TYPE_INVALID_REQUEST);
-            }
-        }
-        snap->tokens        = entry.tokens;
-        snap->loras         = entry.loras;
-        snap->adapter_scope = entry.adapter_scope;
-        snap->source_slot   = entry.id_slot;
-        snap->turn          = entry.turn;
-        snap->session_id    = session_id;
-        snap->base_pos      = entry.base_pos;
-        snap->warm_tag      = entry.content_hash;
-        entry.last_used_ms  = now_ms();
-        ++entry.lease_count;
         leased = true;
     } else {
         // implicit id_slot session: eager capture through a read-only op on the owning instance
@@ -3062,8 +3196,12 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
 
         // reuse the eager snapshot for the current turn; otherwise capture now (no lazy window)
         std::unique_ptr<server_task_result_decision_snapshot> op_res;
+        std::vector<common_adapter_lora_info> reaped;
         {
             std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+            // expiry is proactive, so it runs here and not on the read path: an entry past its ttl
+            // is reaped before the reuse check can refresh it
+            reaped = reap_expired_decision_sessions_locked();
             auto it = decision_sessions_.find(key);
             if (it != decision_sessions_.end() && !it->second.removed &&
                 decision_slot_turns_[key] == it->second.turn_counter) {
@@ -3077,9 +3215,11 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
                 snap->warm_tag      = entry.content_hash;
                 entry.last_used_ms  = now_ms();
                 ++entry.lease_count;
+                decision_n_reuses_++;
                 leased = true;
             }
         }
+        release_decision_refs(reaped);
         if (!leased) {
             // the store mutex is never held across an instance_op
             if (server_http_res_ptr err = decision_snapshot_op(inst, id_slot, op_res)) {
@@ -3100,6 +3240,7 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
                 }
             }
             std::vector<common_adapter_lora_info> stale_loras_out;
+            server_http_res_ptr refusal;
             {
                 std::lock_guard<std::mutex> lock(mutex_decision_sessions);
                 // a slot release may have advanced the turn while the op ran; drop the stale entry
@@ -3109,53 +3250,45 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
                 if (it != decision_sessions_.end() && it->second.removed) {
                     stale_loras = finalize_decision_session_locked(key);
                 }
-                decision_session_entry entry;
                 // token-snapshot budget: the capture path holds the same --decision-session-budget-mb
                 // cap as the create path, so a client that only ever sends id_slot-pinned decisions
-                // cannot grow the store past it. The entry at this key is about to be replaced, so it
-                // is excluded from the total rather than counted twice.
-                if (params.decision_session_budget_mb > 0) {
-                    const size_t budget = (size_t) params.decision_session_budget_mb * 1024u * 1024u;
-                    size_t total = op_res->tokens.size() * sizeof(llama_token);
-                    for (const auto & kv : decision_sessions_) {
-                        if (kv.second.removed || kv.first == key) {
-                            continue;
-                        }
-                        total += kv.second.tokens.size() * sizeof(llama_token);
-                    }
-                    if (total > budget) {
-                        return make_error("capturing this id_slot snapshot would exceed the --decision-session-budget-mb "
-                                          "budget (" + std::to_string(total) + " > " + std::to_string(budget) + " bytes); "
-                                          "delete sessions or raise the budget", ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
-                    }
+                // cannot grow the store past it. Evict-then-admit, exactly as the create path does;
+                // the entry at this key is about to be replaced, so it is neither charged twice nor
+                // a victim.
+                refusal = admit_decision_session_locked(key, op_res->tokens,
+                                                        "capturing this id_slot snapshot", stale_loras);
+                if (refusal == nullptr) {
+                    decision_session_entry entry;
+                    entry.instance       = inst->cfg.name;
+                    entry.id_slot        = id_slot;
+                    entry.base_pos       = op_res->base_pos;
+                    entry.tokens         = std::move(op_res->tokens);
+                    entry.loras          = loras;
+                    entry.adapter_scope  = scope_str;
+                    entry.content_hash   = decision_content_hash_of(entry.tokens, op_res->lora_scope);
+                    entry.turn_counter   = decision_slot_turns_[key];
+                    entry.created_ms     = now_ms();
+                    entry.last_used_ms   = entry.created_ms;
+                    decision_sessions_[key] = std::move(entry);
+                    decision_session_entry & stored = decision_sessions_[key];
+                    snap->tokens        = stored.tokens;
+                    snap->loras         = stored.loras;
+                    snap->adapter_scope = stored.adapter_scope;
+                    snap->source_slot   = id_slot;
+                    snap->base_pos      = stored.base_pos;
+                    snap->warm_tag      = stored.content_hash;
+                    ++stored.lease_count;
+                    leased = true;
+                    decision_n_snapshots_++;
                 }
-                entry.instance       = inst->cfg.name;
-                entry.id_slot        = id_slot;
-                entry.base_pos       = op_res->base_pos;
-                entry.tokens         = std::move(op_res->tokens);
-                entry.loras          = loras;
-                entry.adapter_scope  = scope_str;
-                entry.content_hash   = decision_content_hash_of(entry.tokens, op_res->lora_scope);
-                entry.turn_counter   = decision_slot_turns_[key];
-                entry.created_ms     = now_ms();
-                entry.last_used_ms   = entry.created_ms;
-                decision_sessions_[key] = std::move(entry);
-                decision_session_entry & stored = decision_sessions_[key];
-                snap->tokens        = stored.tokens;
-                snap->loras         = stored.loras;
-                snap->adapter_scope = stored.adapter_scope;
-                snap->source_slot   = id_slot;
-                snap->base_pos      = stored.base_pos;
-                snap->warm_tag      = stored.content_hash;
-                ++stored.lease_count;
-                leased = true;
-                if (!stale_loras.empty()) {
-                    stale_loras_out = std::move(stale_loras);
-                }
+                stale_loras_out = std::move(stale_loras);
             }
-            if (!stale_loras_out.empty()) {
-                std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
-                release_adapter_set(stale_loras_out);
+            // the evicted and stale references' refs, and the scope this request just resolved, are
+            // all dropped here: a refusal must not leak the references it collected
+            release_decision_refs(stale_loras_out);
+            if (refusal) {
+                release_decision_refs(loras);
+                return refusal;
             }
         }
     }
@@ -3165,12 +3298,10 @@ server_http_res_ptr server_instances::attach_decision_snapshot(const json & body
 
     // embed a transient resolve key so the sidecar route can fetch the owned snapshot; the pool
     // holds the lease (and the adapter refs) until release_decision_snapshot_after_dispatch
-    char keybuf[32];
-    std::snprintf(keybuf, sizeof(keybuf), "snp_%08llx", (unsigned long long) (llama_decision::fnv1a64(
-        std::to_string(now_ms()) + decision_session_key(key.first, key.second))));
-    const std::string snap_key = keybuf;
+    std::string snap_key;
     {
         std::lock_guard<std::mutex> lock(mutex_decision_sessions);
+        snap_key = mint_decision_handle_locked("snp_");
         decision_snapshot_resolve_[snap_key] = snap;
     }
     lease_out = key;
@@ -3211,10 +3342,7 @@ void server_instances::release_decision_snapshot_after_dispatch(const std::strin
             removed_loras = finalize_decision_session_locked(entry_key);
         }
     }
-    if (!removed_loras.empty()) {
-        std::lock_guard<std::mutex> mgmt_lock(mutex_mgmt);
-        release_adapter_set(removed_loras);
-    }
+    release_decision_refs(removed_loras);
 }
 
 server_http_res_ptr server_instances::handle_get_lora_adapters(const server_http_req & req) {

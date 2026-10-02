@@ -3,7 +3,7 @@
 #define private public
 #include "decision-engine.h"
 #undef private
-#include "../src/llama-ext.h"  // staging API: sequence-state debug transfer counters
+#include "../src/llama-ext.h"  // staging API
 #include "chat.h"
 #include "common.h"
 #include "decision-protocol.h"
@@ -15,6 +15,13 @@
 #include "llama.h"
 #include "speculative.h"
 #include "testing.h"
+
+// Staging observability seam for the state save/load bulk-copy path, declared here because it is
+// not part of any llama.cpp API: the number of tensor data transfers staged since the last reset.
+// A transposed cache region is one strided transfer instead of one per embedding, so the count is
+// what the bulk-copy assertions below read. State staging runs on the scheduler thread only.
+void     llama_state_seq_debug_reset_transfers();
+uint64_t llama_state_seq_debug_transfer_count();
 
 #include <algorithm>
 #include <cctype>
@@ -118,6 +125,18 @@ static size_t count_substring(const std::string & hay, const std::string & needl
         ++n;
     }
     return n;
+}
+
+// Scoring fields is two steps: compile them into a plan, then score the plan. A caller that scores
+// the same fields more than once compiles them once, so the engine has one entry and this helper
+// is the only place the two steps are written together. It exists here, not in the engine, because
+// no production caller owns the compilation: every one of them already has the plan.
+static llama_decision::batch_result decide_batch(llama_decision::engine &                         eng,
+                                                const std::string &                              shared_text,
+                                                const std::vector<std::string> &                 contexts,
+                                                const std::vector<llama_decision::field_input> & fields,
+                                                const llama_decision::options &                   opt) {
+    return eng.decide_batch(eng.compile_fields(fields, opt), shared_text, contexts, opt);
 }
 
 // Sorted, comma-joined key set of a JSON object, so a test can pin the exact shape of an envelope.
@@ -380,7 +399,7 @@ static void test_numeric_questions(testing & t) {
         assert_close(t, "aggregate median is the value-space quantile", 1.0,
                      med.at("aggregate").get<double>(), 1e-6);
 
-        req.diagnostics = true;
+        req.envelope.diagnostics = true;
         const common_json diag = llama_decision::assemble_decision_response(req, probs, "m", usage);
         const auto & dage = diag.at("answers").at("age");
         t.assert_true("diagnostics add certainty", dage.contains("certainty"));
@@ -442,7 +461,7 @@ static void test_temperature_effect(testing & t) {
 
     t.test("assemble emits confidence and certainty consistent with the probabilities", [](testing & t) {
         auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-        req.diagnostics = true;
+        req.envelope.diagnostics = true;
         const std::vector<std::vector<float>> probs = {
             { 0.2f, 0.8f },
             { 0.5f, 0.3f, 0.2f },
@@ -458,7 +477,7 @@ static void test_temperature_effect(testing & t) {
         };
 
         const common_json out = llama_decision::assemble_decision_response(req, probs, "m", usage);
-        req.confidence_profile = "local";
+        req.envelope.knobs.confidence_profile = "local";
         const common_json local_out = llama_decision::assemble_decision_response(req, probs, "m", usage);
 
         const auto & dept = out.at("answers").at("dept");
@@ -484,7 +503,7 @@ static void test_temperature_effect(testing & t) {
 static void test_confidence_certainty_axes(testing & t) {
     t.test("confidence is the Jev winner-share rescale and certainty is the winner share", [](testing & t) {
         auto req        = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-        req.diagnostics = true;
+        req.envelope.diagnostics = true;
         const std::vector<std::vector<float>> probs = {
             { 0.2f, 0.8f }, // noul: neither axis is emitted
             { 0.6f, 0.3f, 0.1f }, // choice
@@ -493,7 +512,7 @@ static void test_confidence_certainty_axes(testing & t) {
         common_json usage      = common_json::object();
         usage["output_tokens"] = 0;
         const common_json out  = llama_decision::assemble_decision_response(req, probs, "m", usage);
-        req.confidence_profile = "local";
+        req.envelope.knobs.confidence_profile = "local";
         const common_json local_out = llama_decision::assemble_decision_response(req, probs, "m", usage);
 
         const auto & dept = out.at("answers").at("dept");
@@ -526,7 +545,7 @@ static void expect_decision_reject(testing & t, const std::string & body_text, c
 static void test_confidence_profile(testing & t) {
     t.test("the Jev confidence profile is the default certainty-based winner share", [](testing & t) {
         auto req        = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-        req.diagnostics = true;
+        req.envelope.diagnostics = true;
         const std::vector<std::vector<float>> probs = {
             { 0.2f, 0.8f },          // noul: no confidence either way
             { 0.6f, 0.3f, 0.1f },    // choice, N=3: (3*0.6-1)/2 = 0.4
@@ -536,7 +555,7 @@ static void test_confidence_profile(testing & t) {
         usage["output_tokens"] = 0;
 
         const common_json jev   = llama_decision::assemble_decision_response(req, probs, "m", usage);
-        req.confidence_profile  = "local";
+        req.envelope.knobs.confidence_profile  = "local";
         const common_json local = llama_decision::assemble_decision_response(req, probs, "m", usage);
 
         assert_close(t, "default choice confidence is (N*p_max-1)/(N-1)", 0.4,
@@ -564,13 +583,13 @@ static void test_confidence_profile(testing & t) {
         common_json body = common_json::parse(decision_valid_body());
         body["confidence_profile"] = "jev";
         t.assert_equal("jev is accepted", "jev",
-                       llama_decision::parse_decision_request(body).confidence_profile);
+                       llama_decision::parse_decision_request(body).envelope.knobs.confidence_profile);
         body["confidence_profile"] = "local";
         t.assert_equal("local is accepted", "local",
-                       llama_decision::parse_decision_request(body).confidence_profile);
+                       llama_decision::parse_decision_request(body).envelope.knobs.confidence_profile);
         body.erase("confidence_profile");
         t.assert_equal("absent defaults to jev (certainty-based)", "jev",
-                       llama_decision::parse_decision_request(body).confidence_profile);
+                       llama_decision::parse_decision_request(body).envelope.knobs.confidence_profile);
         expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":"other"})",
                                "confidence_profile must be local or jev");
         expect_decision_reject(t, R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"confidence_profile":1})",
@@ -1012,7 +1031,7 @@ static void test_decision_parse(testing & t) {
                       llama_decision::select_request_shape(body) == llama_decision::request_shape::jev);
 
         const auto req = llama_decision::parse_decision_request(body);
-        t.assert_equal("model echoed", std::string("m"), req.model);
+        t.assert_equal("model echoed", std::string("m"), req.envelope.model);
         t.assert_equal("three questions", (size_t) 3, req.questions.size());
         t.assert_equal("noul canonical", std::string("noul"), req.questions[0].type);
         t.assert_equal("noul two options", (size_t) 2, req.questions[0].options.size());
@@ -1020,8 +1039,8 @@ static void test_decision_parse(testing & t) {
         t.assert_equal("choice three options", (size_t) 3, req.questions[1].options.size());
         t.assert_equal("scale becomes score", std::string("score"), req.questions[2].type);
         t.assert_equal("score three levels", (size_t) 3, req.questions[2].options.size());
-        assert_close(t, "temperature parsed", 1.0, req.temperature);
-        t.assert_equal("permutations parsed", 1, req.permutations);
+        assert_close(t, "temperature parsed", 1.0, req.envelope.knobs.temperature);
+        t.assert_equal("permutations parsed", 1, req.envelope.knobs.permutations);
         t.assert_true("structured criterion kept",
                       req.questions[2].options[0].original.is_object());
     });
@@ -1077,7 +1096,6 @@ static void test_decision_parse(testing & t) {
         with_slot["id_slot"] = 3;
         const auto slot = llama_decision::parse_session_ref(with_slot);
         t.assert_true("id_slot marks a session", slot.present);
-        t.assert_equal("id_slot value", 3, slot.id_slot);
         t.assert_equal("session_pos defaults to derived", -1, slot.session_pos);
 
         common_json pinned = with_slot;
@@ -1091,7 +1109,6 @@ static void test_decision_parse(testing & t) {
         const auto sid = llama_decision::parse_session_ref(with_id);
         t.assert_true("session_id marks a session", sid.present);
         t.assert_equal("session_id value", std::string("ses_1234"), sid.session_id);
-        t.assert_equal("a session_id session has no id_slot", -1, sid.id_slot);
         common_json sid_pinned = with_id;
         sid_pinned["session_pos"] = 7;
         const auto sid_pin = llama_decision::parse_session_ref(sid_pinned);
@@ -1121,7 +1138,7 @@ static void test_decision_parse(testing & t) {
 
         const auto a = llama_decision::parse_decision_request(base);
         const auto b = llama_decision::parse_decision_request(with_extra);
-        t.assert_equal("unknown top-level field does not change the model", a.model, b.model);
+        t.assert_equal("unknown top-level field does not change the model", a.envelope.model, b.envelope.model);
         t.assert_equal("unknown top-level field does not change the question count", a.questions.size(), b.questions.size());
         bool same = a.questions.size() == b.questions.size();
         for (size_t i = 0; same && i < a.questions.size(); ++i) {
@@ -1207,15 +1224,15 @@ static void test_decision_parse(testing & t) {
     t.test("diagnostics is an optional boolean, off by default", [](testing & t) {
         const auto off = llama_decision::parse_decision_request(common_json::parse(
             R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}})"));
-        t.assert_true("diagnostics defaults off", !off.diagnostics);
+        t.assert_true("diagnostics defaults off", !off.envelope.diagnostics);
 
         const auto on = llama_decision::parse_decision_request(common_json::parse(
             R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":true})"));
-        t.assert_true("diagnostics true is parsed", on.diagnostics);
+        t.assert_true("diagnostics true is parsed", on.envelope.diagnostics);
 
         const auto explicit_off = llama_decision::parse_decision_request(common_json::parse(
             R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":false})"));
-        t.assert_true("diagnostics false is parsed", !explicit_off.diagnostics);
+        t.assert_true("diagnostics false is parsed", !explicit_off.envelope.diagnostics);
 
         expect_decision_reject(t,
             R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},"diagnostics":"yes"})",
@@ -1223,17 +1240,71 @@ static void test_decision_parse(testing & t) {
     });
 }
 
+// Set by --record-golden: rewrite the value goldens instead of comparing them, for the rare
+// intentional contract change that moves a golden's bytes.
+static bool record_golden = false;
+
+// The uniform score vectors for the canonical body, one per question in request order. Assembly
+// requires a vector of exactly the question's option count, so a uniform distribution is an input
+// here, never a substitute the assembler supplies.
+static std::vector<std::vector<float>> decision_valid_uniform_scores() {
+    return {
+        { 0.5f, 0.5f },                                   // refund: noul over [false, true]
+        { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f },       // dept: choice over 3 options
+        { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f },       // urgency: score over 3 levels
+    };
+}
+
+// The failure message assembly raised for these scores, or an empty string when it accepted them.
+// A score vector that is missing or mis-sized is an internal defect, so the failure names the
+// question and both counts; the readout already refuses to return the wrong number of scores.
+static std::string decision_assembly_failure(const std::vector<std::vector<float>> & probs) {
+    try {
+        const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+        common_json usage = common_json::object();
+        usage["input_tokens"]  = 0;
+        usage["output_tokens"] = 0;
+        (void) llama_decision::assemble_decision_response(req, probs, "m", usage);
+        return std::string();
+    } catch (const std::runtime_error & e) {
+        return e.what();
+    }
+}
+
+// The multi-context response the server builds: one answers/usage pair per context, in request
+// order, over the same questions. The assembler runs once per context here, so this is the shape
+// a per-context change in assembly would move.
+static common_json decision_contexts_from_fixed_scores() {
+    const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+    const std::vector<std::vector<std::vector<float>>> all = {
+        { { 0.25f, 0.75f }, { 0.6f, 0.3f, 0.1f }, { 0.2f, 0.3f, 0.5f } },
+        { { 0.10f, 0.90f }, { 0.1f, 0.7f, 0.2f }, { 0.3f, 0.3f, 0.4f } },
+    };
+    common_json contexts = common_json::array();
+    for (size_t ci = 0; ci < all.size(); ++ci) {
+        common_json usage = common_json::object();
+        usage["input_tokens"]  = 7 + (long long) ci;
+        usage["output_tokens"] = 0;
+        const common_json ans = llama_decision::assemble_decision_response(req, all[ci], "m", usage, nullptr);
+        contexts.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
+    }
+    common_json out = common_json::object();
+    out["model"]    = "m";
+    out["contexts"] = contexts;
+    return out;
+}
+
 static void test_decision_assemble(testing & t) {
     t.test("canonical envelope has the required shape and semantics", [](testing & t) {
         auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
-        req.diagnostics = true;
+        req.envelope.diagnostics = true;
         common_json usage = common_json::object();
         usage["input_tokens"]    = 0;
         usage["output_tokens"]   = 0;
         usage["cached_tokens"]   = 0;
         usage["state_cache_hit"] = false;
 
-        const common_json out = llama_decision::assemble_decision_response(req, {}, req.model, usage);
+        const common_json out = llama_decision::assemble_decision_response(req, decision_valid_uniform_scores(), req.envelope.model, usage);
         t.assert_equal("model echoed", std::string("m"), out.at("model").get<std::string>());
 
         const auto & answers = out.at("answers");
@@ -1262,6 +1333,131 @@ static void test_decision_assemble(testing & t) {
         t.assert_true("legend round-trips the structured value",
                       urg.at("legend").at("0").is_object() && urg.at("legend").at("0").at("label").get<std::string>() == "calm");
         t.assert_equal("output_tokens is zero", 0, out.at("usage").at("output_tokens").get<int>());
+    });
+
+    t.test("a score vector that stops short fails closed naming the question", [](testing & t) {
+        // the last question has no vector at all
+        const std::string missing = decision_assembly_failure({ { 0.5f, 0.5f }, { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f } });
+        t.assert_true("a missing vector is refused: " + missing, missing.find("urgency") != std::string::npos);
+
+        // a vector shorter than the option count
+        const std::string short_vec = decision_assembly_failure({ { 0.5f, 0.5f }, { 0.6f, 0.4f }, { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f } });
+        t.assert_true("a short vector is refused naming the question: " + short_vec,
+                      short_vec.find("dept") != std::string::npos);
+        t.assert_true("a short vector reports both counts: " + short_vec,
+                      short_vec.find("3") != std::string::npos && short_vec.find("2") != std::string::npos);
+    });
+
+    t.test("a score vector one too long fails closed naming the question", [](testing & t) {
+        const std::string long_vec =
+            decision_assembly_failure({ { 0.5f, 0.5f }, { 0.6f, 0.3f, 0.1f, 0.0f }, { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f } });
+        t.assert_true("an over-long vector is refused naming the question: " + long_vec,
+                      long_vec.find("dept") != std::string::npos);
+    });
+
+    t.test("a full-length vector of zeros is accepted and reads as zero confidence", [](testing & t) {
+        // control: the guard keys on the vector's length, never on its content. A degenerate but
+        // well-formed distribution is still a distribution, and confidence 0.0 is a documented
+        // value, not a defect.
+        const std::string none = decision_assembly_failure({ { 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } });
+        t.assert_true("a full-length zero vector is accepted", none.empty());
+
+        const auto req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
+        common_json usage = common_json::object();
+        usage["input_tokens"]  = 0;
+        usage["output_tokens"] = 0;
+        const common_json out = llama_decision::assemble_decision_response(
+            req, { { 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } }, "m", usage);
+        assert_close(t, "choice confidence of an all-zero vector is 0", 0.0,
+                     out.at("answers").at("dept").at("confidence").get<double>());
+        assert_close(t, "choice winner of an all-zero vector is the first option", 0.0,
+                     out.at("answers").at("dept").at("probabilities").at("billing").get<double>());
+        assert_close(t, "noul reads 0 with no true mass", 0.0,
+                     out.at("answers").at("refund").at("noul").get<double>());
+    });
+
+    t.test("a two-context response matches the committed contexts golden", [](testing & t) {
+        const std::string actual = decision_contexts_from_fixed_scores().dump(2) + "\n";
+        if (record_golden) {
+            write_file(fixture_path("decision_contexts.golden.json"), actual);
+            return;
+        }
+        const std::string golden = read_file(fixture_path("decision_contexts.golden.json"));
+        t.assert_equal("contexts golden is byte-identical", golden, actual);
+    });
+}
+
+// The adapter scope a decision decodes under is the only record of what conditioned the replay, and
+// the response reports it. A scope the context would not install therefore cannot be reported as
+// if it had been: the request is refused. This is a capability check, in the same class as "the slot
+// does not exist", and it never reads a producer score.
+static void test_adapter_scope_applied(testing & t) {
+    // True when the request was refused for an unapplied scope, recording the message it refused
+    // with so the scope in the message can be asserted.
+    static auto refused = [](const std::string & scope, int apply_status, std::string * message) {
+        try {
+            llama_decision::require_adapter_scope(scope, apply_status);
+            return false;
+        } catch (const llama_decision::semantic_error & e) {
+            if (message != nullptr) {
+                *message = e.what();
+            }
+            return true;
+        }
+    };
+
+    t.test("a scope the context would not install refuses the decision", [](testing & t) {
+        std::string message;
+        const bool thrown = refused("adapter-scope-v1:1234", 1, &message);
+        t.assert_true("an unapplied scope throws", thrown);
+        t.assert_true("the refusal names the scope: " + message,
+                      message.find("adapter-scope-v1:1234") != std::string::npos);
+    });
+
+    t.test("an unapplied base scope refuses the decision", [](testing & t) {
+        // the base model is the empty scope, and it is the scope diagnostics report as "base"
+        std::string message;
+        const bool thrown = refused("", 1, &message);
+        t.assert_true("an unapplied base scope throws", thrown);
+        t.assert_true("the refusal names base: " + message, message.find("base") != std::string::npos);
+    });
+
+    t.test("an applied scope is accepted whatever its name", [](testing & t) {
+        // control: the check keys on the apply status alone, so an applied base scope stays valid
+        llama_decision::require_adapter_scope("", 0);
+        llama_decision::require_adapter_scope("adapter-scope-v1:1234", 0);
+        t.assert_true("an applied scope does not throw", true);
+    });
+
+    t.test("the base scope applies to a real context and a broken one does not", [](testing & t) {
+        const std::string path = decision_cpu_model_path();
+        if (path.empty()) {
+            t.skip("no model for the adapter scope check");
+            return;
+        }
+        cpu_test_engine eng;
+        if (!eng.load(path)) {
+            t.assert_true("model loads", false);
+            return;
+        }
+
+        // the empty scope is the base model, and it must succeed on every model
+        std::vector<common_adapter_lora_info> base;
+        t.assert_equal("the base scope applies", 0, common_set_adapter_lora(eng.ctx, base));
+
+        // an entry that cannot be installed: no adapter behind a non-zero scale
+        common_adapter_lora_info missing;
+        missing.path  = "not-loaded.gguf";
+        missing.scale = 1.0f;
+        missing.ptr   = nullptr;
+        std::vector<common_adapter_lora_info> broken = { missing };
+
+        const int status = common_set_adapter_lora(eng.ctx, broken);
+        t.assert_true("a scope with an uninstallable entry does not report success", status != 0);
+        t.assert_true("and it refuses the decision", refused("adapter-scope-v1:1234", status, nullptr));
+
+        // a refused apply must leave the context on its previous scope, not half-switched
+        t.assert_equal("the context keeps the scope it had", 0, common_set_adapter_lora(eng.ctx, base));
     });
 }
 
@@ -1588,10 +1784,6 @@ static std::vector<std::vector<float>> test_letter_readout(
     return all.empty() ? std::vector<std::vector<float>>{} : std::move(all[0]);
 }
 
-// Set by --record-golden: rewrite the value goldens instead of comparing them, for the rare
-// intentional contract change that moves a golden's bytes.
-static bool record_golden = false;
-
 // Deterministic typed-record output for a fixed score vector: a value golden for the generic
 // front-end that does not depend on any model weights.
 static common_json generic_record_from_fixed_scores() {
@@ -1604,10 +1796,10 @@ static common_json generic_record_from_fixed_scores() {
     const auto cs = llama_decision::compile_schema(schema, "Answer from the context.");
     llama_decision::result r;
     r.fields = {
-        { 0, 1.0f, 2, true, { 0.7f, 0.3f } },       // active: winner true
-        { 1, 1.0f, 4, true, { 0.2f, 0.5f, 0.3f } }, // severity: winner medium
-        { 2, 1.0f, 3, true, { 0.1f, 0.2f, 0.7f } }, // count: winner 3
-        { 0, 1.0f, 3, true, { 0.6f, 0.3f, 0.1f } }, // amount: winner 0.0, mean 0.25
+        { 0, 2, { 0.7f, 0.3f } },       // active: winner true
+        { 1, 4, { 0.2f, 0.5f, 0.3f } }, // severity: winner medium
+        { 2, 3, { 0.1f, 0.2f, 0.7f } }, // count: winner 3
+        { 0, 3, { 0.6f, 0.3f, 0.1f } }, // amount: winner 0.0, mean 0.25
     };
     return llama_decision::assemble(cs, r, false);
 }
@@ -1659,8 +1851,9 @@ static void generic_frontend_drive_run(testing & t, llama_context * ctx, const s
             "amount":   {"type": "number", "description": "impact factor", "minimum": 0.0, "maximum": 1.0, "step": 0.5, "aggregate": "mean"}
         }
     })");
-    const llama_decision::generic_request greq = llama_decision::parse_generic_request(body);
-    const llama_decision::compiled_schema cs   = llama_decision::compile_schema(greq.schema, greq.instructions);
+    const llama_decision::decision_request greq = llama_decision::parse_decision_request(body);
+    const llama_decision::compiled_schema  cs   = llama_decision::compile_schema(greq.schema, greq.instructions,
+                                                                                   greq.envelope.knobs);
 
     llama_decision::engine eng(ctx, 2, 8);
     llama_decision::options o;
@@ -1669,7 +1862,7 @@ static void generic_frontend_drive_run(testing & t, llama_context * ctx, const s
     o.cache_tag = llama_decision::generic_cache_tag(nullptr, false, cs.system_text);
 
     const auto parts = llama_decision::render_schema_prompt(nullptr, false, cs.system_text,
-                                                            llama_decision::render_state(greq.evidence.state));
+                                                            llama_decision::render_state(greq.envelope.evidence.state));
     const auto plan = eng.compile_fields(cs.inputs, o);
     const auto b    = eng.decide_batch(plan, parts.first, { parts.second }, o);
 
@@ -1682,7 +1875,7 @@ static void generic_frontend_drive_run(testing & t, llama_context * ctx, const s
         for (size_t i = 0; i < item.fields.size(); ++i) {
             const llama_decision::field_result & fr = item.fields[i];
             t.assert_true(lane + ": field " + cs.specs[i].name + " is scored exactly",
-                          fr.tree && fr.winner >= 0 && (size_t) fr.winner < cs.specs[i].values.size());
+                          !fr.probs.empty() && fr.winner >= 0 && (size_t) fr.winner < cs.specs[i].values.size());
             t.assert_equal(lane + ": field " + cs.specs[i].name + " probs cover every value",
                            cs.specs[i].values.size(), fr.probs.size());
             double sum = 0.0;
@@ -1819,7 +2012,7 @@ static void generic_jev_winner_equivalence_run(testing & t, llama_context * ctx,
     go.tree_max  = 64;
     go.cache_tag = llama_decision::generic_cache_tag(nullptr, false, cs.system_text);
     const auto parts = llama_decision::render_schema_prompt(nullptr, false, cs.system_text,
-                                                            llama_decision::render_state(req.state));
+                                                            llama_decision::render_state(req.envelope.evidence.state));
     const auto plan = eng.compile_fields(cs.inputs, go);
 
     t.test(lane + ": generic enum and Jev choice pick the same winner on a decisive model", [&](testing & t) {
@@ -1835,7 +2028,7 @@ static void generic_jev_winner_equivalence_run(testing & t, llama_context * ctx,
 
         // decisive means the winner's share is well above uniform in both framings
         const float jp = jprobs[0][jwinner];
-        const float gp = gr.probs.empty() ? gr.path_score : gr.probs[gr.winner];
+        const float gp = gr.probs[gr.winner];
         t.assert_true(lane + ": the case is decisive in both framings (jev " + std::to_string(jp) +
                       ", generic " + std::to_string(gp) + ")",
                       jp >= 0.6f && gp >= 0.6f);
@@ -1923,7 +2116,7 @@ static void test_generic_wrong_typed_fields(testing & t) {
     t.test("the wrong-typed request fields are semantic errors too", [](testing & t) {
         auto reject = [](testing & t, const std::string & body, const std::string & needle) {
             try {
-                (void) llama_decision::parse_generic_request(common_json::parse(body));
+                (void) llama_decision::parse_decision_request(common_json::parse(body));
                 t.assert_true("wrong-typed request field is rejected: " + body, false);
             } catch (const llama_decision::semantic_error & e) {
                 t.assert_true("reject reason contains \"" + needle + "\": " + body + " -> " + e.what(),
@@ -1945,8 +2138,8 @@ static void test_generic_wrong_typed_fields(testing & t) {
         reject(t, R"({"model": "m", "state": "s", "schema": {"a": {"type": "boolean"}}, "diagnostics": "yes"})",
                "diagnostics must be a boolean");
         // the control: the same body with correct types is accepted unchanged
-        const auto ok = llama_decision::parse_generic_request(common_json::parse(base));
-        t.assert_equal("the valid body still parses", std::string("m"), ok.model);
+        const auto ok = llama_decision::parse_decision_request(common_json::parse(base));
+        t.assert_equal("the valid body still parses", std::string("m"), ok.envelope.model);
         t.assert_true("the valid body still parses", ok.allow_cache);
     });
 
@@ -1984,15 +2177,15 @@ static void test_generic_wrong_typed_fields(testing & t) {
         // the control: the same body with correct types is accepted unchanged
         const auto ok = llama_decision::parse_decision_request(
             common_json::parse(R"({"model": "m", "state": "s", )" + qs + "}"));
-        t.assert_equal("the valid body still parses", std::string("m"), ok.model);
+        t.assert_equal("the valid body still parses", std::string("m"), ok.envelope.model);
         t.assert_equal("the valid body still parses", (size_t) 1, ok.questions.size());
     });
 }
 
-// The schema compiler is a pure function of the request body: it validates the field catalogue,
-// encodes the typed grids, and hoists each field's common value prefix into its suffix. These cases
-// pin the accepted shapes, the refusals, and the hoisting. They need no model and no context, so a
-// capability the refactor drops fails here rather than only at the HTTP layer.
+// The schema compiler is a pure function of the request body: it validates the field catalogue and
+// encodes the typed grids into engine-facing field inputs. These cases pin the accepted shapes, the
+// refusals, and the scored text. They need no model and no context, so a capability the refactor
+// drops fails here rather than only at the HTTP layer.
 static void test_generic_schema_compiler(testing & t) {
     t.test("the compiler accepts every supported field type and aggregate", [](testing & t) {
         const llama_decision::compiled_schema cs = llama_decision::compile_schema(common_json::parse(R"({
@@ -2038,24 +2231,22 @@ static void test_generic_schema_compiler(testing & t) {
         t.assert_equal("multipleOf builds the grid", (size_t) 5, cs.specs[2].values.size());
     });
 
-    // The prefix hoist is what keeps a wide enum cheap: the shared leading characters are scored
-    // once in the suffix and only the remainder is branched on.
-    t.test("the compiler hoists each field's shared value prefix into its suffix", [](testing & t) {
+    // The prefix hoist is what keeps a wide enum cheap: the head its values share is decoded once in
+    // the suffix and each branch decodes only its own tail. The engine finds that head at a token
+    // boundary in `suffix + candidate`, so the front-end scores the whole encoded value and never
+    // splits it itself. The golden below pins the scored text exactly.
+    t.test("each field's suffix and candidates are the whole encoded value", [](testing & t) {
         const llama_decision::compiled_schema cs = llama_decision::compile_schema(common_json::parse(R"({
             "team": {"type": "enum", "description": "owning team",
                      "enum": ["platform-frontend", "platform-backend", "platform-infra"]}
         })"), "");
         const llama_decision::generic_field_spec & f = cs.specs[0];
-        t.assert_equal("the shared prefix is the longest common head", std::string("\"platform-"),
-                       f.common);
-        t.assert_true("the suffix ends with the hoisted prefix",
-                      cs.inputs[0].suffix.size() >= f.common.size() &&
-                      cs.inputs[0].suffix.compare(cs.inputs[0].suffix.size() - f.common.size(),
-                                                  f.common.size(), f.common) == 0);
+        t.assert_equal("the suffix opens the field and stops there", std::string("  \"team\": "),
+                       cs.inputs[0].suffix);
         t.assert_equal("one candidate per value", f.encoded.size(), cs.inputs[0].candidates.size());
         for (size_t i = 0; i < f.encoded.size(); ++i) {
-            t.assert_equal("the candidate is the value minus the hoisted prefix",
-                           f.encoded[i].substr(f.common.size()), cs.inputs[0].candidates[i]);
+            t.assert_equal("the candidate is the whole encoded value", f.encoded[i],
+                           cs.inputs[0].candidates[i]);
         }
     });
 
@@ -2143,15 +2334,308 @@ static void test_generic_field_spellings(testing & t) {
                            "").specs[0].aggregate);
     });
 
-    // The catalogue line is what the model reads, and each candidate is the tail of the encoded value
-    // it lists, so the two cannot drift into showing one value space and scoring another.
+    // The catalogue line is what the model reads, and each candidate is the value it lists, so the
+    // two cannot drift into showing one value space and scoring another.
     t.test("the catalogue lists the encoded values the candidates score", [](testing & t) {
         const auto cs = llama_decision::compile_schema(
             common_json::parse(R"({"a": {"type": "enum", "description": "d", "enum": ["x", "y"]}})"), "");
         t.assert_true("the catalogue shows the encoded values",
                       cs.catalogue.find("Allowed values: \"x\", \"y\"") != std::string::npos);
-        t.assert_equal("the candidate is the value's tail after the shared prefix", std::string("y\""),
+        t.assert_equal("each candidate is the encoded value it lists", std::string("\"y\""),
                        cs.inputs[0].candidates[1]);
+    });
+}
+
+// The engine scores `suffix + candidate`, so that concatenation is the whole of a field's scored
+// text; the system text is what the model is shown. The golden pins both, because any move in either
+// moves every probability the field reports. It needs no model and no tokenizer.
+static common_json generic_scored_text() {
+    const auto cs = llama_decision::compile_schema(common_json::parse(R"({
+        "team":   {"type": "enum", "description": "owning team",
+                   "enum": ["platform-frontend", "platform-backend", "platform-infra"]},
+        "active": {"type": "boolean", "description": "is the incident active"},
+        "count":  {"type": "integer", "description": "affected rows", "minimum": 1, "maximum": 4},
+        "impact": {"type": "number", "description": "impact factor", "minimum": 0.0,
+                   "maximum": 1.0, "step": 0.5}
+    })"), "Answer from the context.");
+    common_json lines_by_field = common_json::object();
+    for (size_t i = 0; i < cs.inputs.size(); ++i) {
+        common_json lines = common_json::array();
+        for (const auto & candidate : cs.inputs[i].candidates) {
+            lines.push_back(cs.inputs[i].suffix + candidate + "\n");
+        }
+        lines_by_field[cs.specs[cs.field_spec[i]].name] = lines;
+    }
+    common_json out = common_json::object();
+    out["system_text"] = cs.system_text;
+    out["scored_lines"] = lines_by_field;
+    return out;
+}
+
+static void test_generic_scored_text_golden(testing & t) {
+    t.test("the compiled generic text matches the committed golden", [&](testing & t) {
+        const std::string actual = generic_scored_text().dump(2) + "\n";
+        if (record_golden) {
+            write_file(fixture_path("generic_scored_text.golden.json"), actual);
+            return;
+        }
+        t.assert_equal("the generic scored text is byte-identical",
+                       read_file(fixture_path("generic_scored_text.golden.json")), actual);
+    });
+}
+
+// One envelope, two shapes. Everything the shapes share is parsed once, so a shared field cannot be
+// honoured on one shape and ignored on the other. These cases need no model.
+static void test_request_envelope_unification(testing & t) {
+    const std::string jev = R"({
+        "model": "m", "state": "s",
+        "questions": {"q": {"type": "choice", "instructions": "x", "criteria": {"a": "", "b": ""}}}
+    })";
+    const std::string gen = R"({
+        "model": "m", "state": "s",
+        "schema": {"a": {"type": "enum", "description": "d", "enum": ["a", "b"]}}
+    })";
+
+    t.test("both shapes parse the shared fields through one envelope", [&](testing & t) {
+        auto knobs_of = [](const std::string & body) {
+            return llama_decision::parse_decision_request(common_json::parse(body)).envelope.knobs;
+        };
+        const std::string with = R"("temperature": 0.5, "temperatures": {"choice": 2.0},
+                                 "permutations": 3, "confidence_profile": "local", "diagnostics": true)";
+        for (const std::string & shape : { std::string("questions"), std::string("schema") }) {
+            const std::string body = shape == "questions"
+                ? std::string(jev.substr(0, jev.size() - 2)) + ", " + with + "}"
+                : std::string(gen.substr(0, gen.size() - 2)) + ", " + with + "}";
+            const llama_decision::decision_request req = llama_decision::parse_decision_request(
+                common_json::parse(body));
+            t.assert_equal(shape + ": the shape is selected", shape,
+                           req.shape == llama_decision::request_shape::jev ? "questions" : "schema");
+            t.assert_equal(shape + ": the global temperature", 0.5, req.envelope.knobs.temperature);
+            t.assert_equal(shape + ": the per-type temperature", 2.0,
+                           req.envelope.knobs.for_type("enum"));
+            t.assert_equal(shape + ": the passes", 3, req.envelope.knobs.permutations);
+            t.assert_equal(shape + ": the reported profile", std::string("local"),
+                           req.envelope.knobs.confidence_profile);
+            t.assert_true(shape + ": the diagnostics opt-in", req.envelope.diagnostics);
+            t.assert_true(shape + ": the evidence is parsed once",
+                          req.envelope.evidence.state_present &&
+                              req.envelope.evidence.state.get<std::string>() == "s");
+            t.assert_true(shape + ": the generic shape carries the schema", req.schema.is_null() ==
+                          (shape == "questions"));
+        }
+        // the defaults are the same on both shapes
+        t.assert_equal("an unset knob defaults on either shape",
+                       knobs_of(jev).for_type("choice"), knobs_of(gen).for_type("enum"));
+    });
+
+    // A generic field type has no temperature key of its own; it reads the Jev primitive that scores
+    // it, so the wire's five keys stay the whole vocabulary and no second map exists.
+    t.test("a field type resolves its temperature through its primitive", [](testing & t) {
+        llama_decision::producer_knobs k;
+        k.temperature       = 1.0;
+        k.temperatures      = common_json::parse(R"({"noul": 2.0, "choice": 3.0, "integer": 4.0})");
+        t.assert_equal("a boolean field reads the noul temperature", 2.0, k.for_type("boolean"));
+        t.assert_equal("an enum field reads the choice temperature", 3.0, k.for_type("enum"));
+        t.assert_equal("an integer field reads its own temperature", 4.0, k.for_type("integer"));
+        t.assert_equal("a number field without an override reads the global", 1.0, k.for_type("number"));
+        k.temperature = 0.25;
+        t.assert_equal("the global is the fallback", 0.25, k.for_type("number"));
+        // the allow-list is unchanged, so a key that is neither primitive nor numeric is still refused
+        bool threw = false;
+        try {
+            (void) llama_decision::parse_decision_request(common_json::parse(
+                R"({"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"x"}},
+                    "temperatures":{"boolean":1.0}})"));
+        } catch (const llama_decision::semantic_error &) {
+            threw = true;
+        }
+        t.assert_true("an unlisted temperatures key is still refused", threw);
+    });
+
+    // The evidence validator used to exist twice, once per front-end. These are the rules it owns,
+    // and they are now exercised once, on both shapes.
+    t.test("the evidence rules hold on both shapes", [](testing & t) {
+        expect_decision_reject(t, R"({"model":"m","state":"s","contexts":["c"],
+                         "questions":{"q":{"type":"noul","instructions":"x"}}})",
+                               "provide either state or contexts, not both");
+        expect_decision_reject(t, R"({"model":"m","state":"s","contexts":["c"],
+                         "schema":{"a":{"type":"boolean","description":"d"}}})",
+                               "provide either state or contexts, not both");
+        expect_decision_reject(t, R"({"model":"m","contexts":[],
+                         "questions":{"q":{"type":"noul","instructions":"x"}}})",
+                               "contexts must hold 1-256 entries");
+        expect_decision_reject(t, R"({"model":"m","contexts":["c",""],
+                         "schema":{"a":{"type":"boolean","description":"d"}}})",
+                               "must be a non-empty string");
+        // a session reference is evidence for the generic shape only; the Jev shape still needs text
+        expect_decision_reject(t, R"({"model":"m","questions":{"q":{"type":"noul","instructions":"x"}},
+                         "id_slot":0})", "state (or contexts) is required");
+        const auto ses = llama_decision::parse_decision_request(common_json::parse(
+            R"({"model":"m","id_slot":0,"schema":{"a":{"type":"boolean","description":"d"}}})"));
+        t.assert_true("a session is evidence for the generic shape", ses.envelope.session.present);
+        t.assert_true("the generic shape reports itself", ses.shape == llama_decision::request_shape::generic);
+    });
+
+    // Control: a field only one shape defines stays an ignored unknown top-level field on the other,
+    // so a body written for one front-end cannot change the other one's answer by accident.
+    t.test("an unknown top-level field is ignored on both shapes", [&](testing & t) {
+        const auto a = llama_decision::parse_decision_request(common_json::parse(jev));
+        common_json jev_extra = common_json::parse(jev);
+        jev_extra["mode"]  = "tree";
+        jev_extra["bogus"] = 7;
+        const auto b = llama_decision::parse_decision_request(jev_extra);
+        t.assert_equal("the Jev shape ignores it", a.questions.size(), b.questions.size());
+        t.assert_equal("the Jev shape ignores the generic knobs", std::string("auto"), b.mode);
+
+        common_json gen_extra = common_json::parse(gen);
+        gen_extra["instructions"] = "extra";
+        gen_extra["bogus"]         = 7;
+        const auto c = llama_decision::parse_decision_request(gen_extra);
+        t.assert_equal("the generic shape ignores it", (size_t) 1, c.schema.size());
+        t.assert_equal("the generic shape keeps its own fields", std::string("extra"), c.instructions);
+        t.assert_equal("the generic shape has no questions", (size_t) 0, c.questions.size());
+    });
+}
+
+// Order de-biasing on the generic shape: one scoring field per (pass, field), averaged by value
+// index. The pass orders come from the same permutation_order the letter readout uses, so the two
+// shapes cannot drift on what a pass means. Pure, so no model is needed to pin the definition.
+static void test_generic_permutations(testing & t) {
+    const std::string schema = R"({"a": {"type": "enum", "description": "d", "enum": ["x", "y", "z"]},
+                                   "b": {"type": "boolean", "description": "e"}})";
+
+    t.test("each pass scores every field in one seeded order", [&](testing & t) {
+        llama_decision::producer_knobs knobs;
+        knobs.permutations = 2;
+        const auto cs = llama_decision::compile_schema(common_json::parse(schema), "", knobs);
+        t.assert_equal("one scoring field per pass and field", (size_t) 4, cs.inputs.size());
+        t.assert_equal("as many order maps", cs.inputs.size(), cs.field_order.size());
+        t.assert_equal("as many owners", cs.inputs.size(), cs.field_spec.size());
+        for (size_t f = 0; f < cs.inputs.size(); ++f) {
+            const size_t si    = cs.field_spec[f];
+            const int    pass  = (int) (f / cs.specs.size());
+            const std::vector<size_t> want =
+                llama_decision::permutation_order(cs.specs[si].values.size(), cs.specs[si].name, pass);
+            t.assert_true("the order is the shared permutation for the field and pass",
+                          want == cs.field_order[f]);
+            t.assert_equal("the candidates are the encoded values in that order",
+                           cs.specs[si].encoded.size(), cs.inputs[f].candidates.size());
+            for (size_t i = 0; i < cs.inputs[f].candidates.size(); ++i) {
+                t.assert_equal("the candidate at a position is its encoded value",
+                               cs.specs[si].encoded[cs.field_order[f][i]], cs.inputs[f].candidates[i]);
+            }
+        }
+    });
+
+    t.test("the passes are averaged by value index", [&](testing & t) {
+        llama_decision::producer_knobs knobs;
+        knobs.permutations = 2;
+        const auto cs = llama_decision::compile_schema(common_json::parse(schema), "", knobs);
+        const size_t n = cs.specs.size();
+        llama_decision::result raw;
+        raw.fields.resize(cs.inputs.size());
+        // the three-value field: each pass is decisive on a different candidate in its own order
+        raw.fields[0].winner = 0;
+        raw.fields[0].probs  = { 0.8f, 0.1f, 0.1f };
+        raw.fields[n + 0].winner = 1;
+        raw.fields[n + 0].probs  = { 0.2f, 0.6f, 0.2f };
+        // the two-value field: the passes favour different values, so the mean is what decides
+        raw.fields[1].winner = 0;
+        raw.fields[1].probs  = { 0.6f, 0.4f };
+        raw.fields[n + 1].winner = 0;
+        raw.fields[n + 1].probs  = { 0.7f, 0.3f };
+
+        // the expected mean, derived here from the same orders the fold must use
+        std::vector<std::vector<float>> expect(cs.specs.size());
+        for (size_t si = 0; si < n; ++si) {
+            expect[si].assign(cs.specs[si].values.size(), 0.0f);
+            for (int pass = 0; pass < 2; ++pass) {
+                const auto & order = cs.field_order[(size_t) pass * n + si];
+                for (size_t i = 0; i < order.size(); ++i) {
+                    expect[si][order[i]] += raw.fields[(size_t) pass * n + si].probs[i] / 2.0f;
+                }
+            }
+        }
+
+        llama_decision::mean_permuted_passes(cs, raw);
+        t.assert_equal("one distribution per field", n, raw.fields.size());
+        double sum = 0.0;
+        for (size_t si = 0; si < n; ++si) {
+            for (size_t i = 0; i < expect[si].size(); ++i) {
+                assert_close(t, "the averaged probability of a value", expect[si][i], raw.fields[si].probs[i],
+                             1e-6);
+                sum += (double) raw.fields[si].probs[i];
+            }
+            t.assert_equal("the winner is the averaged argmax",
+                           (int) (std::max_element(raw.fields[si].probs.begin(), raw.fields[si].probs.end()) -
+                                  raw.fields[si].probs.begin()),
+                           raw.fields[si].winner);
+        }
+        t.assert_true("every average sums to 1", std::fabs(sum - (double) n) < 1e-5);
+    });
+
+    // Control: a single pass has nothing to fold, so the scored result must come back untouched.
+    t.test("a single pass is not folded", [&](testing & t) {
+        const auto cs = llama_decision::compile_schema(common_json::parse(schema), "");
+        llama_decision::result raw;
+        raw.fields.resize(cs.inputs.size());
+        raw.fields[0].winner = 1;
+        raw.fields[0].probs  = { 0.2f, 0.5f, 0.3f };
+        raw.fields[1].winner = 0;
+        raw.fields[1].probs  = { 0.7f, 0.3f };
+        const auto before = raw;
+        llama_decision::mean_permuted_passes(cs, raw);
+        t.assert_equal("no extra field is produced", before.fields.size(), raw.fields.size());
+        for (size_t i = 0; i < raw.fields.size(); ++i) {
+            t.assert_equal("the winner is untouched", before.fields[i].winner, raw.fields[i].winner);
+            t.assert_true("the distribution is untouched", before.fields[i].probs == raw.fields[i].probs);
+        }
+    });
+
+    // A greedily scored field has no distribution over its space, so the fold must not invent one:
+    // the passes decide the point mass the record reports.
+    t.test("passes that were all greedy report the point mass they agreed on", [&](testing & t) {
+        llama_decision::producer_knobs knobs;
+        knobs.permutations = 2;
+        const auto  cs = llama_decision::compile_schema(common_json::parse(schema), "", knobs);
+        const size_t n  = cs.specs.size();
+        llama_decision::result raw;
+        raw.fields.resize(cs.inputs.size());
+        // a greedy pass reports only the position it won, in that pass's own order
+        raw.fields[0].winner     = 2;
+        raw.fields[n + 0].winner = 0;
+        raw.fields[1].winner     = 0;
+        raw.fields[n + 1].winner = 1;
+        // the point mass the passes accumulate, by value index
+        std::vector<std::vector<float>> expect(n);
+        for (size_t si = 0; si < n; ++si) {
+            expect[si].assign(cs.specs[si].values.size(), 0.0f);
+            for (int pass = 0; pass < 2; ++pass) {
+                const auto & order = cs.field_order[(size_t) pass * n + si];
+                expect[si][order[raw.fields[(size_t) pass * n + si].winner]] += 0.5f;
+            }
+        }
+
+        llama_decision::mean_permuted_passes(cs, raw);
+        const common_json answers = llama_decision::assemble(cs, raw, false);
+        for (size_t si = 0; si < n; ++si) {
+            t.assert_true("a greedy fold reports no distribution", raw.fields[si].probs.empty());
+            t.assert_equal("the winner is the accumulated argmax",
+                           (int) (std::max_element(expect[si].begin(), expect[si].end()) - expect[si].begin()),
+                           raw.fields[si].winner);
+            const std::string & name = cs.specs[si].name;
+            const common_json & rec  = answers.at(name);
+            t.assert_equal("the record still says argmax", std::string("argmax"),
+                           rec.at("scored").get<std::string>());
+            double sum = 0.0;
+            int    hot = 0;
+            for (const auto & kv : rec.at("probabilities").items()) {
+                sum += kv.value().get<double>();
+                hot += kv.value().get<double>() > 0.0 ? 1 : 0;
+            }
+            t.assert_true("the point mass sums to 1", std::fabs(sum - 1.0) < 1e-6);
+            t.assert_equal("the point mass names one value", 1, hot);
+        }
     });
 }
 
@@ -2160,7 +2644,9 @@ static void test_generic_frontend(testing & t) {
     test_generic_wrong_typed_fields(t);
     test_generic_field_spellings(t);
     test_generic_typed_golden(t);
+    test_generic_scored_text_golden(t);
     test_generic_mutual_exclusion(t);
+    test_generic_permutations(t);
     test_generic_drives_engine(t);
     test_generic_jev_winner_equivalence(t);
 }
@@ -2573,13 +3059,13 @@ static void test_fork_real(testing & t) {
             llama_decision::options orr;
             orr.fork      = "restore";
             orr.cache_tag = "t";
-            const auto restore_run = eng.decide_batch("system", { "ctx" }, two, orr);
+            const auto restore_run = decide_batch(eng, "system", { "ctx" }, two, orr);
 
             if (copy_ok) {
                 llama_decision::options oc;
                 oc.fork      = "copy";
                 oc.cache_tag = "t";
-                const auto copy_run = eng.decide_batch("system", { "ctx" }, two, oc);
+                const auto copy_run = decide_batch(eng, "system", { "ctx" }, two, oc);
 
                 // same math on two KV layouts: the winner is the task value and is always
                 // asserted; the probability bound is producer numerics
@@ -2605,7 +3091,7 @@ static void test_fork_real(testing & t) {
                 try {
                     llama_decision::options oc;
                     oc.fork = "copy";
-                    eng.decide_batch("system", { "ctx" }, two, oc);
+                    decide_batch(eng, "system", { "ctx" }, two, oc);
                 } catch (const std::invalid_argument &) {
                     rejected = true;
                 }
@@ -2614,7 +3100,7 @@ static void test_fork_real(testing & t) {
                 llama_decision::options oa;
                 oa.fork      = "auto";
                 oa.cache_tag = "t";
-                const auto auto_run = eng.decide_batch("system", { "ctx" }, two, oa);
+                const auto auto_run = decide_batch(eng, "system", { "ctx" }, two, oa);
                 // the winner is the task value and is always asserted; the probability bound is the
                 // producer numerics of sharing vs copying the attention cells on the GPU
                 bool winners = auto_run.items[0].fields.size() == restore_run.items[0].fields.size();
@@ -2640,19 +3126,19 @@ static void test_fork_real(testing & t) {
             llama_decision::options lru;
             lru.fork = "restore";
             lru.cache_tag = "A";
-            const auto a1 = eng.decide_batch("system-A", { "ctx" }, two, lru);
+            const auto a1 = decide_batch(eng, "system-A", { "ctx" }, two, lru);
             lru.cache_tag = "B";
-            const auto b1 = eng.decide_batch("system-B", { "ctx" }, two, lru);
+            const auto b1 = decide_batch(eng, "system-B", { "ctx" }, two, lru);
             lru.cache_tag = "A";
-            const auto a2 = eng.decide_batch("system-A", { "ctx" }, two, lru);
+            const auto a2 = decide_batch(eng, "system-A", { "ctx" }, two, lru);
             t.assert_true("first A misses", !a1.cache_hit);
             t.assert_true("first B misses", !b1.cache_hit);
             t.assert_true("returning to A hits within the bound", a2.cache_hit);
 
             llama_decision::options oc2;
             oc2.fork = copy_ok ? "copy" : "restore";
-            const auto single = eng.decide_batch("system", { "ctx" }, one, oc2);
-            const auto pair   = eng.decide_batch("system", { "ctx" }, two, oc2);
+            const auto single = decide_batch(eng, "system", { "ctx" }, one, oc2);
+            const auto pair   = decide_batch(eng, "system", { "ctx" }, two, oc2);
             const auto & ps = single.items[0].fields[0].probs;
             const auto & pp = pair.items[0].fields[0].probs;
             // Bypass only applies to copy forks. When it does, the single-question result must be
@@ -2677,7 +3163,7 @@ static void test_fork_real(testing & t) {
             // prefix purity: branches never mutate the cached prefix, and branch sequences are released
             llama_memory_t mem = llama_get_memory(te.ctx);
             const llama_pos prefix_before = llama_memory_seq_pos_max(mem, 2);
-            (void) eng.decide_batch("system", { "ctx" }, two, oc2);
+            (void) decide_batch(eng, "system", { "ctx" }, two, oc2);
             const llama_pos prefix_after = llama_memory_seq_pos_max(mem, 2);
             t.assert_equal("cached prefix is not mutated by branches", prefix_before, prefix_after);
             t.assert_true("branch sequences are released", llama_memory_seq_pos_max(mem, 3) <= 0);
@@ -2997,6 +3483,130 @@ static void fork_divergence_run(testing & t, llama_context * ctx, const std::str
     }
 }
 
+// A greedy field walks its value one token at a time, and every round after the first starts again
+// from the trunk. A round that holds exactly one branch may therefore be decoded on the trunk and
+// trimmed back to pos0 instead of forked, which is only exact if the trim restores the trunk as it
+// was: recurrent state lives outside the KV cache and a sequence removal does not put it back. The
+// check is the trunk's state bytes, never the argmax, because a corrupted parent can still pick the
+// same value.
+static void greedy_trunk_trim_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const llama_vocab * vocab  = llama_model_get_vocab(llama_get_model(ctx));
+    const auto          parent = common_tokenize(vocab, "a short decision parent", false, true);
+    const auto          head   = common_tokenize(vocab, "\nAnswer: ", false, true);
+    if (parent.empty() || head.empty()) {
+        t.skip(lane + ": the model has no usable tokens");
+        return;
+    }
+    // three real candidates, so the branch is one wave with three scored slots
+    std::vector<llama_token> cands;
+    for (const char * word : { "yes", "maybe", "never" }) {
+        const auto ids = common_tokenize(vocab, word, false, true);
+        if (ids.empty()) {
+            t.skip(lane + ": the model has no usable tokens");
+            return;
+        }
+        cands.push_back(ids.front());
+    }
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_decision::engine eng(ctx, 2, 8);
+    const llama_seq_id     trunk = eng.seq_pool;
+    if (!t.assert_true(lane + ": the trunk decodes", decode_tokens_on(ctx, trunk, 0, parent))) {
+        return;
+    }
+    const auto before = seq_state_dump(ctx, trunk);
+
+    // the wave the engine runs: one branch off the trunk, either decoded on it or forked
+    eng.select_fork("auto");
+    const bool partial = eng.active_fork_ == llama_decision::engine::fork_kind::hybrid;
+    std::vector<llama_decision::engine::saved_state> parents = { eng.save_seq(trunk, false, partial) };
+    const llama_decision::engine::branch             branch{ trunk, (llama_pos) parent.size(), head, cands };
+
+    const auto on        = eng.score_branches({ branch }, trunk + 1, eng.n_pool - 1, &parents, true);
+    const auto after_on = seq_state_dump(ctx, trunk);
+    if (t.assert_true(lane + ": the trunk wave scores every candidate",
+                      on.size() == 1 && on[0].cand_logits.size() == cands.size())) {
+        std::string detail;
+        t.assert_true(lane + ": scoring one branch on the trunk leaves it byte-identical (" +
+                          std::to_string(state_bytes_diff(before, after_on, &detail)) + " of " +
+                          std::to_string(before.size()) + " bytes differ" +
+                          (detail.empty() ? "" : ", " + detail) + ")",
+                      before == after_on);
+    }
+    eng.clear_seqs(trunk + 1, eng.n_pool - 1);
+
+    // the same wave again from a rebuilt trunk, this time forked: the logits must be the same ones
+    eng.clear_seqs(trunk, 1);
+    if (!t.assert_true(lane + ": the trunk rebuilds", decode_tokens_on(ctx, trunk, 0, parent))) {
+        return;
+    }
+    const auto off = eng.score_branches({ branch }, trunk + 1, eng.n_pool - 1, &parents, false);
+    eng.clear_seqs(trunk + 1, eng.n_pool - 1);
+
+    if (t.assert_true(lane + ": the forked wave scores every candidate",
+                      off.size() == 1 && off[0].cand_logits.size() == cands.size())) {
+        t.assert_true(lane + ": the trunk decode and the forked decode gather the same logits",
+                      max_abs_logit_delta(on[0].cand_logits, off[0].cand_logits) == 0.0);
+    }
+}
+
+// The same hazard through the engine: a greedy field spanning three rounds means round 1 carries a
+// branch from every field and every later round carries only the greedy one, so those later rounds
+// are the single-branch waves a bypass would take. The winners and the walked token counts are task
+// value and must be identical either way; the probabilities are producer numerics and carry the
+// same tolerance every other cross-layout comparison in this file uses.
+static void greedy_multiround_run(testing & t, llama_context * ctx, const std::string & lane) {
+    const std::vector<llama_decision::field_input> fields = {
+        { "\nrefund: ", { "yes", "no" } },
+        { "\nwide: ",
+          { "red apple pie",   "red apple tart",   "red berry pie",   "red berry tart",
+            "blue apple pie",  "blue apple tart",  "blue berry pie",  "blue berry tart",
+            "green apple pie", "green apple tart", "green berry pie", "green berry tart" } },
+    };
+    llama_decision::options opt;
+    opt.mode        = "auto";
+    opt.tree_max    = 4; // the wide field is wider than the trie, so it is scored greedily
+    opt.allow_cache = false;
+
+    llama_decision::engine eng(ctx, 2, 8);
+
+    opt.bypass = true;
+    const auto on = decide_batch(eng, "system", { "ctx" }, fields, opt);
+    opt.bypass = false;
+    const auto off = decide_batch(eng, "system", { "ctx" }, fields, opt);
+
+    if (!t.assert_true(lane + ": both runs score both fields",
+                       on.items.size() == 1 && off.items.size() == 1 &&
+                           on.items[0].fields.size() == 2 && off.items[0].fields.size() == 2)) {
+        return;
+    }
+    const auto & greedy_on = on.items[0].fields[1];
+    if (greedy_on.scored_nodes < 3) {
+        // this tokenizer does not split the value space into three token levels, so no round after
+        // the first ever forks from the trunk and the case does not apply here
+        t.skip(lane + ": this tokenizer walks the greedy value in " +
+              std::to_string(greedy_on.scored_nodes) + " round(s)");
+        return;
+    }
+    t.assert_true(lane + ": the greedy field walks at least three rounds", greedy_on.scored_nodes >= 3);
+    bool winners = true;
+    for (size_t f = 0; f < on.items[0].fields.size(); ++f) {
+        winners = winners && on.items[0].fields[f].winner == off.items[0].fields[f].winner &&
+                  on.items[0].fields[f].scored_nodes == off.items[0].fields[f].scored_nodes;
+    }
+    t.assert_true(lane + ": the bypass changes no winner and no walked token count", winners);
+    bool agree = true;
+    for (size_t f = 0; agree && f < on.items[0].fields.size(); ++f) {
+        const auto & a = on.items[0].fields[f].probs;
+        const auto & b = off.items[0].fields[f].probs;
+        agree          = a.size() == b.size();
+        for (size_t k = 0; agree && k < a.size(); ++k) {
+            agree = std::fabs(a[k] - b[k]) < 5e-3f;
+        }
+    }
+    t.assert_true(lane + ": the bypass agrees with the forked path within tolerance", agree);
+}
+
 static void test_fork_oracle(testing & t) {
     t.test("strategy forks equal a full restore on the CPU model", [](testing & t) {
         const std::string path = decision_cpu_model_path();
@@ -3018,6 +3628,12 @@ static void test_fork_oracle(testing & t) {
                 }
             });
         }
+        try {
+            greedy_trunk_trim_run(t, te.ctx, "cpu");
+            greedy_multiround_run(t, te.ctx, "cpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the CPU greedy trunk cases run: ") + e.what(), false);
+        }
     });
 
     t.test("strategy forks equal a full restore on the GPU model", [](testing & t) {
@@ -3038,6 +3654,12 @@ static void test_fork_oracle(testing & t) {
                     t.assert_true(std::string("the GPU fork oracle runs: ") + e.what(), false);
                 }
             });
+        }
+        try {
+            greedy_trunk_trim_run(t, te.ctx, "gpu");
+            greedy_multiround_run(t, te.ctx, "gpu");
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the GPU greedy trunk cases run: ") + e.what(), false);
         }
     });
 }
@@ -3342,14 +3964,14 @@ static void fork_auto_default_run(testing & t, llama_context * ctx, const std::s
     llama_decision::options o_auto;
     o_auto.fork        = "auto";
     o_auto.allow_cache = false;
-    const auto auto_run = eng.decide_batch("system", { "ctx" }, fields, o_auto);
+    const auto auto_run = decide_batch(eng, "system", { "ctx" }, fields, o_auto);
     const auto resolved = eng.active_fork_;
 
     // the reference is the strategy `auto` must resolve to: the exact hybrid fork for a recurrent
     // model, or the unchanged copy fork for a dense one
     llama_decision::options o_ref = o_auto;
     o_ref.fork = recurrent ? "restore" : "copy";
-    const auto ref_run = eng.decide_batch("system", { "ctx" }, fields, o_ref);
+    const auto ref_run = decide_batch(eng, "system", { "ctx" }, fields, o_ref);
 
     const auto expected = recurrent ? llama_decision::engine::fork_kind::hybrid
                                     : llama_decision::engine::fork_kind::copy;
@@ -3440,12 +4062,12 @@ static void fork_strategy_switch_run(testing & t, llama_context * ctx, const std
         llama_decision::options o1;
         o1.fork      = pair.first;
         o1.cache_tag = "switch";
-        const auto r1 = eng.decide_batch("system", { "ctx" }, fields, o1);
+        const auto r1 = decide_batch(eng, "system", { "ctx" }, fields, o1);
 
         llama_decision::options o2;
         o2.fork      = pair.second;
         o2.cache_tag = "switch";
-        const auto r2 = eng.decide_batch("system", { "ctx" }, fields, o2);
+        const auto r2 = decide_batch(eng, "system", { "ctx" }, fields, o2);
 
         if (!t.assert_true(lane + ": the " + pair.first + " run returns", r1.items.size() == 1) ||
             !t.assert_true(lane + ": the " + pair.second + " run returns", r2.items.size() == 1)) {
@@ -3576,13 +4198,13 @@ static void test_prefix_lru_restores_own_state(testing & t) {
             llama_decision::options opt;
             opt.fork      = "restore";
             opt.cache_tag = "A";
-            const auto a1 = eng.decide_batch("system alpha", { "context" }, fields, opt);
+            const auto a1 = decide_batch(eng, "system alpha", { "context" }, fields, opt);
             const std::vector<uint8_t> kv_a = seq_dump();
             opt.cache_tag = "B";
-            const auto b1 = eng.decide_batch("system beta", { "context" }, fields, opt);
+            const auto b1 = decide_batch(eng, "system beta", { "context" }, fields, opt);
             const std::vector<uint8_t> kv_b = seq_dump();
             opt.cache_tag = "A";
-            const auto a2 = eng.decide_batch("system alpha", { "context" }, fields, opt);
+            const auto a2 = decide_batch(eng, "system alpha", { "context" }, fields, opt);
             const std::vector<uint8_t> kv_a2 = seq_dump();
 
             t.assert_true("the first A request misses", !a1.cache_hit);
@@ -3603,6 +4225,61 @@ static void test_prefix_lru_restores_own_state(testing & t) {
             t.assert_true("the cached A probabilities equal the first A probabilities", same);
         } catch (const std::exception & e) {
             t.assert_true(std::string("the prefix cache run: ") + e.what(), false);
+        }
+    });
+}
+
+// A cache hit on a recurrent or hybrid model reloads the LRU host state and re-saves the device
+// partial state before the fork, so it must reproduce the cold prefill's answer. Repeating a request
+// is reproducible on the winner and the option set, never on the last bits of a probability
+// (docs/decision/API.md Section 3.1).
+static void test_prefix_cache_hit_repeatability(testing & t) {
+    t.test("a restored prefix reproduces the cold fork winner and option set", [](testing & t) {
+        const char * path = std::getenv("LLAMA_DECISION_TEST_MODEL");
+        if (!gpu_model_ready(t, path)) {
+            return;
+        }
+        test_engine te;
+        if (!te.load(path)) {
+            t.assert_true("model loads", false);
+            return;
+        }
+        if (!llama_model_is_recurrent(te.model) && !llama_model_is_hybrid(te.model)) {
+            t.skip("the LRU host-restore path needs a recurrent or hybrid model");
+            return;
+        }
+        try {
+            llama_decision::engine eng(te.ctx, 2, 8);
+            const std::vector<llama_decision::field_input> fields = {
+                { "  \"dept\": ", { "billing", "technical", "refund", "support" } },
+                { "  \"urgent\": ", { "low", "high" } },
+            };
+            std::string shared;
+            for (int i = 0; i < 40; ++i) {
+                shared += "The support request is described in the following ticket. ";
+            }
+
+            llama_decision::options cold_opt;
+            cold_opt.allow_cache = false;
+            const auto cold = decide_batch(eng, shared, { "the customer was charged twice" }, fields, cold_opt);
+
+            llama_decision::options warm_opt;
+            warm_opt.cache_tag = "repeatability";
+            const auto miss = decide_batch(eng, shared, { "the customer was charged twice" }, fields, warm_opt);
+            const auto hit  = decide_batch(eng, shared, { "the customer was charged twice" }, fields, warm_opt);
+
+            t.assert_true("the first cached request is a miss", !miss.cache_hit);
+            t.assert_true("the repeat is a cache hit", hit.cache_hit);
+
+            bool same = cold.items.size() == hit.items.size() &&
+                        cold.items[0].fields.size() == hit.items[0].fields.size();
+            for (size_t f = 0; same && f < hit.items[0].fields.size(); ++f) {
+                same = cold.items[0].fields[f].winner == hit.items[0].fields[f].winner &&
+                       cold.items[0].fields[f].probs.size() == hit.items[0].fields[f].probs.size();
+            }
+            t.assert_true("the restored prefix keeps the winner and the option set", same);
+        } catch (const std::exception & e) {
+            t.assert_true(std::string("the prefix cache hit run: ") + e.what(), false);
         }
     });
 }
@@ -4470,7 +5147,7 @@ static void test_prefix_cache_cost(testing & t) {
                 llama_decision::options opt;
                 opt.fork      = "restore";
                 opt.cache_tag = tag;
-                return eng.decide_batch("system cost", { "context" }, fields, opt).prefill_ms;
+                return decide_batch(eng, "system cost", { "context" }, fields, opt).prefill_ms;
             };
             double miss_ms = std::numeric_limits<double>::max();
             for (int i = 0; i < 3; ++i) {
@@ -4510,7 +5187,7 @@ static void test_bounded_decision_context(testing & t) {
         try {
             llama_decision::engine eng(te.ctx, 2, 8);
             const std::vector<llama_decision::field_input> fields = { { "  \"a\": ", { "1", "2" } } };
-            const auto ok = eng.decide_batch("sys", { "ctx" }, fields, llama_decision::options{});
+            const auto ok = decide_batch(eng, "sys", { "ctx" }, fields, llama_decision::options{});
             t.assert_equal("a fitting request returns a decision", (size_t) 1, ok.items.size());
 
             std::string big;
@@ -4520,7 +5197,7 @@ static void test_bounded_decision_context(testing & t) {
             bool threw = false;
             std::string what;
             try {
-                eng.decide_batch(big, { "ctx" }, fields, llama_decision::options{});
+                decide_batch(eng, big, { "ctx" }, fields, llama_decision::options{});
             } catch (const llama_decision::capacity_error & e) {
                 threw = true;
                 what = e.what();
@@ -4528,7 +5205,7 @@ static void test_bounded_decision_context(testing & t) {
             t.assert_true("an oversize request throws capacity_error", threw);
             t.assert_true("the error names the context budget", what.find("context holds") != std::string::npos);
 
-            const auto again = eng.decide_batch("sys", { "ctx" }, fields, llama_decision::options{});
+            const auto again = decide_batch(eng, "sys", { "ctx" }, fields, llama_decision::options{});
             t.assert_equal("the context keeps serving after a rejected request", (size_t) 1, again.items.size());
         } catch (const std::exception & e) {
             t.assert_true(std::string("the bounded context run: ") + e.what(), false);
@@ -4587,7 +5264,7 @@ static void multi_trunk_restore_round_trip(testing &           t,
     const size_t per_group = std::clamp<size_t>((size_t) eng.n_pool / (1 + plan.branches), 1, contexts.size());
     t.assert_true(lane + ": the batch groups more than one trunk per wave", per_group >= 2);
 
-    const auto batch = eng.decide_batch("system", contexts, fields, o);
+    const auto batch = decide_batch(eng, "system", contexts, fields, o);
     t.assert_equal(lane + ": every context is returned", contexts.size(), batch.items.size());
 
     // the same context twice in one wave must not alias: identical inputs must score identically
@@ -4608,7 +5285,7 @@ static void multi_trunk_restore_round_trip(testing &           t,
 
     // each context keeps its own winner, the task-value outcome, against a single-context run
     for (size_t c = 0; c < contexts.size(); ++c) {
-        const auto single  = eng.decide_batch("system", { contexts[c] }, fields, o);
+        const auto single  = decide_batch(eng, "system", { contexts[c] }, fields, o);
         bool       winners = batch.items[c].fields.size() == single.items[0].fields.size();
         for (size_t f = 0; winners && f < fields.size(); ++f) {
             winners = batch.items[c].fields[f].winner == single.items[0].fields[f].winner;
@@ -4736,7 +5413,7 @@ static void test_pool_seq_lifecycle(testing & t) {
             o.fork = "restore"; // restore allocates exclusive pool cells, so a leak is measurable
             bool threw = false;
             try {
-                (void) eng.decide_batch(shared_text, { tail_text }, fields, o);
+                (void) decide_batch(eng, shared_text, { tail_text }, fields, o);
             } catch (const llama_decision::capacity_error &) {
                 threw = true;
             }
@@ -4808,8 +5485,8 @@ static void swa_fork_clamp_run(testing & t, llama_context * ctx, const std::stri
     llama_decision::options o_hybrid = o_restore;
     o_hybrid.fork = "hybrid";
 
-    const auto restore = eng.decide_batch("system", { context }, fields, o_restore);
-    const auto hybrid  = eng.decide_batch("system", { context }, fields, o_hybrid);
+    const auto restore = decide_batch(eng, "system", { context }, fields, o_restore);
+    const auto hybrid  = decide_batch(eng, "system", { context }, fields, o_hybrid);
     if (!t.assert_true(lane + ": the clamped restore decision returns", restore.items.size() == 1) ||
         !t.assert_true(lane + ": the clamped hybrid decision returns", hybrid.items.size() == 1)) {
         return;
@@ -4883,7 +5560,6 @@ static common_json oracle_readout(const llama_decision::readout_metrics & m,
     o["cache_hit"]            = m.cache_hit;
     o["suffix_tokens"]        = (long long) m.suffix_tokens;
     o["common_suffix_tokens"] = (long long) m.common_suffix_tokens;
-    o["leaf_suffix_tokens"]   = (long long) m.leaf_suffix_tokens;
     o["rows"]                 = (long long) m.rows;
     o["rounds"]               = (long long) m.rounds;
 
@@ -4993,7 +5669,6 @@ static void oracle_assert_readout(testing & t, const std::string & label,
     t.assert_equal(label + " cache_hit", exp.at("cache_hit").get<bool>(), act.at("cache_hit").get<bool>());
     t.assert_equal(label + " suffix_tokens", exp.at("suffix_tokens").get<long long>(), act.at("suffix_tokens").get<long long>());
     t.assert_equal(label + " common_suffix_tokens", exp.at("common_suffix_tokens").get<long long>(), act.at("common_suffix_tokens").get<long long>());
-    t.assert_equal(label + " leaf_suffix_tokens", exp.at("leaf_suffix_tokens").get<long long>(), act.at("leaf_suffix_tokens").get<long long>());
     t.assert_equal(label + " rows", exp.at("rows").get<long long>(), act.at("rows").get<long long>());
     t.assert_equal(label + " rounds", exp.at("rounds").get<long long>(), act.at("rounds").get<long long>());
 
@@ -5073,16 +5748,15 @@ static void test_compile_fields_plan(testing & t) {
 
         const llama_decision::compiled_fields a = eng.compile_fields(fields, opt);
         const llama_decision::compiled_fields b = eng.compile_fields(fields, opt);
-        t.assert_equal("field_count is stable", a.field_count, b.field_count);
         t.assert_equal("rows is stable", a.rows, b.rows);
         t.assert_equal("branches is stable", a.branches, b.branches);
         t.assert_equal("suffix_tokens is stable", a.suffix_tokens, b.suffix_tokens);
         t.assert_equal("common_suffix_tokens is stable", a.common_suffix_tokens, b.common_suffix_tokens);
         t.assert_equal("leaf_suffix_tokens is stable", a.leaf_suffix_tokens, b.leaf_suffix_tokens);
-        t.assert_equal("one unique field", (size_t) 1, a.field_count);
         t.assert_true("the plan carries rows", a.rows > 0);
 
-        const llama_decision::batch_result br = eng.decide_batch("", { "state" }, fields, opt);
+        const llama_decision::batch_result br = decide_batch(eng, "", { "state" }, fields, opt);
+        t.assert_equal("one unique field scores one field", (size_t) 1, br.items.at(0).fields.size());
         t.assert_equal("decide_batch reports the plan rows", (long long) a.rows, (long long) br.rows);
         t.assert_equal("decide_batch reports the plan suffix_tokens", a.suffix_tokens, br.suffix_tokens);
         t.assert_equal("decide_batch reports the plan leaf_suffix_tokens", a.leaf_suffix_tokens, br.leaf_suffix_tokens);
@@ -5090,10 +5764,10 @@ static void test_compile_fields_plan(testing & t) {
     });
 }
 
-// The plan overload and the inputs wrapper must score the same plan the same way, so the wrapper
-// can stay a thin shim while a caller that needs the plan up front compiles it once.
+// The compile-then-score composition and the explicit plan form must score identically, so the
+// composition the tests share is the same plan the engine sees when a caller compiles up front.
 static void test_decide_batch_plan_overload(testing & t) {
-    t.test("the plan overload and the inputs wrapper score identically", [](testing & t) {
+    t.test("the plan overload and the compile-then-score composition agree", [](testing & t) {
         const std::string path = decision_cpu_model_path();
         if (path.empty()) {
             t.skip("no generated model; run the generate-models fixture");
@@ -5116,7 +5790,7 @@ static void test_decide_batch_plan_overload(testing & t) {
         opt.allow_cache = false;  // isolate the arithmetic from prefix-cache reuse
 
         const llama_decision::compiled_fields plan    = eng.compile_fields(fields, opt);
-        const llama_decision::batch_result    wrapped = eng.decide_batch("", { "state" }, fields, opt);
+        const llama_decision::batch_result    wrapped = decide_batch(eng, "", { "state" }, fields, opt);
         const llama_decision::batch_result    planned = eng.decide_batch(plan, "", { "state" }, opt);
 
         t.assert_equal("the overload keeps the item count", wrapped.items.size(), planned.items.size());
@@ -5129,7 +5803,7 @@ static void test_decide_batch_plan_overload(testing & t) {
             const auto & b = planned.items[i];
             same           = a.fields.size() == b.fields.size();
             for (size_t f = 0; same && f < a.fields.size(); ++f) {
-                same = a.fields[f].winner == b.fields[f].winner && a.fields[f].tree == b.fields[f].tree &&
+                same = a.fields[f].winner == b.fields[f].winner &&
                        a.fields[f].scored_nodes == b.fields[f].scored_nodes &&
                        a.fields[f].probs.size() == b.fields[f].probs.size();
                 for (size_t k = 0; same && k < a.fields[f].probs.size(); ++k) {
@@ -5151,10 +5825,9 @@ static bool token_entries_identical(const llama_decision::batch_result & a, cons
     for (size_t i = 0; same && i < a.items.size(); ++i) {
         const auto & ia = a.items[i];
         const auto & ib = b.items[i];
-        same = ia.context_tokens == ib.context_tokens && ia.rows == ib.rows &&
-               ia.fields.size() == ib.fields.size();
+        same = ia.context_tokens == ib.context_tokens && ia.fields.size() == ib.fields.size();
         for (size_t f = 0; same && f < ia.fields.size(); ++f) {
-            same = ia.fields[f].winner == ib.fields[f].winner && ia.fields[f].tree == ib.fields[f].tree &&
+            same = ia.fields[f].winner == ib.fields[f].winner &&
                    ia.fields[f].scored_nodes == ib.fields[f].scored_nodes &&
                    ia.fields[f].probs.size() == ib.fields[f].probs.size();
             for (size_t k = 0; same && k < ia.fields[f].probs.size(); ++k) {
@@ -5250,7 +5923,7 @@ static void warm_resident_run(testing & t, llama_decision::engine & eng, llama_c
     llama_decision::options opt;
     opt.mode = "tree";
     const llama_decision::compiled_fields plan = eng.compile_fields(fields, opt);
-    const llama_vocab * vocab = llama_model_get_vocab(eng.get_model());
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     // a turn long enough that re-prefilling would dominate, like a real session snapshot
     std::string context_text;
     for (int i = 0; i < 25; ++i) {
@@ -5431,30 +6104,55 @@ static void warm_capacity_accounting(testing & t, test_engine & te, const std::s
     ctx       = te.ctx;
     const auto over_t = llama_decision::tokens_t(other + 1, filler[0]);
 
-    t.test(lane + " a warm fork one cell over the budget is refused before the decode", [&](testing &) {
+    t.test(lane + " an over-budget warm decision is refused before any slot is touched", [&](testing &) {
         llama_decision::engine eng2(ctx, 2, 8, 2);
         const llama_decision::compiled_fields plan2 = eng2.compile_fields(fields, opt);
+        // the resident warm tier as a comparable snapshot: tag, decoded length, LRU stamp
+        const auto slot_state = [](const std::vector<llama_decision::engine::warm_slot> & slots) {
+            std::vector<std::string> out;
+            out.reserve(slots.size());
+            for (const auto & s : slots) {
+                out.push_back(s.tag + "|" + std::to_string(s.pos) + "|" + std::to_string(s.last_used));
+            }
+            return out;
+        };
+        const auto filled = [](const std::vector<llama_decision::engine::warm_slot> & slots) {
+            size_t n = 0;
+            for (const auto & s : slots) {
+                n += s.tag.empty() ? 0 : 1;
+            }
+            return n;
+        };
+
+        // control: a fitting decision installs exactly one slot, and its repeat forks that slot
+        // without installing another
         const auto control = eng2.decide_warm(src, plan2, opt, "source");
-        t.assert_equal(lane + " the control fork is accepted before the second prefix exists", (size_t) 1,
-                       control.items[0].fields.size());
-        try {
-            (void) eng2.decide_warm(over_t, plan2, opt, "other");
-        } catch (const llama_decision::capacity_error &) {
-            // the prefix that does not fit is the one under test; it stays resident
-        }
+        t.assert_true(lane + " a fitting warm decision cold-prefills", !control.warm_hit);
+        t.assert_equal(lane + " a fitting warm decision installs exactly one slot", (size_t) 1,
+                       filled(eng2.warm_slots_));
+        const auto repeat = eng2.decide_warm(src, plan2, opt, "source");
+        t.assert_true(lane + " a repeat forks the resident prefix", repeat.warm_hit);
+        t.assert_equal(lane + " a repeat installs no additional slot", (size_t) 1, filled(eng2.warm_slots_));
+
+        // regression: a decision that cannot fit beside the resident prefix is refused before it
+        // allocates or clears anything, so no slot is evicted and the resident prefix survives
+        const std::vector<std::string> before = slot_state(eng2.warm_slots_);
         bool      refused = false;
         std::string what;
         try {
-            (void) eng2.decide_warm(src, plan2, opt, "source");
+            (void) eng2.decide_warm(over_t, plan2, opt, "other");
         } catch (const llama_decision::capacity_error & e) {
             refused = true;
             what    = e.what();
         }
-        t.assert_true(lane + " a fork one cell over the budget raises capacity_error", refused);
+        t.assert_true(lane + " an over-budget warm decision raises capacity_error", refused);
         t.assert_true(lane + " the refusal names the context budget, not a decode failure",
                       what.find("context holds") != std::string::npos);
         t.assert_true(lane + " the refusal is not a late decode failure",
                       what.find("no free KV cache space") == std::string::npos);
+        t.assert_true(lane + " the refusal leaves every warm slot unchanged", slot_state(eng2.warm_slots_) == before);
+        const auto survived = eng2.decide_warm(src, plan2, opt, "source");
+        t.assert_true(lane + " the refused prefix never displaced the resident one", survived.warm_hit);
     });
 }
 
@@ -5494,14 +6192,14 @@ static void test_prefix_cache_coherence(testing & t) {
 
             llama_decision::options o1;
             o1.cache_tag = "tag-A";
-            const auto b1 = eng.decide_batch("system", { "ctx" }, fields, o1);
-            const auto b2 = eng.decide_batch("system", { "ctx" }, fields, o1);
+            const auto b1 = decide_batch(eng, "system", { "ctx" }, fields, o1);
+            const auto b2 = decide_batch(eng, "system", { "ctx" }, fields, o1);
             t.assert_true("first request misses", !b1.cache_hit);
             t.assert_true("same identity hits", b2.cache_hit);
 
             llama_decision::options o2;
             o2.cache_tag = "tag-B";
-            const auto b3 = eng.decide_batch("system", { "ctx" }, fields, o2);
+            const auto b3 = decide_batch(eng, "system", { "ctx" }, fields, o2);
             t.assert_true("changed identity misses", !b3.cache_hit);
         } catch (const std::exception & e) {
             t.assert_true(std::string("cache coherence runs: ") + e.what(), false);
@@ -5528,8 +6226,8 @@ static void test_token_cache(testing & t) {
             };
             llama_decision::options o;
             o.cache_tag = "tok";
-            const auto first  = eng.decide_batch("system", { "ctx" }, fields, o);
-            const auto second = eng.decide_batch("system", { "ctx" }, fields, o);
+            const auto first  = decide_batch(eng, "system", { "ctx" }, fields, o);
+            const auto second = decide_batch(eng, "system", { "ctx" }, fields, o);
             t.assert_true("the second decision reuses the cached prefix", second.cache_hit);
             t.assert_true("the repeat is byte-identical",
                           first.items[0].fields.size() == second.items[0].fields.size());
@@ -5555,8 +6253,8 @@ static void test_prefix_reuse(testing & t) {
             const std::vector<llama_decision::field_input> fields = { { "  \"a\": ", { "1", "2", "3" } } };
             llama_decision::options o;
             o.cache_tag = "reuse";
-            const auto b1 = eng.decide_batch("system", { "ctx" }, fields, o);
-            const auto b2 = eng.decide_batch("system", { "ctx" }, fields, o);
+            const auto b1 = decide_batch(eng, "system", { "ctx" }, fields, o);
+            const auto b2 = decide_batch(eng, "system", { "ctx" }, fields, o);
 
             t.assert_true("the first request is cold", !b1.cache_hit);
             t.assert_true("the repeat is a hit", b2.cache_hit);
@@ -5593,7 +6291,7 @@ static void test_request_prefix(testing & t) {
             };
             llama_decision::options o;
             o.cache_tag = "hoist";
-            const auto r = eng.decide_batch("system", { "ctx" }, shared_suffix, o);
+            const auto r = decide_batch(eng, "system", { "ctx" }, shared_suffix, o);
             t.assert_true("a long common head is hoisted", r.common_suffix_tokens >= 32);
             t.assert_true("branches decode only their unique tail", r.leaf_suffix_tokens < r.suffix_tokens);
             t.assert_equal("the hoisted head is removed from every field",
@@ -5604,7 +6302,7 @@ static void test_request_prefix(testing & t) {
                 { "state alpha: ", { "1", "2" } },
                 { "state beta: ",  { "3", "4" } },
             };
-            const auto rn = eng.decide_batch("system", { "ctx" }, near_miss, o);
+            const auto rn = decide_batch(eng, "system", { "ctx" }, near_miss, o);
             t.assert_equal("a short head on two fields does not hoist", 0, (int) rn.common_suffix_tokens);
 
             // A short head still pays off once many questions share it: the hoist budget is
@@ -5617,7 +6315,7 @@ static void test_request_prefix(testing & t) {
             for (int i = 0; i < 40; ++i) {
                 many.push_back({ many_head + "field" + std::to_string(i) + ": ", { "1", "2" } });
             }
-            const auto rm = eng.decide_batch("system", { "ctx" }, many, o);
+            const auto rm = decide_batch(eng, "system", { "ctx" }, many, o);
             t.assert_true("a short head is hoisted once many fields share it", rm.common_suffix_tokens >= 4);
             t.assert_true("the many-field branches decode only their unique tail",
                           rm.leaf_suffix_tokens + rm.common_suffix_tokens * many.size() == rm.suffix_tokens);
@@ -5625,13 +6323,13 @@ static void test_request_prefix(testing & t) {
             llama_decision::options off = o;
             off.cache_tag = "hoist-off";
             off.optimize  = false;
-            const auto ro = eng.decide_batch("system", { "ctx" }, shared_suffix, off);
+            const auto ro = decide_batch(eng, "system", { "ctx" }, shared_suffix, off);
             t.assert_equal("optimize off does not hoist", 0, (int) ro.common_suffix_tokens);
             t.assert_equal("optimize off keeps every suffix token",
                            (long long) ro.leaf_suffix_tokens, (long long) ro.suffix_tokens);
 
             const std::vector<llama_decision::field_input> duplicate = { shared_suffix[0], shared_suffix[0] };
-            const auto rd = eng.decide_batch("system", { "ctx" }, duplicate, o);
+            const auto rd = decide_batch(eng, "system", { "ctx" }, duplicate, o);
             t.assert_true("identical fields score once", rd.suffix_tokens < r.suffix_tokens);
             t.assert_equal("the duplicate is the same single suffix",
                            (long long) (rd.suffix_tokens * 2), (long long) r.suffix_tokens);
@@ -5661,7 +6359,7 @@ static void test_batching_waves(testing & t) {
             }
             llama_decision::options o;
             o.cache_tag = "waves-many";
-            const auto b = eng.decide_batch("system", { "ctx" }, many, o);
+            const auto b = decide_batch(eng, "system", { "ctx" }, many, o);
             t.assert_equal("one result per context", (size_t) 1, b.items.size());
             t.assert_equal("one field per question", (size_t) 64, b.items[0].fields.size());
 
@@ -5669,7 +6367,7 @@ static void test_batching_waves(testing & t) {
             std::vector<llama_decision::field_input> first(many.begin(), many.begin() + 8);
             llama_decision::options o2;
             o2.cache_tag = "waves-first";
-            const auto b2 = eng.decide_batch("system", { "ctx" }, first, o2);
+            const auto b2 = decide_batch(eng, "system", { "ctx" }, first, o2);
             bool same = b2.items[0].fields.size() == 8;
             double max_diff = 0.0;
             auto winner = [](const std::vector<float> & p) {
@@ -5710,7 +6408,7 @@ static void test_dedup_fields(testing & t) {
 
             llama_decision::options o;
             o.cache_tag = "dedup";
-            const auto dup = eng.decide_batch("system", { "ctx" }, { a, a, b, a }, o);
+            const auto dup = decide_batch(eng, "system", { "ctx" }, { a, a, b, a }, o);
 
             t.assert_equal("duplicates still answer in place", (size_t) 4, dup.items[0].fields.size());
             bool equal = true;
@@ -5721,7 +6419,7 @@ static void test_dedup_fields(testing & t) {
                 equal = equal && dup.items[0].fields[f].probs == dup.items[0].fields[0].probs;
             }
             t.assert_true("duplicate fields share the first answer", equal);
-            const auto unique = eng.decide_batch("system", { "ctx" }, { a, b }, o);
+            const auto unique = decide_batch(eng, "system", { "ctx" }, { a, b }, o);
             t.assert_equal("dedup scores only the unique fields", unique.rows, dup.rows);
         } catch (const std::exception & e) {
             t.assert_true(std::string("dedup runs: ") + e.what(), false);
@@ -5753,7 +6451,7 @@ static void test_cancel_reaches_compute(testing & t) {
 
             bool cancelled = false;
             try {
-                (void) eng.decide_batch("system", { "ctx" }, fields, o);
+                (void) decide_batch(eng, "system", { "ctx" }, fields, o);
             } catch (const llama_decision::cancelled_error &) {
                 cancelled = true;
             }
@@ -5786,7 +6484,7 @@ static void test_yield_points(testing & t) {
             llama_decision::options o;
             o.cache_tag = "yield";
             o.yield     = [&yields]() { ++yields; };
-            (void) eng.decide_batch("system", { "ctx" }, many, o);
+            (void) decide_batch(eng, "system", { "ctx" }, many, o);
             t.assert_true("a wide decision yields at least once", yields >= 1);
         } catch (const std::exception & e) {
             t.assert_true(std::string("yield run: ") + e.what(), false);
@@ -5816,7 +6514,7 @@ static void test_capacity_error(testing & t) {
             llama_decision::options oc;
             oc.mode      = "tree";
             oc.cache_tag = "capacity-chunked";
-            const auto b = eng.decide_batch("system", { "ctx" }, chunked_fields, oc);
+            const auto b = decide_batch(eng, "system", { "ctx" }, chunked_fields, oc);
             t.assert_equal("the chunked suffix produces one field", (size_t) 1, b.items[0].fields.size());
             t.assert_equal("the chunked suffix scores every candidate", (size_t) 2, b.items[0].fields[0].probs.size());
 
@@ -5831,7 +6529,7 @@ static void test_capacity_error(testing & t) {
             o.cache_tag = "capacity-context";
             bool rejected = false;
             try {
-                (void) eng.decide_batch("system", { "ctx" }, fields, o);
+                (void) decide_batch(eng, "system", { "ctx" }, fields, o);
             } catch (const llama_decision::capacity_error &) {
                 rejected = true;
             }
@@ -5873,8 +6571,8 @@ static void test_long_branch_chunking(testing & t) {
 
             llama_decision::engine es(small.ctx, 2, 8);
             llama_decision::engine el(large.ctx, 2, 8);
-            const auto bs = es.decide_batch("system", { "ctx" }, fields, opt);
-            const auto bl = el.decide_batch("system", { "ctx" }, fields, opt);
+            const auto bs = decide_batch(es, "system", { "ctx" }, fields, opt);
+            const auto bl = decide_batch(el, "system", { "ctx" }, fields, opt);
 
             t.assert_equal("chunked and reference both score one field", (size_t) 1, bs.items[0].fields.size());
             const auto & ps = bs.items[0].fields[0].probs;
@@ -5955,10 +6653,10 @@ static void test_permutations_parsing(testing & t) {
     t.test("permutations are accepted and capped, never used on the default path", [](testing & t) {
         common_json body = common_json::parse(decision_valid_body());
         body["permutations"] = 2;
-        t.assert_equal("two passes accepted", 2, llama_decision::parse_decision_request(body).permutations);
+        t.assert_equal("two passes accepted", 2, llama_decision::parse_decision_request(body).envelope.knobs.permutations);
 
         body["permutations"] = 99;
-        t.assert_equal("large values are capped, not rejected", 8, llama_decision::parse_decision_request(body).permutations);
+        t.assert_equal("large values are capped, not rejected", 8, llama_decision::parse_decision_request(body).envelope.knobs.permutations);
 
         body["permutations"] = 0;
         bool threw = false;
@@ -5970,7 +6668,7 @@ static void test_permutations_parsing(testing & t) {
         t.assert_true("zero passes is rejected", threw);
 
         common_json def = common_json::parse(decision_valid_body());
-        t.assert_equal("default is one pass", 1, llama_decision::parse_decision_request(def).permutations);
+        t.assert_equal("default is one pass", 1, llama_decision::parse_decision_request(def).envelope.knobs.permutations);
     });
 }
 
@@ -6257,7 +6955,7 @@ static std::pair<common_json, common_json> assemble_default_and_diagnostics() {
     const std::vector<std::vector<float>> probs = { { 0.25f, 0.75f }, { 0.6f, 0.3f, 0.1f }, { 0.2f, 0.3f, 0.5f } };
     llama_decision::decision_request req = llama_decision::parse_decision_request(common_json::parse(decision_valid_body()));
     const common_json plain = llama_decision::assemble_decision_response(req, probs, "m", usage);
-    req.diagnostics = true;
+    req.envelope.diagnostics = true;
     const common_json diag = llama_decision::assemble_decision_response(req, probs, "m", usage);
     return { plain, diag };
 }
@@ -6345,7 +7043,7 @@ static void test_jev_compat_guarantee(testing & t) {
 
     t.test("the diagnostics variant differs only additively", [&](testing & t) {
         auto diag_req = req;
-        diag_req.diagnostics = true;
+        diag_req.envelope.diagnostics = true;
         const common_json plain = llama_decision::assemble_decision_response(req, probs, "m", usage);
         const common_json diag  = llama_decision::assemble_decision_response(diag_req, probs, "m", usage);
 
@@ -6401,7 +7099,7 @@ static void test_jev_compat_guarantee(testing & t) {
 
         // with diagnostics the same payload still reports the fork fields
         auto diag_req = req;
-        diag_req.diagnostics = true;
+        diag_req.envelope.diagnostics = true;
         const common_json diag = llama_decision::assemble_decision_response(diag_req, probs, "m", usage, &session_payload);
         t.assert_equal("session_fork is reported with diagnostics", true, diag.at("session_fork").get<bool>());
         t.assert_equal("source_slot is reported with diagnostics", 3, diag.at("source_slot").get<long long>());
@@ -6736,6 +7434,138 @@ static common_json calibration_determinism_allowlist_measurement() {
     return out;
 }
 
+// Shared-prefix cache cost. The prefix LRU keeps a self-contained host state; on a recurrent or
+// hybrid model a hit reloads that state onto the snapshot sequence and re-saves the device partial
+// state before a fork, while a dense model keeps the prefix resident on the snapshot sequence and
+// forks it directly. This times a cold prefill, an LRU miss, an LRU hit and the resident hit at
+// three prefix sizes, and reports the state bytes each path moves. It is a measurement, never a
+// gate on a producer score.
+static common_json calibration_prefix_warm_measurement(test_engine & te) {
+    const char * cls = llama_model_is_recurrent(te.model) ? "recurrent"
+                     : llama_model_is_hybrid(te.model)    ? "hybrid" : "dense";
+    const bool   recurrent = std::string(cls) != "dense";
+
+    llama_decision::engine eng(te.ctx, 2, 8);
+    eng.select_fork("auto");
+
+    const llama_vocab * vocab       = llama_model_get_vocab(te.model);
+    const std::string   unit        = "The support request follows and the customer explains the problem. ";
+    const size_t        unit_tokens = common_tokenize(vocab, unit, false, true).size();
+
+    auto percentile = [](std::vector<double> xs, double q) {
+        if (xs.empty()) {
+            return 0.0;
+        }
+        std::sort(xs.begin(), xs.end());
+        const size_t idx = std::min(xs.size() - 1, (size_t) (q * (double) (xs.size() - 1) + 0.5));
+        return xs[idx];
+    };
+
+    common_json out   = common_json::object();
+    out["class"]      = cls;
+    common_json sizes = common_json::object();
+    for (int target : { 1000, 8000, 32000 }) {
+        if (unit_tokens == 0) {
+            break;
+        }
+        const int repeats = std::max(1, target / (int) unit_tokens);
+        std::string shared_text;
+        shared_text.reserve(unit.size() * (size_t) repeats);
+        for (int i = 0; i < repeats; ++i) {
+            shared_text += unit;
+        }
+        const auto shared = common_tokenize(vocab, shared_text, true, true);
+        if (shared.empty()) {
+            continue;
+        }
+        const std::string tag = "warm-" + std::to_string(target);
+
+        auto time_prepare = [&](bool allow_cache, const std::string & cache_tag) {
+            std::vector<double> samples;
+            bool                hit = false;
+            for (int i = 0; i < 4; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                hit = eng.prepare_prefix(shared, allow_cache, cache_tag);
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                if (i > 0) {
+                    samples.push_back(ms);
+                }
+            }
+            common_json r  = common_json::object();
+            r["median_ms"] = percentile(samples, 0.50);
+            r["p95_ms"]    = percentile(samples, 0.95);
+            r["hit"]       = hit;
+            return r;
+        };
+
+        common_json row      = common_json::object();
+        row["shared_tokens"] = (long long) shared.size();
+        // cold: never reuse the cache
+        row["cold"] = time_prepare(false, "");
+        // miss: a fresh tag each call forces a prefill that repopulates the LRU
+        {
+            std::vector<double> samples;
+            for (int i = 0; i < 4; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                (void) eng.prepare_prefix(shared, true, tag + "-miss-" + std::to_string(i));
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                if (i > 0) {
+                    samples.push_back(ms);
+                }
+            }
+            row["miss_median_ms"] = percentile(samples, 0.50);
+        }
+        // lru hit: the first call populates the LRU, every later call reloads its host state
+        if (recurrent) {
+            (void) eng.prepare_prefix(shared, true, tag);
+            std::vector<double> samples;
+            for (int i = 0; i < 4; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                (void) eng.prepare_prefix(shared, true, tag);
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                samples.push_back(ms);
+            }
+            row["lru_hit_median_ms"] = percentile(samples, 0.50);
+            row["lru_hit_p95_ms"]    = percentile(samples, 0.95);
+        }
+        // resident hit: an empty tag reuses the prefix already on the snapshot sequence
+        {
+            (void) eng.prepare_prefix(shared, true, std::string());
+            std::vector<double> samples;
+            for (int i = 0; i < 4; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                (void) eng.prepare_prefix(shared, true, std::string());
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                if (i > 0) {
+                    samples.push_back(ms);
+                }
+            }
+            row["resident_hit_median_ms"] = percentile(samples, 0.50);
+        }
+        // state bytes the hit path moves, read off the snapshot sequence
+        row["host_state_bytes"]    = (long long) llama_state_seq_get_size_ext(te.ctx, 2, LLAMA_STATE_SEQ_FLAGS_NONE);
+        row["device_state_bytes"]  = (long long) llama_state_seq_get_size_ext(te.ctx, 2, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        row["device_partial_bytes"] = recurrent
+            ? (long long) llama_state_seq_get_size_ext(
+                  te.ctx, 2, (llama_state_seq_flags) (LLAMA_STATE_SEQ_FLAGS_ON_DEVICE | LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))
+            : 0;
+        const double cold_ms = row.at("cold").at("median_ms").get<double>();
+        if (cold_ms > 0.0) {
+            row["resident_speedup_vs_cold"] = cold_ms / std::max(1e-9, row.at("resident_hit_median_ms").get<double>());
+            if (recurrent) {
+                row["lru_speedup_vs_cold"] = cold_ms / std::max(1e-9, row.at("lru_hit_median_ms").get<double>());
+            }
+        }
+        sizes[std::to_string(target)] = row;
+    }
+    out["sizes"] = sizes;
+    return out;
+}
+
 static common_json calibration_model_measurement(const char * path) {
     test_engine te;
     if (!te.load(path)) {
@@ -6759,10 +7589,10 @@ static common_json calibration_model_measurement(const char * path) {
     oa.tree_max  = 4;
     oa.cache_tag = "cal-auto";
 
-    const auto st = eng.decide_batch("system", { "ctx" }, small, ot);
-    const auto sg = eng.decide_batch("system", { "ctx" }, small, og);
-    const auto wt = eng.decide_batch("system", { "ctx" }, wide, ot);
-    const auto wa = eng.decide_batch("system", { "ctx" }, wide, oa);
+    const auto st = decide_batch(eng, "system", { "ctx" }, small, ot);
+    const auto sg = decide_batch(eng, "system", { "ctx" }, small, og);
+    const auto wt = decide_batch(eng, "system", { "ctx" }, wide, ot);
+    const auto wa = decide_batch(eng, "system", { "ctx" }, wide, oa);
 
     auto tv = [](const std::vector<float> & p, const std::vector<float> & q) {
         double s = 0.0;
@@ -6774,13 +7604,15 @@ static common_json calibration_model_measurement(const char * path) {
     auto argmax = [](const std::vector<float> & p) {
         return (int) (std::max_element(p.begin(), p.end()) - p.begin());
     };
+    // a tree-scored field carries the exact distribution over its values; a greedy one carries none
+    auto scored_by_tree = [](const llama_decision::batch_result & b) { return !b.items[0].fields[0].probs.empty(); };
 
     const auto & ps = st.items[0].fields[0].probs;
     const auto & pg = sg.items[0].fields[0].probs;
     out["small_tv"]            = tv(ps, pg);
     out["small_argmax_agree"]  = argmax(ps) == argmax(pg);
-    out["wide_tree_is_tree"]   = wt.items[0].fields[0].tree;
-    out["wide_auto_is_tree"]   = wa.items[0].fields[0].tree;
+    out["wide_tree_is_tree"]   = scored_by_tree(wt);
+    out["wide_auto_is_tree"]   = scored_by_tree(wa);
     out["wide_tree_rows"]      = (long long) wt.rows;
     out["wide_greedy_rows"]    = (long long) wa.rows;
 
@@ -6802,7 +7634,7 @@ static common_json calibration_model_measurement(const char * path) {
         double best = 1e18;
         for (int i = 0; i < 8; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
-            (void) eng.decide_batch(long_shared, { "ctx" }, small, o);
+            (void) decide_batch(eng, long_shared, { "ctx" }, small, o);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (i > 0) {
                 best = std::min(best, ms);
@@ -6824,6 +7656,68 @@ static common_json calibration_model_measurement(const char * path) {
     }
     out["bypass_applicable"] = bypass_applicable;
 
+    // Benefit report for the fork bypass: median and p95 scoring time for one single-question
+    // decision, bypass on versus off, at three option counts. The copy fork is dense-only; the
+    // restore fork reloads the full parent and is exact on every model. This is a measurement, not
+    // a tunable: a fork whose bypass is not clearly cheaper stays off.
+    auto percentile = [](std::vector<double> xs, double q) {
+        if (xs.empty()) {
+            return 0.0;
+        }
+        std::sort(xs.begin(), xs.end());
+        const size_t idx = std::min(xs.size() - 1, (size_t) (q * (double) (xs.size() - 1) + 0.5));
+        return xs[idx];
+    };
+    const auto bypass_field = [](int n) {
+        std::vector<std::string> vals;
+        vals.reserve((size_t) n);
+        for (int i = 0; i < n; ++i) {
+            vals.push_back("v" + std::to_string(i));
+        }
+        return std::vector<llama_decision::field_input>{ { "  \"a\": ", std::move(vals) } };
+    };
+    const auto measure_bypass = [&](const std::string & fork, int n_opts, bool bypass) {
+        llama_decision::options o;
+        o.mode      = "greedy"; // one branch per greedy round, so the bypass actually engages
+        o.fork      = fork;
+        o.bypass    = bypass;
+        o.cache_tag = "cal-bypass-" + fork + "-" + std::to_string(n_opts);
+        const auto fields = bypass_field(n_opts);
+        std::vector<double> samples;
+        for (int i = 0; i < 9; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            (void) decide_batch(eng, long_shared, { "ctx" }, fields, o);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (i > 0) {
+                samples.push_back(ms);
+            }
+        }
+        common_json r = common_json::object();
+        r["median_ms"] = percentile(samples, 0.50);
+        r["p95_ms"]    = percentile(samples, 0.95);
+        return r;
+    };
+    common_json bypass_report = common_json::object();
+    for (const std::string fork : { std::string("copy"), std::string("restore") }) {
+        if (fork == "copy" && !copy_fork) {
+            continue;
+        }
+        common_json by_fork = common_json::object();
+        for (int n : { 2, 16, 64 }) {
+            const common_json on  = measure_bypass(fork, n, true);
+            const common_json off = measure_bypass(fork, n, false);
+            common_json e = common_json::object();
+            e["on"]      = on;
+            e["off"]     = off;
+            e["speedup"] = on.at("median_ms").get<double>() > 0.0
+                         ? off.at("median_ms").get<double>() / on.at("median_ms").get<double>()
+                         : 1.0;
+            by_fork[std::to_string(n)] = e;
+        }
+        bypass_report[fork] = by_fork;
+    }
+    out["bypass_measurement"] = bypass_report;
+
     // prefix-reuse economy behind the hoist threshold: cached vs cold prefill of the shared head
     llama_decision::options po;
     po.cache_tag = "cal-prefill";
@@ -6833,7 +7727,7 @@ static common_json calibration_model_measurement(const char * path) {
         double best = 1e18;
         for (int i = 0; i < 5; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
-            (void) eng.decide_batch(long_shared, { "ctx" }, four, o);
+            (void) decide_batch(eng, long_shared, { "ctx" }, four, o);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (i > 0) {
                 best = std::min(best, ms);
@@ -6853,10 +7747,10 @@ static common_json calibration_model_measurement(const char * path) {
     o4.mode      = "auto";
     o4.tree_max  = 3;
     o4.cache_tag = "cal-auto4";
-    const auto b3 = eng.decide_batch("system", { "ctx" }, small, o3);
-    const auto b4 = eng.decide_batch("system", { "ctx" }, four, o4);
-    out["auto_at_tree_max_is_tree"]    = b3.items[0].fields[0].tree;
-    out["auto_above_tree_max_is_tree"] = b4.items[0].fields[0].tree;
+    const auto b3 = decide_batch(eng, "system", { "ctx" }, small, o3);
+    const auto b4 = decide_batch(eng, "system", { "ctx" }, four, o4);
+    out["auto_at_tree_max_is_tree"]    = scored_by_tree(b3);
+    out["auto_above_tree_max_is_tree"] = scored_by_tree(b4);
 
     // temperature changes the distribution shape but keeps the winner; NLL(winner) is recorded
     auto vocab = llama_decision::make_llama_label_vocab(llama_model_get_vocab(te.model));
@@ -6902,8 +7796,8 @@ static common_json calibration_model_measurement(const char * path) {
     llama_decision::options oo_off;
     oo_off.optimize  = false;
     oo_off.cache_tag = "cal-hoist-off";
-    const auto hon  = eng.decide_batch("system", { decision_state }, corpus, oo_on);
-    const auto hoff = eng.decide_batch("system", { decision_state }, corpus, oo_off);
+    const auto hon  = decide_batch(eng, "system", { decision_state }, corpus, oo_on);
+    const auto hoff = decide_batch(eng, "system", { decision_state }, corpus, oo_off);
     double hoist_tv = 0.0;
     bool   hoist_agree = hon.items.size() == hoff.items.size() &&
                          !hon.items.empty() && !hoff.items.empty() &&
@@ -6922,8 +7816,21 @@ static common_json calibration_model_measurement(const char * path) {
     llama_decision::options od;
     od.mode      = "auto";
     od.cache_tag = "cal-auto-default";
-    const auto wdef = eng.decide_batch("system", { "ctx" }, wide, od);
-    out["wide_auto_default_is_tree"] = wdef.items[0].fields[0].tree;
+    const auto wdef = decide_batch(eng, "system", { "ctx" }, wide, od);
+    out["wide_auto_default_is_tree"] = scored_by_tree(wdef);
+
+    // shared-prefix cache cost at three prefix sizes: a 32k prefix needs a window above it, so reopen
+    // the context and fall back to a smaller window when the backend cannot hold the largest one
+    {
+        bool reopened = false;
+        for (int big : { 40960, 20480, 10240 }) {
+            if (te.reopen(10, big)) {
+                reopened = true;
+                break;
+            }
+        }
+        out["prefix_warm_measurement"] = reopened ? calibration_prefix_warm_measurement(te) : common_json::object();
+    }
     return out;
 }
 
@@ -7041,7 +7948,7 @@ static common_json calibration_rows() {
     rows["single_question_bypass"] = calibration_row("single-question fork bypass", "task-value",
                                  { "which scoring path runs" },
                                  { "correctness", "admission" },
-                                 "copy-fork only; bypass stays on by default and never runs on multi-question rounds or restore-fork memory; measured speedup recorded in model_measurements");
+                                 "copy-fork only; bypass stays on by default and never runs on multi-question rounds, on restore-fork memory, or on hybrid memory. A restore fork is exact but measured no faster than the fork it replaces; a hybrid trunk cannot be restored exactly, so a later greedy round would decode on a corrupted trunk. Per-option-count medians are recorded in model_measurements.bypass_measurement");
     {
         auto r = calibration_row("tree_max auto switch", "task-value",
                                  { "mode selection at the boundary" },
@@ -7471,12 +8378,43 @@ static void test_calibration_model(testing & t) {
         } else {
             t.assert_true("single_question_bypass bypass is not applicable to restore-fork memory", m.at("bypass_speedup").get<double>() == 1.0);
         }
+        // the benefit report covers the exact fork kinds at three option counts and is finite; the
+        // numbers are a measurement, never a gate on a producer score
+        const common_json & bm     = m.at("bypass_measurement");
+        bool                bm_ok  = bm.is_object() && !bm.empty();
+        for (const auto & fork_entry : bm.items()) {
+            for (const auto & count_entry : fork_entry.value().items()) {
+                const common_json & e = count_entry.value();
+                bm_ok = bm_ok && std::isfinite(e.at("on").at("median_ms").get<double>()) &&
+                                std::isfinite(e.at("off").at("median_ms").get<double>()) &&
+                                std::isfinite(e.at("speedup").get<double>());
+            }
+        }
+        t.assert_true("single_question_bypass benefit report is finite at every option count", bm_ok);
         t.assert_true("auto_mode_boundary auto at tree_max selects tree", m.at("auto_at_tree_max_is_tree").get<bool>());
         t.assert_true("auto_mode_boundary auto above tree_max selects greedy", !m.at("auto_above_tree_max_is_tree").get<bool>());
         t.assert_true("temperature_profile NLL is finite", std::isfinite(m.at("temperature_nll_t1").get<double>()));
         t.assert_true("prefix-reuse prefill delta is reported",
                       m.at("prefill_cached_ms").get<double>() > 0.0 &&
                       m.at("prefill_cached_ms").get<double>() <= m.at("prefill_cold_ms").get<double>() * 1.1);
+
+        // shared-prefix cache cost: the LRU host restore is only worth keeping on a recurrent or
+        // hybrid model if a hit beats a cold prefill. The numbers are recorded per size; the
+        // assertions only require the measurement to be present and the hit to be cheaper.
+        const common_json & pwm = m.at("prefix_warm_measurement");
+        t.assert_true("prefix_warm_measurement records the class and sizes",
+                      pwm.contains("class") && pwm.contains("sizes") && !pwm.at("sizes").empty());
+        for (const auto & size_entry : pwm.at("sizes").items()) {
+            const common_json & r = size_entry.value();
+            t.assert_true("prefix_warm_measurement cold is finite", std::isfinite(r.at("cold").at("median_ms").get<double>()));
+            t.assert_true("prefix_warm_measurement miss is finite", std::isfinite(r.at("miss_median_ms").get<double>()));
+            t.assert_true("prefix_warm_measurement resident hit is finite",
+                          std::isfinite(r.at("resident_hit_median_ms").get<double>()));
+            if (pwm.at("class").get<std::string>() != "dense") {
+                t.assert_true("the LRU host restore is faster than a cold prefill",
+                              r.at("lru_speedup_vs_cold").get<double>() > 1.0);
+            }
+        }
 
         // hoist (outcome axis): optimize on/off must keep every winner and stay within the
         // committed TV bound recorded in the sign-off table, and the control must actually
@@ -7867,7 +8805,9 @@ int main(int argc, char ** argv) {
         test_thinking_control(t);
         test_decision_shape_contract(t);
         test_decision_parse(t);
+        test_request_envelope_unification(t);
         test_decision_assemble(t);
+        test_adapter_scope_applied(t);
         test_decision_default_envelope(t);
         test_decision_values_golden(t);
         test_jev_compat_guarantee(t);
@@ -7903,6 +8843,7 @@ int main(int argc, char ** argv) {
         test_fork_divergence_control(t);
         test_fork_swa_clamp(t);
         test_prefix_lru_restores_own_state(t);
+        test_prefix_cache_hit_repeatability(t);
         test_state_bulk_copy(t);
         test_device_state_round_trip(t);
         test_device_async_staging(t);

@@ -2580,7 +2580,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
 // Counts the tensor data transfers staged by a state save or load. A transposed cache region is
 // transferred as one strided op instead of one op per embedding, so the count is the observable
 // behind the bulk-copy path. Only the scheduler thread stages state, so a plain counter is enough.
+// The accessors are declared here and not in a header: the decision engine's own test reads the
+// count and declares them itself, so this is not a llama.cpp API.
 static uint64_t g_state_transfer_count = 0;
+
+void     llama_state_seq_debug_reset_transfers();
+uint64_t llama_state_seq_debug_transfer_count();
 
 class llama_io_write_dummy : public llama_io_write_i {
 public:
@@ -4483,6 +4488,9 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
 
+// The bulk-copy counter is not a llama.cpp API: the decision engine's own test declares the two
+// accessors it needs. A transposed cache region is one strided transfer instead of one per
+// embedding, so the count is what exposes that path.
 void llama_state_seq_debug_reset_transfers() {
     g_state_transfer_count = 0;
 }

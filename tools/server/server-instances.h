@@ -66,8 +66,11 @@ struct server_instance {
     bool removing          = false;
     bool running           = true;
     int  n_active_dispatch = 0;
-    // set true exactly once, under mutex_dispatch, before loop_thread.join runs so
-    // destroy / resize / pool-terminate never join the same scheduler thread twice
+    // thread ownership, not a one-shot latch: false means loop_thread is running
+    // and owes a join. start_instance_loop_locked takes ownership (false) at the
+    // single place a thread is created, each teardown site releases it (true)
+    // before loop_thread.join, so a second teardown after a rebuild joins the new
+    // thread while a second teardown with no intervening thread skips the join
     bool scheduler_joined  = false;
     // the synchronization barrier for the whole window: a release-store of true
     // happens after ctx_server/routes/effective are fully written; an acquire-load
@@ -99,6 +102,26 @@ struct server_instance {
 // manages the pool: one shared model load, many named contexts (instances).
 // owns the shared weights, resolves requests by model id, routes them to the
 // owning instance, and exposes the instance management API.
+// The decision session store's byte-budget policy, as pure functions over a view of one
+// reference, so the victim ordering and the skip rules hold without a server, a model or a budget
+// flag. Skipping a pinned or in-flight reference is the admission rule, not a deferral: when
+// nothing else can be evicted the request is refused rather than evicting something held.
+struct decision_session_ref {
+    size_t  bytes        = 0;
+    int64_t last_used_ms = 0;
+    bool    pinned       = false;
+    bool    leased       = false;
+    bool    removed      = false;    // turn advanced; waiting only for a lease to drop
+    bool    replacing    = false;    // the key the incoming reference is about to take
+};
+
+// the owned token bytes the store charges against its budget: every reference still live, which is
+// the set the budget itself charges, so a client can read its own consumption
+size_t decision_session_total_bytes(const std::vector<decision_session_ref> & refs);
+
+// the least-recently-used evictable reference, or none when every remaining one is held
+std::optional<size_t> pick_decision_session_victim(const std::vector<decision_session_ref> & refs);
+
 struct server_instances {
     // context construction seam: fills ctx_server + routes for an instance from
     // the shared model, true on success. the production default builds them for
@@ -608,18 +631,67 @@ struct server_instances {
     // decision. filled by attach_decision_snapshot, read by decision_snapshot_by_key on the sidecar
     // route thread, erased after the dispatch (and the adapter drain) returns.
     std::map<std::string, std::shared_ptr<server_decision_snapshot>> decision_snapshot_resolve_;
+    // monotonic source for transient resolve keys and session handles, guarded by
+    // mutex_decision_sessions. uniqueness is a property of the counter, not of a
+    // hash of a timestamp, so two handles minted in one millisecond cannot alias.
+    uint64_t decision_handle_seq_ = 0;
+    // trigger counters for the session store. the three monotonic ones count events that cannot be
+    // derived from the map; the live ones come from one walk (decision_store_stats_locked).
+    uint64_t decision_n_snapshots_ = 0;           // captures performed
+    uint64_t decision_n_reuses_    = 0;           // resolves that reused a reference instead of capturing
+    uint64_t decision_n_releases_  = 0;           // references actually removed
     mutable std::mutex mutex_decision_sessions;
+
+    // what the store holds right now, in one walk. the two quantities are read from the same pass
+    // because they are the same fact at different scales: live references and the owned token bytes
+    // they charge against --decision-session-budget-mb.
+    struct decision_store_stats {
+        size_t n_sessions  = 0;
+        size_t bytes_total = 0;
+    };
 
     // --- decision session token store helpers (sidecar executor) ---
     static std::string decision_adapter_scope_of(const std::vector<std::pair<std::string, float>> & scope);
     static std::string decision_content_hash_of(const std::vector<llama_token> & tokens,
                                                 const std::vector<std::pair<std::string, float>> & scope);
+    // the owned host bytes one reference charges against the session byte budget
+    static size_t decision_session_bytes(const decision_session_entry & entry);
+    // mint a collision-free handle into the decision session store. the caller holds
+    // mutex_decision_sessions; the counter it advances is the uniqueness property.
+    std::string mint_decision_handle_locked(const std::string & prefix);
     // ensure one pool-owned ref per path in `scope`, returning the resolved (ptr-bearing) list;
     // caller holds mutex_mgmt. the caller owns the refs until release_adapter_set.
     std::vector<common_adapter_lora_info> resolve_decision_lora_scope(const std::vector<std::pair<std::string, float>> & scope);
     // release the refs of a store entry and erase it from every map; the returned refs must be
     // released by the caller AFTER dropping the store lock. called only from HTTP threads.
     std::vector<common_adapter_lora_info> finalize_decision_session_locked(const std::pair<std::string, int> & key);
+    // drop the store lock's refs afterwards: takes mutex_mgmt and releases them. every store
+    // mutation that returns adapter refs releases them through here, so no path hand-rolls it.
+    void release_decision_refs(std::vector<common_adapter_lora_info> & loras);
+    // remove every reference whose ttl_ms has elapsed since its last use. caller holds
+    // mutex_decision_sessions; the returned refs are released through release_decision_refs.
+    // ttl_ms == 0 never expires, and a pinned or leased reference is skipped, not deferred.
+    std::vector<common_adapter_lora_info> reap_expired_decision_sessions_locked();
+    // charge one incoming reference against --decision-session-budget-mb, evicting the
+    // least-recently-used unpinned, unleased reference until the total fits. `exclude` is the key
+    // about to be replaced, so it is neither charged nor a victim. caller holds
+    // mutex_decision_sessions; victims are removed through finalize_decision_session_locked and
+    // their refs returned for release through release_decision_refs. returns nullptr when the
+    // reference is admitted, and the existing 422 when every remaining reference is pinned or in
+    // flight. never truncates.
+    server_http_res_ptr admit_decision_session_locked(const std::pair<std::string, int> & exclude,
+                                                      const std::vector<llama_token> & incoming,
+                                                      const std::string & subject,
+                                                      std::vector<common_adapter_lora_info> & evicted);
+    decision_store_stats decision_store_stats_locked() const;
+    // resolve a first-class session handle to a copy of its owned snapshot and lease its store
+    // entry. this is one of the two points the TTL reaper runs from; a handle whose reference was
+    // reaped here is an ordinary unknown session.
+    server_http_res_ptr resolve_decision_session(const std::string & session_id,
+                                                 const std::string & instance_field,
+                                                 const std::string & model_field,
+                                                 const std::shared_ptr<server_decision_snapshot> & snap,
+                                                 std::pair<std::string, int> & key_out);
     // erase a store entry and release its adapter refs (store lock is never held across the mgmt
     // lock); HTTP threads only.
     void erase_decision_session(const std::pair<std::string, int> & key);

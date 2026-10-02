@@ -1984,16 +1984,21 @@ void common_adapter_lora_fill_meta(common_adapter_lora_info & la) {
     la.prompt_prefix = buf;
 }
 
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
+int common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
     std::vector<llama_adapter_lora *> loras;
     std::vector<float> scales;
 
     for (auto & la: lora) {
+        if (la.scale != 0.0f && la.ptr == nullptr) {
+            // an adapter the model does not have, at a scale that would apply it. The context would
+            // store the null pointer as if it were an adapter, so refuse the whole scope instead.
+            return -1;
+        }
         loras.push_back(la.ptr);
         scales.push_back(la.scale);
     }
 
-    llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
+    return llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
 std::string common_lora_fingerprint(const std::vector<common_adapter_lora_info> & loras) {

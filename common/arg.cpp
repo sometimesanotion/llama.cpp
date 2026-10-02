@@ -2595,7 +2595,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
             {"--decision-seqs"}, "N",
-            string_format("sequences reserved for the /decision endpoint, above the slots; enables it (default: %d = disabled, minimum 3)", params.n_seq_decision),
+            string_format("sequences reserved for the /decision endpoint; enables it (default: %d = disabled, minimum 3). the sequences live on the decision sidecar executor's own context, never on a chat context", params.n_seq_decision),
             [](common_params & params, int value) {
                 if (value != 0 && value < 3) {
                     throw std::invalid_argument("--decision-seqs needs at least 3 (cached prefix, trunk, one branch)");
@@ -2639,7 +2639,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_DECISION_SESSION_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
             {"--decision-session-budget-mb"}, "N",
-            string_format("byte budget for all retained token-snapshot references (the owned token lists), mebibytes (default: %d = unlimited; a create that would exceed it is refused)", params.decision_session_budget_mb),
+            string_format("byte budget for all retained token-snapshot references (the owned token lists), mebibytes (default: %d = unlimited; pressure evicts the least-recently-used unpinned, unleased reference, and a create is refused only when no such reference is left)", params.decision_session_budget_mb),
             [](common_params & params, int value) {
                 if (value < 0) {
                     throw std::invalid_argument("--decision-session-budget-mb needs a non-negative count");

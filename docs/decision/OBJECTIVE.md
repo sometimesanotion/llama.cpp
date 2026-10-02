@@ -1,5 +1,22 @@
 # Objective: best of both decision engines
 
+> **Historical.** This document compares the two decision-engine implementations
+> measured on this machine in 2026-09 and recommends a target design. It is kept
+> as the reasoning behind several choices - the hybrid fork, the fork oracle, the
+> Jev envelope, the hardening list. Two things in it no longer describe the
+> server, and they are called out where they appear:
+>
+> * Decisions no longer run on the chat context. They run on the internal
+>   `__decision__` sidecar executor, on their own context and scheduler thread.
+>   So recommendation 7 below ("do not add a worker thread or a second context")
+>   was **not** followed, and the reasoning in section 5 about sharing one
+>   scheduler thread describes the lane that has since been removed. See
+>   `OBJECTIVE_MULTI_CONTEXT.md` for where placement actually landed.
+> * The sessions are owned token snapshots on that executor, not references into
+>   a chat context.
+>
+> The measurements themselves are still the evidence for what they measured.
+
 This document compares the two decision-engine implementations measured on this
 machine, explains what each does well and badly, and recommends a target design:
 a Jev-compatible API on top of one hardened, high-performance llama.cpp process.
@@ -8,8 +25,8 @@ a Jev-compatible API on top of one hardened, high-performance llama.cpp process.
   `contexts` + `schema` shape only.
 - This implementation: keeps the generic shape as a second front-end and adds
   the Jev `state` + `questions` shape, three fork strategies, cancellation, and
-  diagnostics. The classifier answer head and its separate context were
-  removed; every readout uses full logits on the shared context.
+  diagnostics. The classifier answer head and its separate context were removed;
+  every readout uses full logits on one context.
 
 Everything below was measured on the same machine and the same GPU. Numbers are
 warm (`cache_prompt=true`), one context, `mode=auto`, flash attention off,
@@ -212,28 +229,37 @@ Implementation notes [Local]:
   `tools/parallel-decision/decision-protocol.cpp`.
 ## 5. Process and hardening differences
 
-Both branches run decisions on the loaded model's context with unified KV and
-reserved decision sequences (`--decision-seqs`), and both keep chat and
-decisions on one scheduler thread. This implementation adds:
+**As measured in 2026-09:** both branches ran decisions on the loaded model's
+context with unified KV and reserved decision sequences (`--decision-seqs`), and
+both kept chat and decisions on one scheduler thread. This implementation added:
 
 - Cancellation: `options.should_stop` is checked inside the decode loop, and the
   server passes a per-request cancel flag.
 - Cooperative yielding: the decision runs inside `yield_to_queue`, so
   `/metrics` and `/slots` are answered while a decision is in flight. The
   reference calls `handle_decision` directly and blocks them.
-- Guaranteed cleanup: `clear_pool_seqs` runs on every exit, so a failed or
-  cancelled decision cannot leave cells that starve chat.
-- A single full-logits path on the shared context: the classifier-only
-  context and answer head were removed, so a decision never duplicates the KV
-  cache.
+- Guaranteed cleanup: the pool sequences are cleared on every exit, so a failed or
+  cancelled decision cannot leave cells behind.
+- A single full-logits path: the classifier-only context and answer head were
+  removed, so a decision never needs a second model copy.
 - Diagnostics: contract hash, template hash, and adapter
   scope, plus `certainty` on choice/score.
-- Adapter scoping: decision decodes run on the base model, scoped while
-  chat applies its adapters.
+- Adapter scoping: a stateless decision decodes on the base model, scoped while
+  chat applies its adapters; a session decodes under the scope its snapshot
+  captured.
 
 The reference is much simpler to read and maintain. Its failure modes are also
 simpler: no cancellation inside a multi-second decision, no yield, no
 diagnostics, no typed answers.
+
+**Where this landed later.** The shared-context placement in the paragraph above
+was abandoned. Decisions now run on the internal `__decision__` sidecar executor
+- its own context and its own scheduler thread - so the "chat stalls for the
+decision" problem this section describes no longer exists, and the cost is device
+contention instead. A session's captured adapter scope is resolved and **applied**
+to the executor, so the "decision decodes on the base model" bullet above is
+true of a stateless decision only. See `OBJECTIVE_MULTI_CONTEXT.md` sections 3
+and 5.
 
 ## 6. Recommendations
 
@@ -272,11 +298,18 @@ behind it. Concretely:
    The single full-logits readout is the only path, so there is no fast path
    that could change the winner; keep that as a hard gate.
 
-7. **Do not add a worker thread or a second context to make decisions
-   concurrent.** The measured cost is small enough that cooperative yielding on
-   the one context is sufficient, and it avoids a second copy of the model
-   state and any cross-thread KV hazard. The one-context, one-thread rule is the
-   thread-safety story; keep it.
+7. ~~**Do not add a worker thread or a second context to make decisions
+   concurrent.**~~ **Not followed, and the recommendation was wrong.** The
+   premise was that cooperative yielding on the one context was sufficient
+   because the measured cost was small. It was not sufficient: chat still stalled
+   for a multi-second decision, and a concurrent decode could perturb a chat
+   token through batch geometry. The shipped design gives the decision stack its
+   own context and scheduler thread - the instance pool already knew how to own a
+   context, so a sidecar executor cost no architectural surprise - and chat is
+   now never stalled. The cost moved to device contention, which is measured
+   rather than assumed. **The general lesson is worth keeping: "the decision is
+   cheap enough to share" is an assumption about one measurement, and the
+   measurable harm is on the other API's latency, not on the decision's.**
 
 ## 7. Risks and follow-ups
 
@@ -291,7 +324,10 @@ behind it. Concretely:
   plainly in any write-up instead of implying the reference returns wrong
   numbers.
 - The reference's blocking handler is the one place it is clearly worse under
-  chat load. Any merge must keep the yield and the cancel path.
+  chat load. Any merge must keep the yield and the cancel path - the yield is
+  still what keeps `/metrics` and `/slots` responsive to the context a decision
+  is running on, and the cancel path is how a client disconnect stops a
+  multi-second decode.
 
 ## 8. Reproducing the numbers
 

@@ -101,7 +101,7 @@
         "admission"
       ],
       "production_gate": false,
-      "verdict": "copy-fork only; bypass stays on by default and never runs on multi-question rounds or restore-fork memory; measured speedup recorded in model_measurements"
+      "verdict": "copy-fork only; bypass stays on by default and never runs on multi-question rounds, on restore-fork memory, or on hybrid memory. A restore fork is exact but measured no faster than the fork it replaces; a hybrid trunk cannot be restored exactly, so a later greedy round would decode on a corrupted trunk. Per-option-count medians are recorded in model_measurements.bypass_measurement"
     },
     "auto_mode_boundary": {
       "trigger": "tree_max auto switch",

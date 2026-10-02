@@ -1,23 +1,26 @@
 # Objective: multiple context windows with concurrent chat and decisions
 
-Non-normative overview. It explains what this merged branch is for, how the
-pieces fit, and what "reliable and performant" means when testing it. The
-normative contracts live in:
+Non-normative overview. It states what the merge of the instance-pool branch and
+the decision branch was for, how the pieces fit, what actually landed, and what
+"reliable and performant" means when testing it. The normative contracts live
+in:
 
-- `docs/decision/API.md` - the `/v1/decision` wire contract.
+- `docs/decision/API.md` - the `/v1/decision` wire contract, and the combined
+  generic + Jev request shape.
 - `LLAMA_INSTANCES.md` - the instance-pool contract (one process, many windows).
-- `docs/decision/README.md` - decision-engine design notes and KV background.
-- `docs/decision/OBJECTIVE.md` - why the engine looks the way it does.
-- `docs/decision/BENCHMARKING.md` - how to measure it.
+- `docs/decision/README.md` - what the decision endpoint is for, and why it is fast.
+- `docs/decision/OBJECTIVE.md` - why the engine looks the way it does (historical).
+- `docs/decision/BENCHMARKING.md` - how to measure and validate it.
 
 If this overview disagrees with `API.md` or `LLAMA_INSTANCES.md`, those win.
 
 > **Status: the in-context decision lane has been removed.** Decisions now always
 > run on the internal `__decision__` sidecar executor, on a single-context server
 > as well as a pool, so a decision never shares a context with chat. The
-> `--decision-instance` flag is gone with it. Sections describing the legacy
-> shared-context lane (3.2, and the legacy-lane notes elsewhere) are kept below
-> only as design history; they no longer describe the server.
+> `--decision-instance` flag is gone with it, and so is the session arena and the
+> `host`/`clone`/`file` backends. Sections describing the legacy shared-context
+> lane (2.2's second half, 3.2, 4's second half, and the section 12 history) are
+> kept only as design history; they no longer describe the server.
 
 ---
 
@@ -26,23 +29,33 @@ If this overview disagrees with `API.md` or `LLAMA_INSTANCES.md`, those win.
 A single `llama-server` process should serve an agentic team, not one chat
 session. That means three things at once:
 
-1. Load a model's weights once, then serve several independent context windows
-   ("instances"), each with its own size and parameters, so different agents do
-   not share or evict one another's KV.
-2. Serve the decision API (`/v1/decision`, `/v1/session`) alongside the chat
-   API, including decisions that read an existing chat turn. A decision either
-   runs on a context that also serves chat (sharing its KV cache), or on a
-   dedicated context (a "sidecar") so it does not stall chat.
-3. Make the above reliable and measurable under concurrent agentic load: no
+1. **Load a model's weights once, then serve several independent context
+   windows** ("instances"), each with its own size, parameters, KV cache,
+   compute buffer and scheduler thread, so different agents do not share or
+   evict one another's KV.
+2. **Serve the decision API alongside the chat API**, including decisions that
+   read a chat turn the agent has already produced, without that decision
+   writing, stalling or resizing the chat window it read.
+3. **Make the above reliable and measurable under concurrent agentic load**: no
    corruption, no cross-agent KV interference, bounded admission, and known,
-   repeatable latency behavior.
+   repeatable latency behaviour.
 
 The merge combines two previously separate efforts:
 
-- the multi-context / instance-pool work (`server_instances`), and
-- the decision-engine + session-registry work (`parallel-decision`).
+| | from | what it contributed |
+|---|---|---|
+| the multi-context / instance-pool work | `server_instances` | one process, many independently sized windows, lazy materialisation, the pool API, adapter scoping per instance, the internal-executor concept |
+| the decision-engine and session-substrate work | `parallel-decision` | the scoring engine, the Jev and generic front-ends, the two readouts, the live-session token snapshots, the admission and error surface |
 
-The rest of this document describes how those meet.
+The interesting part is where they meet, and it is one sentence: **a decision is
+not a chat request, so it must not run on a chat window.** The instance pool is
+what makes that expressible - it already knew how to own a context, schedule it
+and hide it from the user, so the decision stack got a home of its own (the
+sidecar executor) instead of a reserved slice of somebody else's window. Every
+placement decision below follows from that.
+
+The rest of this document describes how those meet, what survived, and what did
+not.
 
 ---
 
@@ -57,57 +70,68 @@ is a named context window with its own KV cache, compute buffer, scheduler
 thread, and LoRA set. The model weights are loaded once and shared by all
 instances.
 
-- Instances are registered without allocating KV. They materialize lazily on
+- Instances are registered without allocating KV. They materialise lazily on
   the first request that targets them (`ensure_built_instance`). An unused
   window costs nothing but its registry entry.
 - Each instance has its own scheduler thread and its own `server_context_impl`,
   so two instances can be dispatched concurrently at the HTTP/task level.
 - Compute is not necessarily parallel at the device: on one GPU, contexts
   serialize at the backend. More instances means more VRAM, not free
-  throughput. Do not claim parallel throughput without measuring it.
-- Routing is by `model`, `instance`, `snapshot`, or `id_slot` in the body or
-  query. The pool id (`base`) alone means "the default instance, or the sole
-  instance, or ambiguous (400)".
+  throughput. Do not claim parallel throughput without measuring it. The
+  measured shape of that trade for decisions is in section 3.1.
+- Routing is by `model`, `instance`, or `id_slot` in the body or query. The pool
+  id (`base`) alone means "the default instance, or the sole instance, or
+  ambiguous (400)".
+- An instance flagged `internal` is undeletable and is never in a user group. The
+  decision sidecar executor is exactly that, and that is why chat can never land
+  on it and it can never be named as a session's owner.
 
 ### 2.2 Decisions vs chat context
 
-With the sidecar executor (section 3.1), there is no in-context decision layer
-at all: a chat context holds only its own chat slots, and decision traffic runs
-on the sidecar's separate context. This is why decision work can neither stall
-nor write a chat window.
+With the sidecar executor (section 3.1) there is no in-context decision layer at
+all: a chat context holds only its own chat slots, and decision traffic runs on
+the sidecar's separate context. That is why decision work can neither stall nor
+write a chat window. It is also why the two APIs now *run concurrently* and
+contend for the device, which is a different thing to measure than the old
+serialized lane (see `BENCHMARKING.md` section 6).
 
-The legacy single-context lane (section 3.2) keeps the old shared layout:
-disjoint ranges of sequence ids inside one context.
+What the sidecar forces on its own context: `kv_unified`, because branches share
+cells by metadata and a metadata-sharing fork only works in a unified cache.
+That requirement does **not** propagate to chat instances.
 
-- chat slots: `[0, n_parallel)`
-- decision engine pool: `[n_parallel, n_parallel + n_seq_decision)`
-- session registry arena: `[n_parallel + n_seq_decision, ... + n_seq_arena)`
+**The legacy single-context lane, as history.** The design this replaced ran
+decisions on the same context as chat, using disjoint sequence-id ranges inside
+it:
 
-A decision on that shared context runs inside `queue_tasks.yield_to_queue(...)`
-on that context's scheduler thread. While it yields, the scheduler declines every
-task type except `SERVER_TASK_TYPE_METRICS` and `SERVER_TASK_TYPE_SLOT_GET`;
-declined tasks are parked and replayed FIFO after the yield. A CANCEL posted
-during the yield still removes its target.
+```
+chat slots:            [0, n_parallel)
+decision engine pool:  [n_parallel, n_parallel + n_seq_decision)
+session arena:         [n_parallel + n_seq_decision, ... + n_seq_arena)
+```
 
-The hard contract that follows (legacy lane only): **chat on the same context is
-stalled for the whole decision duration.** This is deliberate, not a bug. Other
-instances are unaffected.
-
-`--decision-seqs N` (N >= 3) enables the engine and forces `kv_unified` (in the
-legacy lane; the sidecar forces it only on its own context).
-`--decision-arena-seqs` sizes the session arena (legacy lane, default
-`n_parallel`).
+A decision there ran inside `queue_tasks.yield_to_queue(...)` on the chat
+context's scheduler thread; while it yielded, the scheduler declined every task
+type except metrics and slot-get, and declined tasks were parked and replayed
+FIFO. Its hard contract was that **chat on that context stalls for the whole
+decision duration** - deliberate, but it made a multi-second decision a
+multi-second chat stall, and a concurrent decode could perturb a chat token
+through batch geometry. `--decision-arena-seqs` sized its session arena. None of
+it exists in the tree.
 
 ---
 
 ## 3. Where decisions run
 
-The decision sidecar executor is the single, default placement. When
-`--decision-seqs` is set and a pool exists (`--instance`), the pool registers an
-internal, undeletable `__decision__` instance - its own context and scheduler
-thread - and every decision (stateless and session) runs there. Chat contexts
-carry no decision sequences and are never forced into the unified KV cache, so a
-decision cannot stall or write a chat window.
+The decision sidecar executor is the single, default placement, and it is not
+optional. Setting `--decision-seqs N` (N >= 3) is what turns the decision API on,
+and it is what makes `params.decision_sidecar` true; with that set the pool
+registers an internal, undeletable `__decision__` instance - its own context and
+its own scheduler thread - and **every** decision, stateless and session, runs
+there. A single-context server with no `--instance` at all gets one too, because
+the whole point is that a decision never lands on a context chat is using. Chat
+contexts carry no decision sequences and are never forced into the unified KV
+cache, so a decision cannot stall or write a chat window. There is no fallback
+placement and none may be added.
 
 ### 3.1 The sidecar executor (default)
 
@@ -173,27 +197,43 @@ turn the slot already decoded, instead of re-prefilling the transcript.
 The sidecar executor has its own context, so its decision engine pool lives in
 its own KV cells, never in a chat context's. A chat context holds only its chat
 slots. Weights are shared across all instances; each instance (chat and sidecar)
-has its own KV cells.
+has its own KV cells. What the sidecar's context holds:
 
-Legacy single-context lane (no pool): the engine shares the chat context, using
-reserved sequence ranges above the chat slots:
+- the persistent **prefix snapshot** sequence, which survives between requests so
+  a matching prefix is never re-decoded;
+- the **resident warm prefixes** the warm tier keeps (`--decision-warm-budget-mb`),
+  so a repeat decision on the same turn forks a kept prefix instead of
+  re-prefilling;
+- the transient **trunk** and **branch** sequences of the decision in flight.
+
+A stateless decision prefills into the pool, scores, then removes its transient
+sequences; only the prefix snapshot and any warm slot survive. A session
+decision replays an owned token snapshot into the same pool, so it holds no cells
+between decisions either - there is no session arena, by design, and nothing like
+`arena_used` to leak.
+
+**A capacity preflight estimates peak KV use and refuses with 422 rather than
+ever partially overwriting the cache.** The refusal is deliberately placed
+*before* any sequence is allocated, so an over-budget request never costs a
+resident warm prefix that another request was relying on. `llama_decode`
+returning 1 is also mapped to a client error rather than a partial answer.
+
+**The legacy single-context layout, as history.** The design this replaced had
+the engine sharing the chat context, in reserved sequence ranges above the chat
+slots:
 
 ```
-one context (one instance) with --decision-seqs 4, --parallel 1, arena default 1
+one context with --decision-seqs 4, --parallel 1, arena default 1
 
 seq 0                     chat slot 0
 seq 1 .. 4                decision engine pool (seq 1 is the persistent prefix snapshot)
 seq 5                     session arena (materialized only during a session decision, host/file)
 ```
 
-- A stateless decision prefills into the engine pool, scores, then removes its
-  transient sequences. Only the prefix snapshot survives for reuse.
-- A `host`/`file` session reference holds no cells between decisions; an arena
-  sequence is allocated for the decision and freed on release.
-- A `clone` session reference shares the source attention cells and pins them
-  for the session lifetime (opt-in; not available on sliding-window models).
-- A capacity preflight estimates peak use and returns 422 rather than partially
-  overwriting the cache; `llama_decode` returning 1 is also mapped to 422.
+with a `host`/`file` session reference holding no cells between decisions (an
+arena sequence allocated for the decision and freed on release) and a `clone`
+reference sharing the source attention cells and pinning them for the session
+lifetime. None of it exists in the tree.
 
 ---
 
@@ -201,80 +241,103 @@ seq 5                     session arena (materialized only during a session deci
 
 Guaranteed:
 
-- Decisions never corrupt chat KV: with the sidecar they run on a separate
-  context; in the legacy shared lane they use disjoint sequence ranges, a
-  read-only source slot, cleanup on every exit, and admission limits.
-- Only `/metrics` and `/slots` are served in a legacy shared context while a
-  decision yields.
-- Declined tasks are parked and replayed FIFO, and are not lost or reordered.
-- Admission bounds concurrent decisions, not their duration: codes 413 (body too
-  large), 429 / 529 (queue full), 499 (client cancel), 503 + Retry-After
-  (server-side deadline via `--decision-timeout-ms`).
-
-Measured, legacy shared-context lane (chat already streaming):
-
-| model | decision | largest chat inter-token gap | other-instance chat |
-| --- | --- | --- | --- |
-| lfm2.5-350m | 270 ms | 269.7 ms | unaffected |
-| qwen3.5-2b | 498 ms | 503.0 ms | unaffected |
-| gemma-4-e4b | 1005 ms | 1008.3 ms | unaffected |
-
-The stall equals the decision duration and applies only to a decision running on
-a chat context (the removed legacy lane). The sidecar executor is the only one
-left, so no decision ever stalls chat.
+- **Decisions never corrupt chat KV.** With the sidecar they run on a separate
+  context, so chat's slots and their cells are not merely protected by
+  convention - they are not addressable by a decision at all. On top of that the
+  engine removes its transient sequences on every exit path, and admission
+  bounds how many run at once.
+- A decision reads a chat slot **read-only**: the source slot's KV is never
+  written by a decision, and a decision never decodes on the slot's context.
+- Admission bounds concurrent decisions, not their duration: 413 (body too
+  large), 429 / 529 (queue full), 499 (client cancel), 503 + `Retry-After`
+  (server-side deadline via `--decision-timeout-ms`), 422 (over-budget or
+  semantically invalid).
+- Chat and decisions **run concurrently on separate contexts** rather than
+  serializing. The cost is device contention, which is measurable; the old
+  serialization was not a safety property.
 
 Not guaranteed:
 
+- **Device-level isolation.** On one GPU the sidecar and the chat contexts
+  contend, so a decision's latency depends on total device load, and a chat
+  stream's inter-token cadence can be affected by a large decision. That is a
+  throughput trade, measured in `BENCHMARKING.md` section 6, not a corruption
+  risk.
 - No cancellation of a decision during teardown. A long decision delays
-  `DELETE`/resize on that instance until the abort deadline; then the
-  management op may return 503 with the instance intact. Client
-  disconnect during a decision is handled promptly (the engine stops), but a
-  session capture already in flight completes.
-- Session decisions do not cross context windows (in the legacy shared lane).
+  `DELETE`/resize on that instance until the abort deadline; then the management
+  op may return 503 with the instance intact. Client disconnect during a
+  decision is handled promptly (the engine stops), but a session capture already
+  in flight completes.
+- Session decisions do not cross context windows: a session handle belongs to the
+  instance that owns its slot, and that instance is named on every get / patch /
+  delete.
+
+The measured shape of the sidecar trade, from the agentic mixed-load harness
+(4 streaming chat agents, 4 stateless decision workers, 1 session worker, 2 churn
+workers, one GPU, all three reference models):
+
+- Small model (lfm2.5-350m): the sidecar removes the decision-induced chat tail
+  (chat max inter-token gap 611 ms -> 166 ms) at the cost of slower decisions.
+- Mid model (qwen3.5-2b): it greatly improves the chat tail (max 1641 ms ->
+  280 ms) but decisions are roughly 1.5-2x slower.
+- Larger model (gemma-4-e4b): device-bound; it gives little chat benefit and
+  slows decisions. Four contexts contending for one GPU is the bottleneck.
 
 ---
 
 ## 6. Routing rules
 
-Placement of a decision is decided by an explicit `target_specified` signal
-computed from the ORIGINAL request fields, never from a stamped pool id: the
-pool id echoed into a decision body is echo-only and never selects a target.
+`/v1/decision` and `/v1/session` are dispatched by one predicate,
+`decision_request_is_session_pinned`, which asks a single question: does this
+request name a retained turn - `session_id` or `id_slot`, in the body or in the
+query string? Nothing else is computed from the request, and nothing is
+computed from a stamped pool id: the `instance` the pool writes into a forwarded
+body is echo-only and never selects a target.
 
-| request target | result |
+| request | what the pool does |
 | --- | --- |
-| stateless decision (no placement) | the decision sidecar executor (the internal `__decision__`) |
-| `instance: "X"` | instance X |
-| `model: "base:X"` | instance X |
-| `model: "base:latest:X"` | instance X |
-| `model: "base"` / no target (stateless decision) | the sidecar executor |
-| `model: "base:GROUP"` (group) | any free member; refused for session-pinned requests (400) |
-| `session_id` or `id_slot` | the owning instance's slot (the decision then runs on the sidecar from an owned token snapshot); cross-instance is refused |
-| unknown `model` (stateless) | answered on the sidecar (echo-only) |
+| stateless decision (no `session_id`, no `id_slot`) | dispatch straight to the decision sidecar executor (the internal `__decision__`). `model` and `instance` are echo-only, so a bare pool id, a Jev alias (`jev-latest`/`jev-preview`) and an unknown `model` all answer on the sidecar; `model` is still REQUIRED by the contract |
+| `session_id` or `id_slot` | resolve the owning instance, attach an owned token snapshot of that slot's completed turn, then dispatch to the sidecar |
 
-On the sidecar executor a stateless `model` is echo-only and never places the
-request. See `API.md` section 2.6.
+The owner of a session-pinned request is resolved by `decision_owning_instance`:
+an explicit `instance` wins, otherwise a `model` of the form `base:NAME` names
+one. A group is refused, because the request addresses one instance's slot and a
+group is not an instance. The internal `__decision__` instance is refused as an
+owner (it has no chat slot to snapshot), an unknown name is refused, and a bare
+pool id or no target resolves to the default instance, matching stateless
+routing. The decision then runs on the sidecar *from the snapshot*, never on the
+owning instance, so the source slot is only ever read.
+
+Session handles are instance-local: get, patch and delete must name the owning
+instance, the same way create did.
+
+See `API.md` sections 2.4 and 2.6.
 
 ---
 
 ## 7. Configuration surface you will use
 
-- Instances: `--instance NAME:ctx=N:parallel=M:group=G[:default]`.
-- Decisions: `--decision-seqs N` (N >= 3) with a pool selects the sidecar
-  executor; it forces `kv_unified` on the sidecar context only, never on chat
-  instances.
-- Sidecar executor: `--decision-sidecar-ctx N`, `--decision-sidecar-prebuild`.
-- Sidecar admission/timeout: `--decision-timeout-ms N`,
-  `--decision-max-queue N`.
-- Sidecar warm tier: `--decision-warm-budget-mb N` (KV budget for the resident
-  session warm prefixes; 0 = off, default). With a positive budget the sidecar
-  keeps recent session turns resident and forks them on a repeat instead of
-  re-prefilling; a hit is wire-identical to a miss on every model and only
-  qwen's recurrent warm-restore can move the reported concentration by up to ~0.05.
-- Session limits: `--decision-session-ttl`, `--decision-session-budget-mb`
-  (token-snapshot byte budget for the sidecar store; 0 = unlimited).
-- Template and metrics: `--jinja`, `--metrics` (the latter is required for
-  `/metrics`; without it the endpoint is 501 by design).
-- Tests require GPU offload: `-ngl 99`.
+Everything the decision API needs, and nothing about it is optional once
+`--decision-seqs` is set. `API.md` section 5.1 owns the environment overrides
+that sit on top of these.
+
+| flag | default | what it does |
+|---|---|---|
+| `--instance NAME:ctx=N:parallel=M:group=G[:default]` | - | one named context window per agent |
+| `--decision-seqs N` | 0 (disabled) | **turns the decision API on.** Sizes the decision sequence pool (N >= 3: prefix snapshot, trunk, one branch) and, by being non-zero, is what registers the sidecar executor. Forces `kv_unified` on the sidecar context only, never on a chat instance |
+| `--decision-sidecar-ctx N` | 0 | sidecar window size; 0 means the largest configured instance window, so the longest turn a chat instance can produce still replays |
+| `--decision-sidecar-prebuild` | off | build the sidecar context at startup instead of on the first decision |
+| `--decision-max-queue N` | 4 | concurrent decision cap; past it 429, past twice it 529 |
+| `--decision-timeout-ms N` | 0 (none) | server-side deadline for a whole decision; on expiry 503 + `Retry-After`, never a partial answer |
+| `--decision-warm-budget-mb N` | 0 (off) | KV budget for the sidecar's resident session warm prefixes. With a positive budget the sidecar keeps recent session turns resident and forks them on a repeat instead of re-prefilling. A hit answers the same winner and option set as a miss on every model; on a recurrent or hybrid model the host-state restore can move the reported concentration by up to ~0.05, which is the documented repeatability rule, never the answer. A warm fork is admitted only if its peak fits beside every *other* resident prefix; one that does not is a 422 before the cache is touched |
+| `--decision-session-ttl MS` | 0 (no expiry) | default TTL for created sessions. A **reaper**, not a read filter: it runs at the create and resolve points, never from a timer thread |
+| `--decision-session-budget-mb N` | 0 (unlimited) | byte budget for the sidecar's owned token snapshots. Pressure evicts the least-recently-used unpinned, unleased reference and retries; a create is refused only when every remaining reference is pinned or in flight. The unit is mebibytes of token bytes, so the smallest expressible budget is 1 MiB = 262144 tokens |
+| `--decision-temperature FILE` | - | calibrated temperatures plus provenance; refused if the provenance does not match the running model, quantization, template and backend flags |
+| `--decision-contract HASH` | - | pin the contract identity (tokenizer + prompt template + label code); a mismatch refuses the decision path with a plain 501 |
+| `--decision-permutations N` | 1 | server default order-debias passes for requests that omit `permutations` |
+| `--jinja`, `--metrics` | - | `--metrics` is required for `/metrics`; without it that endpoint is 501 by design |
+
+Tests require GPU offload: `-ngl 99`.
 
 ---
 
@@ -282,19 +345,31 @@ request. See `API.md` section 2.6.
 
 ### 8.1 Test protocol
 
-Build GPU-only (no CUDA/Vulkan on the reference machine), then run:
+Build GPU-only (no CUDA/Vulkan on the reference machine), then run the engine
+harness and the seven server suites against **all three** reference models -
+lfm2.5-350m (recurrent), qwen3.5-2b (hybrid), gemma-4-e4b (dense, sliding
+window, reasoning). They exercise different fork and cache paths, so a green run
+on one is not a green run.
 
-- `LLAMA_DECISION_TEST_MODEL=<model> ./build/bin/test-decision-engine`
-- `tools/server/tests/test_decision_envelope.py`
-- `tools/server/tests/test_decision_admission.py`
-- `tools/server/tests/test_decision_session_concurrency.py`
-- `tools/server/tests/test_decision_accuracy.py`
-- `test-server-instances-snapshots`, `test-common-instances`,
-  `test-save-load-state`, `test-recurrent-state-rollback`
+```sh
+export LLAMA_SERVER_BIN=$PWD/build/bin/llama-server      # the ROCm build, always explicit
 
-Use all three models: lfm2.5-350m (hybrid/recurrent), qwen3.5-2b (hybrid),
-gemma-4-e4b (dense, sliding-window, reasoning). They exercise different fork
-and cache paths, so a green run on one is not a green run.
+LLAMA_DECISION_TEST_MODEL=$MODEL ./build/bin/test-decision-engine
+ctest --test-dir build -R "test-decision" --output-on-failure
+
+for suite in envelope systemone generic admission session_concurrency agentic accuracy; do
+  LLAMA_SERVER_TEST_MODEL=$MODEL python3 "tools/server/tests/test_decision_${suite}.py" || break
+done
+
+# the regression suites a decision change can break
+ctest --test-dir build -R \
+  "test-server-instances-snapshots|test-common-instances|test-save-load-state|test-recurrent-state-rollback" \
+  --output-on-failure
+```
+
+`BENCHMARKING.md` owns the methodology behind each of those, the frozen
+artifacts that own a number, and the known upstream failure in
+`test-recurrent-state-rollback`.
 
 ### 8.2 Acceptance signals
 
@@ -302,11 +377,13 @@ and cache paths, so a green run on one is not a green run.
 - No unexpected 413/422/429/499/529; expected 422s only for genuinely
   over-budget or semantically invalid requests.
 - Session churn does not monotonically grow memory: the sidecar holds only
-  non-resident token snapshots, so there is no arena to leak (the legacy lane's
-  `arena_used` returns to 0 after each non-resident session decision).
-- Chat inter-token gap is not decision-attributable on any instance (sidecar
-  executor), and only metrics/slots are served during a legacy shared-lane
-  yield.
+  non-resident token snapshots, so there is no arena to leak, and under a
+  configured budget or TTL the store reclaims references rather than growing.
+- Chat answers are byte-identical whether or not a decision ran; a decision
+  fired mid-chat leaves the chat answer unchanged.
+- Chat is never *stalled* by a decision - the sidecar is a different context.
+  Chat and decisions may still contend for the GPU, so device-bound latency
+  interaction is measured rather than asserted.
 - Other instances stay within their undisturbed latency under decision load.
 - Master-vs-branch default path stays identical: with `--decision-seqs` and
   `--instance` absent, `/props`, chat output, and `n_seq_max` match master; the
@@ -318,37 +395,68 @@ and cache paths, so a green run on one is not a green run.
 RSS growth during mixed chat+decision load is normally the stock prompt cache
 (`cache_ram_mib` default 8192, `cache_idle_slots` on). With `--cache-ram 0` the
 same workload is flat and stateless decisions add zero growth. Check that before
-suspecting a leak.
+suspecting a leak. The sidecar's own resident memory is bounded by its context
+size plus the warm budget, both explicit.
 
 ---
 
-## 9. Current status and known gaps (2026-09)
+## 9. Current status and known gaps
 
-Verified working at the merge commit:
+Verified at the merge commit (2026-09):
 
-- The decision suites, admission and session concurrency pass on all three
+- The decision suites, admission and session concurrency passed on all three
   models. The accuracy harness measures the labeled corpus on all three and
   gates the holdout split against per-model floors, so "passes" says something
   about answer quality here; see the quality gap below for what it does not fix.
-- `test-decision-engine` passes (lfm 1850, qwen 1845, gemma 1768 assertions).
-- The instance and snapshot C++ suites, and save/load (126/126), pass.
+- The instance and snapshot C++ suites, and save/load, passed.
 - Cross-context host-format state transfer (a capture from one context loading
-  into a context with different `n_ctx`/`n_seq_max`) matches to zero logit
+  into a context with different `n_ctx`/`n_seq_max`) matched to zero logit
   difference on all three models.
+
+Per-milestone assertion counts and gate results are recorded in the roadmap
+annotations rather than here; they move every time the harness grows, and a
+number in this file would be stale within a day.
 
 > M0-M9 completion (2026-09-29): the simplification roadmap
 > `ROADMAP_20260929_SIMPLIFY.md` has landed. The decision sidecar executor is now
-> the single decision executor (opt-in via `--decision-seqs` with a pool, the
-> default when a pool exists); sessions are eager token snapshots replayed on the
-> sidecar (mechanism B), chat contexts carry no decision sequences and are never
-> forced into the unified KV cache in sidecar mode; the warm tier
-> (`--decision-warm-budget-mb`) and the timeout/queue admission
-> (`--decision-timeout-ms`, `--decision-max-queue`) are calibrated; per-instance
-> and sidecar VRAM are reported in both `/instances` and `/props`. The old
-> shared-context machinery (`session_registry`/`session_store`, the arena/backend
-> flags) has been removed from the tree. The
-> gates in the checklist are green on all three models; `--cache-ram 0` soak shows
-> flat RSS and no sequence drift.
+> the single decision executor, unconditionally once `--decision-seqs` is set
+> (pool or no pool); sessions are eager token snapshots replayed on the sidecar
+> (mechanism B); chat contexts carry no decision sequences and are never forced
+> into the unified KV cache; the warm tier (`--decision-warm-budget-mb`) and the
+> timeout/queue admission (`--decision-timeout-ms`, `--decision-max-queue`) are
+> calibrated; per-instance and sidecar VRAM are reported in both `/instances` and
+> `/props`. The old shared-context machinery (`session_registry`/
+> `session_store`, the arena/backend flags) has been removed from the tree. The
+> gates in that checklist are green on all three models; a `--cache-ram 0` soak
+> shows flat RSS and no sequence drift.
+
+> Red-team remediation (2026-10-01): this stack was reviewed against its three
+> must-keep features and against the normative contract, and the findings were
+> remediated. The plan, the reasoning behind each fix and the per-milestone
+> measured outcome are in `ROADMAP_20261001_REDTEAM.md` and its checklist; that
+> is the record, not this section. What belongs here is the two things a reader
+> of the system needs: the accuracy numbers did not move, and two performance
+> questions were settled by measurement rather than by argument.
+>
+> **Accuracy did not move, and that is the result rather than a non-event.** On
+> the ROCm reference build the letter readout's winner agreement on the frozen
+> 240-case corpus, measured before the work and again after it, is 0.3917 /
+> holdout 0.3770 on `lfm2.5-350m`, 0.7375 / 0.7459 on `qwen3.5-2b` and 0.7542 /
+> 0.7541 on `gemma-4-e4b` - identical to four decimal places on all three. Every
+> change was on the task-value axis (exactness, capacity, memory, identity, error
+> handling) and none of them touched how a distribution is produced, so that is
+> what the frozen per-model floors in `GATE_FLOORS` are there to catch.
+>
+> Two performance questions are now settled by numbers. The single-branch decode
+> bypass recovered **no** measurable compute on any of the three models - median
+> and p95 `scoring_ms` ratios at 2, 16 and 64 options all sit within a few
+> percent of 1.0 - so the fork strategies it would have enabled stay off. The
+> resident-prefix cache **was** worth keeping: a hit beats a cold prefill by
+> 12.6x / 23.9x / 58.6x at about 1k / 8k / 32k prefix tokens on `qwen3.5-2b` and
+> 1.3x / 17.4x / 45.6x on `lfm2.5-350m`, so the host-state restore on recurrent
+> and hybrid models stayed and removing it was rejected. One measurement behind
+> that cache is fixed now and was wrong before: the reported `prefill_ms` used to
+> exclude a cold prefill paid on a warm-miss.
 
 Known gaps, in rough priority order:
 
@@ -386,6 +494,30 @@ Known gaps, in rough priority order:
    on lfm2.5 on this corpus; it cannot be reasoned about from the framing
    "value scoring is more principled", because that framing is the one that
    measured worse.
+
+   **That measurement can no longer be reproduced, and it is not evidence about
+   the generic front-end.** Two things about it need saying plainly, so the next
+   reader does not rebuild a deletion argument out of it.
+   * It is **dead**. The code that produced the value framing has been deleted, so
+     `paired_readout_delta` in the accuracy harness is now degenerate by
+     construction: with one readout in the build it is that readout against
+     itself, exactly zero with a zero-width interval, and the report says so in
+     `delta.compared`. Only the frozen `readout_decision` block still carries the
+     original margins and verdict.
+   * It measured the wrong question. What ran was **one enum field per case over
+     the wire values** - 240 distinct single-field schemas, each its own request,
+     with no per-field record and no multi-field catalogue competing for the same
+     prefix. That is sound evidence against the value readout as a **drop-in
+     replacement for letter labels**, which is exactly what was asked of it. It is
+     **not** evidence about the generic front-end as a deployed feature, because
+     a real deployment does neither: it sends one stable schema, so the prefix
+     cache hits and the measured ~1.4x cost largely evaporates, and it sends many
+     fields per request, which is the regime this measurement never exercised.
+     A multi-field measurement on a stable schema is a separate, still-unmade
+     experiment.
+
+   The front-end is kept, on the user's decision, for schema compilation. Keep it
+   on that basis; do not reopen it on the basis of these numbers.
 1. `test-recurrent-state-rollback` fails on lfm2.5-350m and qwen3.5-2b on CPU
    and GPU. The identical failure reproduces on upstream master, so it is a
    pre-existing upstream bug, not a regression from this merge. Do not treat it
@@ -393,23 +525,29 @@ Known gaps, in rough priority order:
 
 The earlier gaps (sidecar default routing, lazy-session invalidation by
 idle-slot purging, and session-in-sidecar) are resolved by the M0-M9 work above:
-routing now uses an explicit `target_specified` signal, sessions are captured
-eagerly, and sessions run on the sidecar as token snapshots.
+routing is the single session-pinned predicate of section 6, sessions are
+captured eagerly, and sessions run on the sidecar as token snapshots.
 
 ---
 
 ## 10. Reading order for a new agent
 
-1. This file, for the goals and the mental model.
-2. `LLAMA_INSTANCES.md`, for the instance pool (windows, routing, adapters,
+1. `docs/decision/README.md`, for what the endpoint is for and why it is fast.
+2. This file, for the goals of the merge and the mental model.
+3. `docs/decision/API.md`, for the wire contract of the combined generic and Jev
+   shape. It is normative; where this file disagrees, it wins.
+4. `LLAMA_INSTANCES.md`, for the instance pool (windows, routing, adapters,
    snapshots).
-3. `docs/decision/API.md`, for the decision wire contract.
-4. `docs/decision/README.md`, for how the decision engine uses KV.
-5. `docs/decision/OBJECTIVE.md`, for the engine tradeoffs and fork strategy.
-6. Source entry points: `tools/server/server-instances.{h,cpp}`,
-   `tools/server/server-context.{h,cpp}` (handles, sequence layout),
-   `tools/parallel-decision/decision-engine.{h,cpp}`. The legacy-lane session
-   registry and store have been deleted.
+5. `docs/decision/BENCHMARKING.md`, for how to measure and validate any claim.
+6. `docs/decision/JEV-API.md`, if you are writing a Jev client.
+7. `docs/decision/OBJECTIVE.md`, for the historical engine comparison and the
+   reasoning behind the fork strategy.
+8. Source entry points: `tools/server/server-instances.{h,cpp}` (the pool, the
+   sidecar, the session store), `tools/server/server-context.{h,cpp}` (the
+   decision handler and the routing), `tools/parallel-decision/decision-engine.{h,cpp}`
+   (the scoring engine), `tools/parallel-decision/decision-protocol.{h,cpp}` (one
+   envelope, both shapes). The legacy-lane session registry and store have been
+   deleted.
 
 ---
 
@@ -417,6 +555,9 @@ eagerly, and sessions run on the sidecar as token snapshots.
 
 - Instance / context window: a named, independently sized KV + compute context
   built from shared weights, with its own scheduler thread.
+- Internal instance: an `internal` pool instance - undeletable and in no user
+  group. The decision sidecar executor is the only one, and chat can never land
+  on it.
 - Sidecar: the decision executor - the internal `__decision__` pool instance
   with its own context and scheduler thread. It owns every decision, on a
   single-context server as well as a pool, and is never written or stalled by
@@ -424,42 +565,50 @@ eagerly, and sessions run on the sidecar as token snapshots.
 - Shared context / legacy lane: removed. Decisions ran on the same context as
   chat, so chat stalled for the decision and a concurrent decode could perturb a
   chat token through batch geometry.
-- Engine pool: reserved decision sequences inside a context, above the chat
-  slots (legacy shared lane, and the sidecar's own context).
-- Session arena: reserved sequences used to materialize a retained-turn
-  reference for the duration of a session decision (legacy shared lane only;
-  the sidecar uses non-resident token snapshots).
-- Yield: the mechanism that lets a decision run on the scheduler thread while
-  only `/metrics` and `/slots` are answered (legacy shared lane).
+- Engine pool: the decision sequences inside a context. In the sidecar's context
+  they are its only contents: the persistent prefix snapshot, any resident warm
+  prefixes, and the transient trunks and branches of a decision in flight.
+- Session arena: removed. The sidecar's session references are non-resident token
+  snapshots, so there is nothing to reserve between decisions.
+- Yield: the mechanism that lets a decision run on its scheduler thread while
+  only `/metrics` and `/slots` are answered. Still used inside a decision, on
+  whichever context that decision runs on.
 - Token snapshot: the owned copy of a completed turn's tokens and adapter scope
-  taken from the owning instance and replayed into the sidecar context; the
-  sidecar's only session backend.
+  taken from the owning instance through a read-only op and replayed into the
+  sidecar context; the sidecar's only session backend.
 - Non-resident: a session reference that holds no context cells between
-  decisions (token snapshots, and legacy `host` bytes in RAM / `file` on disk).
+  decisions.
 - Fork: the strategy that gives each branch a copy-on-write view of the parent
   sequence (`copy` / `restore` / `hybrid`, chosen by `select_fork`).
+- Task value vs producer concentration: two different axes. Fork-state equality,
+  capacity preflights, adapter-scope application and memory budgets are task
+  value. `confidence` and `certainty` describe how peaked a distribution is and
+  never gate anything. See `API.md` section 6.
 
 ---
 
 ## 12. Simplification findings (2026-09-29)
 
 Non-normative. This section records the architecture review that led to
-`ROADMAP_20260929_SIMPLIFY.md`. Where it disagrees with the rest of this file,
-the simplification target wins for new work; the old behavior stays documented
-until the prune phases land. As of the M0-M9 landing, the simplification target
-is the current implementation (section 3): the sidecar executor with token
-snapshots is the single decision placement, so the shared-context machinery
-below is the legacy lane described in sections 2.2/3.2/4.
+`ROADMAP_20260929_SIMPLIFY.md`. **That roadmap is not in the tree** - it was a
+planning artifact and has since been removed, so this section and the M0-M9
+status note above are the surviving record of it. Where the review disagrees
+with the rest of this file, the simplification target wins for new work; the old
+behavior stays documented until the prune phases land. As of the M0-M9 landing,
+the simplification target is the current implementation (section 3): the sidecar
+executor with token snapshots is the single decision placement, so the
+shared-context machinery below is the legacy lane described in sections 2.2/3.2/4.
 
 ### 12.1 Branch correction
 
 `_codacus_parallel_decision` is not itself a sidecar. It reserves decision
 sequences inside the chat context (`--decision-seqs` grows `n_seq_max`), decodes
 on the same scheduler thread, and shares the prompt's KV cells with
-`llama_memory_seq_cp`. The `llama-parallel-decision` worker is a separate
-process. The "decision sidecar with its own context" called for by the
-simplification target does not exist on either source branch; it is new work
-built on the instance pool from `_multi_context_adapter_ds`.
+`llama_memory_seq_cp`. A separate standalone worker process drove it, and that
+worker has since been removed from the tree. The "decision sidecar with its own
+context" called for by the simplification target does not exist on either source
+branch; it is new work built on the instance pool from
+`_multi_context_adapter_ds`.
 
 The current branch adds the decision stack on top of the instance pool (77 files,
 about 24k lines over `_multi_context_adapter_ds`): the Jev and generic
@@ -527,9 +676,11 @@ persistence.
 
 #### 12.2.1 Reproduction run (M0 gate)
 
-Harness (removed after the experiment; the recorded results below are kept):
-`tools/parallel-decision/bench-snapshot.cpp`, GPU-only (`-ngl 99`), one chat context and
-one sidecar context with identical params (`kv_unified`, `swa_full=false`,
+Harness: a standalone snapshot-measurement binary that lived in
+`tools/parallel-decision/` and was **deleted when the experiment ended**, so it
+cannot be re-run and there is no source to look for; the recorded results below
+are kept and are the only record of it. GPU-only (`-ngl 99`), one chat context
+and one sidecar context with identical params (`kv_unified`, `swa_full=false`,
 flash attention off for bit-exactness). The turn is tokenized from a fixed
 synthetic paragraph; the 16-token question head is tokenized from a fixed
 sentence. "A" is `llama_state_seq_get_data_ext`/`set_data_ext` between the two

@@ -87,12 +87,6 @@ struct unsupported_error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// A referenced object (for example an unknown or already-deleted session id) does not exist. The
-// server maps this to HTTP 404, the not-found family, distinct from a 422 semantic error.
-struct not_found_error : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
 // One allowed answer of a question.
 struct decision_option {
     std::string key;         // choice key, level index string, or "true"/"false"
@@ -115,26 +109,14 @@ struct decision_question {
 // is an opaque client tag that must match the slot's retained snapshot; a mismatch is a 409/422,
 // never a silent answer about a different turn. All are capability inputs: the slot must exist,
 // hold decoded state, and the position must continue it exactly. `session_id` names a first-class
-// server-side session handle and is mutually exclusive with `id_slot`.
+// server-side session handle and is mutually exclusive with `id_slot`. The slot number itself is
+// resolved from the request body by the pool, which is the component that owns the slot table, so
+// only the presence of a slot reference travels here.
 struct session_ref {
     bool        present     = false;
-    int         id_slot     = -1;
     std::string session_id; // first-class session handle; mutually exclusive with id_slot
     int         session_pos = -1;
     std::string turn;       // opaque turn tag, matched against the retained snapshot
-};
-
-struct decision_request {
-    std::string               model;
-    common_json               state;       // single evidence document (Jev); unused when `contexts` is set
-    std::vector<common_json>  contexts;    // multi-context extension: the same questions against each
-    std::vector<decision_question> questions;
-    double                    temperature = 1.0;
-    common_json               temperatures; // object or null
-    int                       permutations = 1;
-    std::string               confidence_profile = "jev"; // "jev" (certainty-based, Jev default) | "local" (1 - H/logK)
-    bool                      diagnostics = false; // emit additive and diagnostics fields
-    session_ref               session;
 };
 
 // The evidence source shared by the Jev and generic front-ends: exactly one of a single `state`
@@ -148,8 +130,60 @@ struct decision_evidence {
 
 // Parses the evidence fields of a decision body. Throws semantic_error on invalid content; the
 // caller checks `state_present` for the "state or contexts required" rule because a session request
-// may carry neither.
+// may carry neither. The single evidence validator: a body is evidence-checked here and nowhere
+// else, so the two request shapes cannot drift on the "state or contexts, not both" rule.
 decision_evidence parse_evidence(const common_json & body);
+
+// Which front-end a decision request body selects. Dispatch is on the top-level shape: `schema`
+// selects the generic front-end, `questions` (or a bare `state`) the Jev one. Mutual exclusion is a
+// request error: a body carrying both `schema` and `questions` cannot be dispatched and throws
+// std::invalid_argument (the server maps it to 400). `state`/`contexts`/`id_slot` are evidence,
+// orthogonal to the front-end.
+enum class request_shape { none, jev, generic };
+
+request_shape select_request_shape(const common_json & body);
+
+// The producer-side knobs every request shape shares: how the gathered label logits are softened,
+// how many order-de-bias passes are averaged, and which confidence profile the answer reports. A
+// value rather than a body fragment, so the letter readout and the schema compiler resolve the same
+// temperature from the same fields.
+struct producer_knobs {
+    double      temperature       = 1.0;   // global softmax temperature on the gathered label logits
+    common_json temperatures;               // per-type overrides, the wire object
+    int         permutations      = 1;      // order-de-bias passes, mean taken by semantic key
+    std::string confidence_profile = "jev";  // reported concentration only; it gates nothing
+
+    // The effective softmax temperature for a question or field of `type`: the per-type override
+    // when there is one, else the global. A type outside the Jev primitives maps onto its
+    // primitive - a generic `boolean` is a `noul`, an `enum` a `choice` - so one rule serves both
+    // shapes and the wire's five type keys stay the whole vocabulary.
+    double for_type(const std::string & type) const;
+};
+
+// Everything a decision request carries regardless of its shape: the echoed model, the evidence,
+// the session reference, the producer knobs and the diagnostics opt-in. One envelope, so the two
+// shapes cannot disagree about a shared field.
+struct decision_envelope {
+    std::string       model;
+    decision_evidence evidence;
+    session_ref       session;
+    producer_knobs    knobs;
+    bool              diagnostics = false; // emit additive and diagnostics fields
+};
+
+// A parsed decision request: the shared envelope, the shape that selected it, and the fields only
+// that shape defines. `questions` belongs to the Jev front-end; `schema` and the schema-only knobs
+// to the generic one. Both terminate at the same engine.
+struct decision_request {
+    decision_envelope           envelope;
+    request_shape               shape = request_shape::none;
+    std::vector<decision_question> questions; // Jev shape
+    common_json                 schema;      // generic shape
+    std::string                 instructions;
+    std::string                 mode     = "auto"; // generic: auto | tree | greedy
+    size_t                      tree_max = 128;
+    bool                        allow_cache = true;
+};
 
 // Renders a state (string/object/array) as prompt evidence: the text is framed as data and every
 // "<" is escaped so chat-template special tokens cannot be injected from the evidence.
@@ -184,11 +218,23 @@ double question_temperature(const decision_request & req, const decision_questio
 // is supplied without id_slot.
 session_ref parse_session_ref(const common_json & body);
 
-// Throws semantic_error on any invalid decision content.
+// Parses the envelope both request shapes share. Calls the existing parse_evidence, read_temperatures
+// and parse_session_ref, so the shared fields are validated exactly once per body whatever the shape.
+// Throws semantic_error on invalid content.
+decision_envelope parse_decision_envelope(const common_json & body);
+
+// Parses one request body of either shape: the envelope, then the shape the body selects, then that
+// shape's own fields. Every other top-level field is ignored, so a typo cannot change an answer.
+// Throws semantic_error on invalid decision content and std::invalid_argument on a body that
+// carries both `questions` and `schema`.
 decision_request parse_decision_request(const common_json & body);
 
-// Uniform distributions, one per question, sized to its option count.
-std::vector<std::vector<float>> uniform_probs(const decision_request & req);
+// A decision decodes under an adapter scope and reports the scope it used, so a scope the context
+// would not install cannot be reported as if it had been. `apply_status` is what installing `scope`
+// returned (0 = installed); the base model is the empty scope. Throws semantic_error, so the request
+// is refused as 422 in the same class as "the slot does not exist": the requested conditioning is not
+// available. It never reads a producer score.
+void require_adapter_scope(const std::string & scope, int apply_status);
 
 // Identity a calibrated temperature profile was fitted against. It is never used
 // to gate answers; it only stops a profile fitted on one deployment from silently
@@ -223,8 +269,10 @@ std::string sha256_hex(const std::string & text);
 // additive and merged whenever the caller provides it: the server passes it for a diagnostics
 // request and for a session fork (which reports its fork fields additively, even without
 // `diagnostics: true`); a null payload keeps the strict Jev default envelope. `probs` is
-// index-aligned with req.questions and their options; a missing or empty entry falls back to a
-// uniform distribution. This assembler is the single owner of the default-vs-diagnostics envelope.
+// index-aligned with req.questions and carries exactly one score per option; a missing or
+// mis-sized vector is an internal defect and throws rather than being answered with a
+// distribution nobody scored. This assembler is the single owner of the default-vs-diagnostics
+// envelope.
 common_json assemble_decision_response(const decision_request & req,
                                   const std::vector<std::vector<float>> & probs,
                                   const std::string & model,

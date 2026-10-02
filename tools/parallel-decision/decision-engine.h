@@ -1,7 +1,7 @@
 #pragma once
 
-// Parallel constrained decisions for finite JSON schemas, shared by llama-parallel-decision
-// and llama-server's /decision endpoint.
+// Parallel constrained decisions for finite JSON schemas, served by llama-server's /v1/decision
+// and /v1/systemone endpoints.
 //
 // Every field of a schema has a finite set of allowed values. After a shared context, each
 // field's value is scored as token paths following that field's own suffix; every scored path
@@ -73,7 +73,6 @@ struct compiled_fields {
     compiled_fields(const compiled_fields &) = delete;
     compiled_fields & operator=(const compiled_fields &) = delete;
 
-    size_t field_count          = 0; // unique fields after dedup
     size_t suffix_tokens        = 0; // per-field suffix tokens before the shared head is hoisted
     size_t common_suffix_tokens = 0; // suffix head hoisted onto every trunk
     size_t leaf_suffix_tokens   = 0; // what each branch decodes after the hoist
@@ -91,26 +90,13 @@ std::string make_prefix_tag(const std::string & system_text, const std::string &
 
 struct field_result {
     int                winner       = -1;
-    float              path_score   = 1.0f;
     int                scored_nodes = 0;
-    bool               tree         = false;
     std::vector<float> probs;            // tree fields: probability of every allowed value
 };
 
 struct result {
     std::vector<field_result> fields;
-    bool   cache_hit      = false;
-    size_t shared_tokens  = 0;
     size_t context_tokens = 0;
-    int    rows           = 0;
-    int    rounds         = 0;
-    double prefill_ms     = 0;
-    double scoring_ms     = 0;
-    // suffix token accounting: unique field suffixes after dedup, the head hoisted onto the trunk,
-    // and what each branch actually decodes
-    size_t suffix_tokens        = 0;
-    size_t common_suffix_tokens = 0;
-    size_t leaf_suffix_tokens   = 0;
 };
 
 // Several contexts decided against one schema and one cached prefix. Items carry fields,
@@ -136,10 +122,6 @@ class engine {
   public:
     engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, int n_warm = 0);
 
-    // The most resident warm prefixes an engine keeps. The engine owns the number, so a caller that
-    // sizes sequences above the pool asks for a count here instead of inventing a second limit.
-    static constexpr int WARM_MAX_SLOTS = 8;
-
     // Resident warm slots a KV budget buys, from the model KV geometry and the cache types. The
     // engine owns the derivation as well as the limit, so a caller passes geometry and never clamps
     // the result again. Each slot is charged one whole window of cells, which is an upper bound:
@@ -148,21 +130,6 @@ class engine {
     // and a budget of 0, an unsized window, or a model with no KV geometry disables the tier.
     static int warm_slots_for_budget(int n_layer, int n_embd, int n_head, int n_kv, int n_ctx, int budget_mb,
                                      ggml_type type_k, ggml_type type_v);
-
-    // KV cells the resident warm prefixes hold, skipping `except`: the sequence a fork reads from,
-    // whose own cells that fork's peak already counts (pass -1 to charge every slot). The prefixes
-    // stay resident for the whole decision, so both capacity preflights subtract them from the
-    // window.
-    size_t resident_warm_cells(llama_seq_id except) const;
-
-    // The single constructor for the flags a save writes and a load uses. Pure: it reads only the
-    // requested format and scope, never the engine capability, so a capability downgrade can only
-    // change how a state is saved, never how saved bytes are read.
-    static llama_state_seq_flags state_load_flags(bool on_device, bool partial = false);
-
-    // True while the engine may save a partial (recurrent-only) state to device staging. A failed
-    // partial device save retires this one-way capability for the process; the host format remains.
-    bool partial_state_capable() const { return partial_device_capable_; }
 
     // True when `requested` selects a fork that reproduces the parent's state exactly on this model.
     // A copy fork shares attention cells by metadata, which drops the recurrent state of a
@@ -176,19 +143,14 @@ class engine {
         return true;
     }
 
-    const llama_model * get_model() const { return model; }
-
     // Compiles field inputs into the scoring plan. Pure: it tokenizes (through the per-engine
     // cache) and lays out the trie, but never touches the context or the KV cache.
     compiled_fields compile_fields(const std::vector<field_input> & inputs, const options & opt) const;
 
     // Contexts are prefilled together and their branches scored together, in groups sized to fit
-    // the sequence budget; results keep the order of the contexts.
-    batch_result decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
-                              const std::vector<field_input> & fields, const options & opt);
-
-    // Same as above, but scores a plan the caller already compiled. The fields are compiled once
-    // instead of twice. A null plan is a caller error.
+    // the sequence budget; results keep the order of the contexts. The plan is compiled by the
+    // caller through compile_fields, so a caller that scores the same fields twice compiles them
+    // once. A null plan is a caller error.
     batch_result decide_batch(const compiled_fields &          plan,
                               const std::string &              shared_text,
                               const std::vector<std::string> & contexts,
@@ -222,6 +184,40 @@ class engine {
     batch_result decide_warm(const tokens_t & tokens, const compiled_fields & plan, const options & opt,
                              const std::string & warm_tag);
 
+  private:
+    // The most resident warm prefixes an engine keeps. The engine owns the number, so a caller that
+    // sizes sequences above the pool asks for a count here instead of inventing a second limit.
+    static constexpr int WARM_MAX_SLOTS = 8;
+
+    // KV cells the resident warm prefixes hold, skipping `except`: the sequence a fork reads from,
+    // whose own cells that fork's peak already counts (pass -1 to charge every slot). The prefixes
+    // stay resident for the whole decision, so both capacity preflights subtract them from the
+    // window.
+    size_t resident_warm_cells(llama_seq_id except) const;
+
+    // Peak KV cells one decision needs: `persistent` cells held once (a cached prefix or a session
+    // source), one trunk per group member, and the branch wave decoded above the trunks. Pure plan
+    // geometry: it never reads the memory, so a caller may run it before allocating any sequence.
+    static size_t peak_kv_cells(size_t persistent, size_t group, size_t trunk_len,
+                                size_t branch_wave, size_t branch_len);
+
+    // Longest branch path a plan decodes, in tokens. Pure plan geometry.
+    static size_t max_branch_tokens(const compiled_fields & plan);
+
+    // Refuse a decision whose peak exceeds the window minus the resident warm prefixes it cannot
+    // evict. `resident_except` is the sequence the fork reads from, whose own cells the peak already
+    // counts (pass -1 to charge every slot). Both entry points and `decide_warm` share this check.
+    void check_decision_capacity(size_t peak, llama_seq_id resident_except) const;
+
+    // The single constructor for the flags a save writes and a load uses. Pure: it reads only the
+    // requested format and scope, never the engine capability, so a capability downgrade can only
+    // change how a state is saved, never how saved bytes are read.
+    static llama_state_seq_flags state_load_flags(bool on_device, bool partial = false);
+
+    // True while the engine may save a partial (recurrent-only) state to device staging. A failed
+    // partial device save retires this one-way capability for the process; the host format remains.
+    bool partial_state_capable() const { return partial_device_capable_; }
+
     // Remove every cell of `count` sequences starting at `first` in this engine's memory.
     void clear_seqs(llama_seq_id first, int count);
 
@@ -229,7 +225,6 @@ class engine {
     // touched, so prefix cache reuse survives a cleanup.
     void clear_pool_seqs();
 
-  private:
     struct prompt_part {
         const tokens_t * toks;
         llama_pos        pos0;

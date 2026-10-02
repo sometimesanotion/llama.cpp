@@ -127,6 +127,10 @@ static const char * const DECISION_JEV_PATH = "/v1/systemone";
 // make a request stricter by sending the mark itself, never looser.
 static const char * const DECISION_JEV_ONLY_KEY = "__decision_jev_only";
 
+// The default decision request body cap, in bytes, when LLAMA_DECISION_MAX_BODY does not override
+// it. 2 MiB matches openjev-sglang and is ample for an evidence document; raise it deliberately.
+static const size_t DECISION_MAX_BODY_DEFAULT = 2u * 1024u * 1024u;
+
 //
 // random string / id
 //

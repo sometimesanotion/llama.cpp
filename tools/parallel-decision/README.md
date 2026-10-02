@@ -7,8 +7,19 @@ After the context, each field's allowed values are scored as token paths that fo
 fields are answered in one `llama_decode` and cannot see each other. Each answer comes back with a probability, and
 the JSON object is assembled by code, so it always matches the schema.
 
-This directory holds the engine (`decision-engine.*`), a CLI (`llama-parallel-decision`), and the engine is also
-served by `llama-server` as `POST /v1/decision`.
+This directory holds the decision engine and its two request front-ends, and nothing executable. The engine
+(`decision-engine.*`, `labels.*`, `decision-protocol.*`, `letter_readout.*`, `generic_frontend.*`) is built as a
+static library that only `llama-server` links, through `POST /v1/decision` and `POST /v1/systemone`; there is no
+CLI and no standalone worker. `tests/` holds one Python case, `test_temperature.py`, which `ctest` runs as
+`test-decision-temperature`.
+
+> **Removed, so nobody goes looking for it.** This directory used to carry three executables and now carries
+> none: a standalone CLI that drove the engine outside the server (dropped with the in-context decision lane), a
+> state-transfer benchmark that compared host-snapshot capture against a sidecar re-prefill (deleted once its
+> experiment was recorded), and an earlier scratch driver for engine throughput. All three sources are gone from
+> the tree, so nothing here builds them and no binary in `build/` is one of them. Their numbers live in
+> `docs/decision/OBJECTIVE_MULTI_CONTEXT.md` section 12.2 and `docs/decision/BENCHMARKING.md`; to measure now,
+> drive the server over HTTP instead of looking for a harness.
 
 ## Build
 
@@ -80,22 +91,23 @@ only for dense attention, because a recurrent/hybrid model's SSM/conv state is n
 reloads the whole sequence state with `llama_state_seq_get/set_data`; it is exact everywhere but copies the attention prefix per
 branch. `hybrid` is `seq_cp` for attention plus a `PARTIAL_ONLY` byte copy of the recurrent state into the child's own cell: exact
 everywhere and cheap on hybrid models. The engine picks per model (`auto` = hybrid on recurrent/hybrid when the partial format is
-available, else restore; copy on dense attention); set `"fork"` on a `contexts`/`schema` request, or
-`LLAMA_DECISION_FORK=copy|restore|hybrid|auto`, to force it. On a sliding-window model the copy is clamped to the retained window
-so branch memory does not grow.
+available, else restore; copy on dense attention); set `LLAMA_DECISION_FORK=copy|restore|hybrid|auto` to force it. There is no
+request field for this: the fork is a property of the model, not of the question. On a sliding-window model the copy is clamped
+to the retained window so branch memory does not grow.
 
 Fork correctness is judged by a byte-level oracle, not by matching the argmax: the engine's tests decode a branch and compare its
 state bytes against a full `restore` fork of the same parent. A plain `seq_cp` fork that shares a recurrent tail can agree on the
 winner while its probabilities are stale, so the oracle is the guarantee and the hybrid fork is its enforcement.
 
-## POST /v1/decision
+## POST /v1/decision, generic `schema` shape
 
-`contexts` is a list of 1-256 strings. They share one schema, one set of instructions, and one cached prefix; results
-come back in the same order.
+A body with a top-level `schema` (and no `questions`) selects the generic front-end. `model` is required, exactly as on
+the Jev shape. `contexts` is a list of 1-256 strings; they share one schema, one set of instructions and one cached
+prefix, and come back in the same order.
 
 ```bash
 curl http://localhost:8096/v1/decision -H "Content-Type: application/json" -d '{
-  "model": "gemma-4-12b",
+  "model": "gemma-4-e4b",
   "instructions": "Answer each question about this support request from its state.",
   "schema": {
     "category": {"type": "enum", "choices": ["billing","technical","cancellation","other"],
@@ -110,24 +122,48 @@ curl http://localhost:8096/v1/decision -H "Content-Type: application/json" -d '{
 
 ```json
 {
-  "object": "decision",
-  "results": [
-    {
-      "decision": {"category": "billing", "urgent": true, "priority": "high"},
-      "fields": {
-        "category": {"value": "billing",  "probability": 1.0,  "scored_nodes": 1, "tree": true},
-        "urgent":   {"value": true,       "probability": 1.0,  "scored_nodes": 1, "tree": true},
-        "priority": {"value": "high",     "probability": 0.74, "scored_nodes": 1, "tree": true}
-      },
-      "usage": {"context_tokens": 21, "scored_rows": 14}
-    }
-  ],
-  "usage": {"prompt_tokens": 137, "cached_tokens": 116, "context_tokens": 21, "scored_rows": 14},
-  "timings": {"prefill_ms": 50.7, "scoring_ms": 50.0, "total_ms": 100.7, "rounds": 1, "per_decision_ms": 100.7}
+  "model": "gemma-4-e4b",
+  "answers": {
+    "category": {"type": "enum", "value": "billing", "confidence": 1.0,
+                 "probabilities": {"billing": 1.0, "technical": 4.679e-08,
+                                   "cancellation": 1.649e-08, "other": 1.799e-06},
+                 "legend": {"billing": "billing", "technical": "technical",
+                            "cancellation": "cancellation", "other": "other"},
+                 "scored": "tree", "scored_nodes": 1},
+    "urgent":   {"type": "boolean", "value": true, "confidence": 0.9998,
+                 "probabilities": {"true": 0.9999, "false": 9.038e-05},
+                 "legend": {"true": true, "false": false},
+                 "scored": "tree", "scored_nodes": 1},
+    "priority": {"type": "enum", "value": "critical", "confidence": 0.4478,
+                 "probabilities": {"low": 1.894e-08, "medium": 7.021e-06,
+                                   "high": 0.4142, "critical": 0.5858},
+                 "legend": {"low": "low", "medium": "medium",
+                            "high": "high", "critical": "critical"},
+                 "scored": "tree", "scored_nodes": 1}
+  },
+  "usage": {"input_tokens": 137, "output_tokens": 0}
 }
 ```
 
-(That response is a real one: Gemma 4 12B on an RTX 3060, warm cache.)
+That is a real capture from `gemma-4-e4b` on the ROCm build (`-ngl 99`, `--decision-seqs 24`, first decision, cold
+prefix), with the probabilities and `confidence` shortened to four significant digits for width; the server returns
+full double precision. The digits are one run: a repeat returns the same keys and the same winners, and the reported
+concentration can move a little (see the repeatability rule in `docs/decision/API.md` section 3.1), so read this for
+the keys, not for the digits:
+
+* The envelope is the **Jev one, extended**. There is no `object`, no `results[]`, no `fields`, no `decision`: the top
+  level is `model`, `answers`, `usage`, and each answer is the Jev key set plus `value` and `scored`. A Jev client
+  reads the same keys it always has.
+* `probabilities` is a **map**, keyed by every allowed value, summing to 1 - never a singular `probability`. `tree` is
+  the string `"tree"` or `"argmax"` inside `scored`, never a boolean.
+* One context answers at the top level as `answers`. Several use the `contexts` array of
+  `{"answers": ..., "usage": ...}` objects, one per context, in request order.
+* `usage` carries only `input_tokens` and `output_tokens` by default, exactly as on the Jev shape. `"diagnostics": true`
+  adds the full counters (`cached_tokens`, `state_cache_hit`) and the `timings` object at the top level, and adds
+  `interval_p10_p90` and `aggregate` to a **numeric** field. It never changes an answer.
+
+The normative version of all of this is `docs/decision/API.md` section 2.5; where this README and that document
+disagree, that document wins.
 
 ### Schema
 
@@ -139,6 +175,10 @@ Compact fields, or a JSON Schema object with `properties`:
 | `boolean` | - | true / false |
 | `integer` | `minimum`, `maximum` | 1-255 values |
 | `number` | `minimum`, `maximum`, `step` (`multipleOf` in JSON Schema) | fixed-width decimals |
+
+Every field also needs a `description`: it is what the model is told the field means, so a compact field without one
+is a 422 naming the field. In the JSON Schema form the meaning already lives in the property's own
+`description`/`title`, so it is not repeated and not required there.
 
 Numeric fields take `aggregate`: `mode` (default), `median` or `mean`.
 
@@ -197,8 +237,8 @@ the `diagnostics` object, and the extra usage counters
 (`cached_tokens`, `state_cache_hit`). The answers themselves are identical either way.
 
 Both shapes are served by `POST /v1/decision`, the canonical route. `POST /decision` is a deprecated
-alias for the same handler; use `/v1/decision`. `model` is optional and echoed back verbatim;
-`GET /v1/models` keeps the OpenAI list shape, not Jev's.
+alias for the same handler; use `/v1/decision`. `model` is required on both (a body without it is a 422) and is
+echoed back verbatim; `GET /v1/models` keeps the OpenAI list shape, not Jev's.
 
 ### Live session (`id_slot`, `session_id`)
 

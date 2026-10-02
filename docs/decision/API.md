@@ -1,8 +1,58 @@
-# Jev-Compatible Decision API (`/v1/decision`) - Specification
+# Decision API (`/v1/decision`) - Specification
 
-Status: implemented. This is the normative contract: routes, request, response,
-errors, and limits. Non-normative design notes, the backend survey, and the
-benchmark narrative live in `README.md`.
+Status: implemented. This is the normative contract **and** the overview of the
+combined API: routes, the one request envelope both shapes share, the response
+envelope, errors, and limits. Design notes and the orientation live in
+`README.md`; how to measure any claim here lives in `BENCHMARKING.md`.
+
+## 0. The combined shape in one page
+
+One process serves two request shapes over one engine, and they are the *same
+request type* with the *same envelope*. That is the design claim worth stating
+first, because everything else in this document follows from it.
+
+```
+                      one envelope            one engine
+   state + questions ─────────────┐   ┌────────────────────────┐
+                                   ├──>│  compile -> field_input │
+   schema + evidence ─────────────┘   │  -> batched decode      │──> answers
+                                       │  -> code-assembled JSON │
+                                       └────────────────────────┘
+```
+
+* **One envelope.** `model`, the evidence (`state` or `contexts`), a session
+  reference (`id_slot` or `session_id`), and the producer knobs
+  (`temperature`, `temperatures`, `permutations`, `confidence_profile`,
+  `diagnostics`) are parsed once by `parse_decision_envelope` and read the same
+  way by both shapes. A body adds either `questions` (Jev) or `schema`
+  (generic), plus the generic-only `instructions`, `mode`, `tree_max` and
+  `cache_prompt`.
+* **One engine, one scorer.** Both front-ends compile to the same `field_input[]`
+  plan and terminate at the same batched decode. There is no second evidence
+  validator, no second temperature resolver and no second scorer, so the two
+  contracts cannot drift; the generic shape is a strict, additive extension of
+  the Jev one rather than a sibling of it.
+* **One answer assembly.** The response is the Jev envelope. A generic answer
+  keeps the Jev keys for the primitive that scores it - `type`, `confidence`,
+  `probabilities`, `legend` - replaces the type-specific answer key (`choice`,
+  `noul`, `score`) with a typed `value`, and adds exactly three keys of its own:
+  `value`, `scored` and `scored_nodes` (plus the diagnostics-only numeric
+  summaries). Nothing else changes, so a Jev client reads the same envelope it
+  always has.
+* **One executor.** Every decision, stateless and session, runs on the internal
+  `__decision__` sidecar executor: its own context, its own scheduler thread.
+  Chat contexts are never written, stalled or resized by decision work. There is
+  no fallback placement and none may be added.
+
+What each shape is for:
+
+| | Jev shape | generic `schema` shape |
+|---|---|---|
+| body | `state`/`contexts` + `questions` | evidence + `schema` |
+| unit | a typed question with free-text option descriptions | a typed field with a closed value space |
+| readout | one verified single-token letter label per option | the model's own token paths over the value space |
+| adds | - | `value`, `scored`, `scored_nodes`, and the diagnostics-only numeric summaries |
+| reaches for it when | you want a Jev-compatible contract | a field is wider than the realized label pool, or you want a typed value grid with an aggregate |
 
 The endpoint naming is settled:
 
@@ -29,7 +79,8 @@ One POST. No generation. A caller supplies opaque `state` (evidence, treated
 as DATA, never as instructions) plus `DECISION_MIN_QUESTIONS` to
 `DECISION_MAX_QUESTIONS` independently-scored typed questions. The server
 returns one closed-world distribution per question, assembled by code.
-`output_tokens` is always 0; no text is sampled.
+`output_tokens` is always 0; no text is sampled. The `schema` shape answers the
+same way over fields instead of questions; Section 2.5 is its contract.
 
 ```
 POST /v1/decision
@@ -47,7 +98,8 @@ Route policy:
 
 Coexistence: the same model/server also serves the OpenAI-compatible API
 (`/v1/chat/completions`, `/v1/models`, `/health`). Decision traffic must not
-corrupt chat KV state, including on hybrid/recurrent models.
+corrupt chat KV state, including on hybrid/recurrent models. Section 2.6 owns
+how placement works.
 
 ---
 
@@ -58,7 +110,7 @@ Content-Type: `application/json`. Body limit: 2 MiB default
 and is sufficient - raise only deliberately). Unknown top-level fields are
 tolerated and ignored for forward compatibility. Unknown fields inside a
 question object are still rejected (a misspelled `question`/`criteria` must not
-silently default).
+silently default). The full set of environment overrides is in Section 5.1.
 
 ```json
 {
@@ -73,6 +125,13 @@ silently default).
   "diagnostics": false
 }
 ```
+
+That is the Jev shape, shown in full. **Everything except `questions` is the
+shared envelope**: the same `model`, evidence, session reference and producer
+knobs apply to both shapes, and they mean the same thing on both. The generic
+shape replaces `questions` with `schema` and adds four fields of its own
+(`instructions`, `mode`, `tree_max`, `cache_prompt`); Section 2.5 is its
+contract, and Section 2.3 is this one's.
 
 ### 2.1 Fields
 
@@ -122,6 +181,23 @@ silently default).
 Server flag: `--decision-permutations N` (env `LLAMA_ARG_DECISION_PERMUTATIONS`,
 default 1) sets the pass count for requests that omit `permutations`; an explicit
 request field always wins and the pass cap still applies.
+
+Server-injected fields: the server may add two internal keys to the body it
+forwards, and neither is removed before the decision runs.
+
+* `__decision_snapshot_key` names the owned token snapshot the pool resolved for
+  a session-pinned decision. The decision handler turns it into the snapshot the
+  task holds, and an unknown key is refused rather than ignored, because the
+  snapshot is the session's evidence.
+* `__decision_jev_only` is the mark `POST /v1/systemone` sets to pin the strict
+  Jev contract; it is what makes a `schema` body a 400 on that route.
+
+A client MUST NOT send either. They are not part of this contract, they are not
+stable, and the routing depends on them surviving the pool's body rewrite. A
+client that sends one can only make its own request stricter, never looser.
+Unknown top-level fields are otherwise tolerated for forward compatibility (the
+first paragraph of this section), which is why these two are named rather than
+reserved.
 
 Server executor: when `--decision-seqs` is set, every decision runs on the
 decision sidecar executor - an internal, undeletable pool instance with its own
@@ -272,7 +348,14 @@ and survives the slot's KV being cleared and reused:
   `last_used_ms`, and the trigger counters (`n_snapshots`, `n_reuses`,
   `n_releases`, `n_sessions`, `bytes_total`). The arena counters
   (`arena_used`/`arena_capacity`) are removed: a token snapshot holds no reserved
-  sequence between decisions, so there is no arena to report.
+  sequence between decisions, so there is no arena to report. The counters are
+  pool-wide, not per reference: `n_snapshots` counts captures performed, `n_reuses`
+  resolves that reused an existing snapshot instead of capturing one, `n_releases`
+  references that left the store by any route (expiry, eviction, explicit erase,
+  the slot advancing past the retained turn), `n_sessions` the current store size
+  and `bytes_total` the owned byte total the budget charges. **`GET` does not
+  reap**: see the lifecycle rules below, so a status read on a reference that is
+  past its TTL but has not been touched since still answers 200.
 - `PATCH /v1/session/{id}` - set `pinned` and/or `ttl_ms`.
 - `DELETE /v1/session/{id}` - erase, releasing the owned reference.
 
@@ -312,12 +395,37 @@ per retained turn:
   turn advanced is stale (422), never answered from an old turn. A token
   snapshot is model-epoch independent: a model reload does not make it stale.
 - Lifecycle: a reference is released by `SLOT_ERASE`, by the slot's release
-  callback, by an expired TTL (`ttl_ms`, reaped only when a session is older than
-  its TTL and never when pinned or held by an in-flight decision), and, under
-  byte-budget pressure (`--decision-session-budget-mb`), by LRU eviction of the
-  least-recently-used unpinned, unleased reference. A pinned or in-flight
-  reference is never evicted. The default budget is unlimited and the default TTL
-  is 0 (no expiry), so a deployment that never sets them sees no eviction.
+  callback, by an expired TTL, and, under byte-budget pressure
+  (`--decision-session-budget-mb`), by LRU eviction. The default budget is
+  unlimited and the default TTL is 0 (no expiry), so a deployment that never sets
+  them sees no eviction.
+- **TTL is a reaper, not a read filter.** It runs at the two points that already
+  take the store lock - `POST /v1/session` create, and a decision resolve
+  (a `session_id`, or the first `id_slot` decision for a turn) - and never from a
+  background timer. A reference is reaped once it is older than its `ttl_ms`
+  measured from `last_used_ms`; a session created without one inherits
+  `--decision-session-ttl` (0 = no expiry). `GET` and `PATCH` do not reap, so
+  there is no read filter: the reported set does not depend on who asked, and a
+  client that creates sessions and never reads them again is still bounded.
+  Because expiry runs before the reuse check, an expired implicit `id_slot`
+  reference is reaped and **re-captured**, not revived by the resolve that would
+  otherwise have refreshed it; a resolve of a reaped `session_id` answers 404.
+- A **pinned reference and one held by an in-flight decision are skipped, not
+  deferred**: neither is ever reaped late, both are simply not victims, and a
+  later pass takes them only if they are still eligible then. So an in-flight
+  decision always outlives its own TTL.
+- **Byte-budget pressure evicts.** `--decision-session-budget-mb N` caps the
+  total owned token bytes the store holds, charged as
+  `tokens.size() * sizeof(llama_token)`; `N = 0` is unlimited. The unit is
+  mebibytes of *token* bytes, so the smallest budget a deployment can express is
+  1 MiB, which is 262144 tokens. Before admitting a reference, the store evicts
+  the least-recently-used unpinned, unleased reference and retries until the
+  total fits, then admits the new one; the request succeeds. Only when every
+  reference in the store is pinned or in flight is the admission refused, with
+  the 422 naming `--decision-session-budget-mb`. The path never truncates a
+  reference and never refuses a client whose own reference would fit. An
+  in-flight decision is unaffected by an eviction of any reference, including its
+  own: it holds an owned copy of the tokens.
 - Window persistence: `POST /slots/{id}?action=save`/`restore` carry only the
   slot's token and KV state. A retained session is a live sidecar handle keyed by
   (instance, slot, turn); it is not part of a slot file and is not rebound by a
@@ -345,7 +453,12 @@ Schema object with `properties`:
   `minimum`/`maximum`), `number` (numeric `minimum`/`maximum`/`step`, or
   `multipleOf` in a JSON Schema). Each field is compiled to the same
   `field_input` the Jev front-end produces, and scored by the same engine.
-  Numeric fields take `aggregate` (`mode` default, `median`, `mean`).
+  Numeric fields take `aggregate` (`mode` default, `median`, `mean`). In the
+  compact form every field needs a `description` - it is what the model is told
+  the field means, so a field without one is a 422 naming the field rather than a
+  silently unscored field. A JSON Schema `properties` entry carries the meaning
+  in its own `description`/`title`, so it is not repeated and is not required
+  there.
 * Response: the **Jev envelope, extended**. A single context answers
   `{model, answers, usage}`; several use the same `contexts` array as Section
   2.4. `answers` is keyed by field name, and each answer carries the Jev keys
@@ -375,6 +488,14 @@ Schema object with `properties`:
 * Options: `mode` (`auto` default, `tree`, `greedy`), `tree_max` (default 128),
   `cache_prompt` (default true). Evidence (`state`, `contexts`, or a session
   `id_slot`/`turn`) is orthogonal to the front-end and behaves as in Section 2.3.
+* The shared knobs of Section 2.1 apply to this shape exactly as they do to
+  `questions`: `temperature`, `temperatures`, `permutations` and
+  `confidence_profile` are honoured here, and their defaults produce the
+  same answers the `questions` shape gives. A field type resolves its
+  temperature the way a question does, by the primitive that scores it: a
+  `boolean` reads the `noul` temperature and an `enum` the `choice` one, so
+  the `temperatures` map keeps the five keys of Section 2.3. `permutations: N`
+  scores each field in N seeded orders and averages them by value.
 * The generic front-end reuses the Jev engine, label pool, temperature and
   permutation machinery; it never re-implements field compilation or branch
   scoring.
@@ -511,7 +632,11 @@ either way.
   two or three decisions after the sidecar is built, then settles into a
   bit-stable steady state, and on a mid-size reference model it measured 0.015 at
   most. A dense model, which never round-trips its prefix, is bit-reproducible
-  from the first call. Clients MUST compare a repeated answer on the winner and
+  from the first call. The host-state LRU is kept because a hit is far cheaper
+  than a cold re-prefill: measured on the reference ROCm build, a hit cost
+  12.6x / 23.9x / 58.6x less than a cold prefill at about 1k / 8k / 32k prefix
+  tokens on the hybrid qwen3.5-2b, and 1.3x / 17.4x / 45.6x on the recurrent
+  lfm2.5-350m. Clients MUST compare a repeated answer on the winner and
   the key set, never on the last bits of a probability.
 * Score `median` and `interval_p10_p90` (skew-robust spread summaries) are
   additive and only present when `diagnostics: true`; the default score answer
@@ -672,14 +797,30 @@ same value.
 | `choice` options per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_CHOICE_OPTIONS` |
 | `score` levels per question | `DECISION_MIN_OPTIONS`-`DECISION_MAX_SCORE_LEVELS` |
 | order-de-bias passes | 1 default, capped at `DECISION_MAX_PERMUTATIONS` |
-| contexts per generic request | `DECISION_MAX_CONTEXTS` |
-| answer-label pool | `LABEL_POOL_CAP` (equal to `DECISION_MAX_CHOICE_OPTIONS`) |
+| contexts per request | `DECISION_MAX_CONTEXTS` |
+| answer-label pool | `LABEL_POOL_CAP` (equal to `DECISION_MAX_CHOICE_OPTIONS`), lowered by `LLAMA_DECISION_POOL_CAP` |
 | request body | `LLAMA_DECISION_MAX_BODY` (default 2 MiB) |
 | concurrent decisions | `--decision-max-queue` (default 4, env `LLAMA_DECISION_MAX_QUEUE`), then 429/529; `--decision-timeout-ms` (env `LLAMA_DECISION_TIMEOUT_MS`) sets the server-side deadline |
 | retained session references | one per chat slot; token snapshots hold only the owned token list plus adapter scope (`bytes` reports that), `--decision-session-budget-mb` sets the byte budget (0 = unlimited) and `--decision-session-ttl` sets the default expiry (0 = none) |
 | session residency | token snapshots are non-resident by design: they hold no context cells between decisions (no arena, no `arena_used`) |
 | multi-instance routing | `instance`/`model` body or query fields; sessions pin to the owning instance, groups are refused for session requests; all decisions run on the decision sidecar executor |
 | trie fields / values per field | 1-32 fields, 1-255 values |
+| branch fork strategy | `LLAMA_DECISION_FORK` (`auto` default, or `copy`/`restore`/`hybrid`); there is no request field for it |
+
+### 5.1 Environment overrides
+
+Each is a deployment or test knob, not part of the wire contract; a client never
+sends one. The first five are read per request and override the server flag for
+that request; `LLAMA_ARG_DECISION_PERMUTATIONS` is a server flag read at startup.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LLAMA_DECISION_MAX_BODY` | 2 MiB | request body cap; over it the request is 413, before any decode |
+| `LLAMA_DECISION_MAX_QUEUE` | `--decision-max-queue` (4) | concurrent decision cap; past the cap 429, past twice the cap 529 |
+| `LLAMA_DECISION_TIMEOUT_MS` | `--decision-timeout-ms` (0 = none) | server-side deadline for a whole decision; on expiry 503 + `Retry-After`, never a partial answer |
+| `LLAMA_DECISION_POOL_CAP` | `LABEL_POOL_CAP` (255) | clamps the **realized** answer-label pool, so it **lowers the widest question the model can answer**: a `choice` with more options than the clamped pool is a 422. A value below 2 is ignored. Narrowing it is only safe when every question that model answers fits |
+| `LLAMA_DECISION_FORK` | `auto` | forces the branch fork strategy: `auto` (hybrid on a recurrent/hybrid model when the partial state format is available, else restore; `copy` on dense attention), `restore` (save and reload the whole sequence state, exact everywhere), `hybrid` (attention `seq_cp` plus a `PARTIAL_ONLY` recurrent copy; `copy` on dense attention, where there is no recurrent part), or `copy` (attention cells only, by metadata; exact for dense attention alone). A value the model cannot satisfy is a 400, and so is `copy` on a recurrent or hybrid model. There is deliberately no request-body field for this: the fork is a property of the model, not of the question |
+| `LLAMA_ARG_DECISION_PERMUTATIONS` | `--decision-permutations` (1) | server default pass count for requests that omit `permutations`; an explicit request field always wins and the cap still applies |
 
 The protocol option cap is `DECISION_MAX_CHOICE_OPTIONS` (255); the label-pool
 cap is `LABEL_POOL_CAP` (255), equal so every option can get a label. The

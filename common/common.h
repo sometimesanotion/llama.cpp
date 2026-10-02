@@ -1023,8 +1023,11 @@ common_init_result_ptr common_init_from_model_params(common_params & params, lla
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 
-// clear LoRA adapters from context, then apply new list of adapters
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
+// clear LoRA adapters from context, then apply new list of adapters. Returns the
+// llama_set_adapters_lora status: 0 when the requested scope is installed, non-zero when it could
+// not be. An entry with a non-zero scale and no loaded adapter can never be installed, so it is
+// refused here instead of being handed to the context.
+int common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
 // fill the report-only task_name / prompt_prefix fields from the adapter's
 // loaded GGUF metadata. la.ptr must be non-null.

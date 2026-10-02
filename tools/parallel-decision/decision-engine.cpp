@@ -35,7 +35,6 @@ struct decision_field {
 
     bool  use_tree     = false;
     int   winner       = -1;
-    float path_score   = 1.0f;
     int   scored_nodes = 0;
     float temperature  = 1.0f;
 
@@ -67,7 +66,7 @@ struct decision_field {
         return {};
     }
 
-    void select(llama_token tok, float p) {
+    void select(llama_token tok) {
         const size_t depth = chosen.size();
         std::vector<int> remaining;
         for (int i : active) {
@@ -77,7 +76,6 @@ struct decision_field {
         }
         active = remaining;
         chosen.push_back(tok);
-        path_score *= p;
         scored_nodes += 1;
     }
 
@@ -162,7 +160,6 @@ struct decision_field {
         const int best = (int) (std::max_element(path_lp.begin(), path_lp.end()) - path_lp.begin());
         probs          = softmax(path_lp, temperature);
         winner         = best;
-        path_score     = probs[best];
         scored_nodes   = (int) node_prefix.size();
     }
 };
@@ -240,6 +237,31 @@ size_t engine::resident_warm_cells(llama_seq_id except) const {
         resident += (size_t) std::max<llama_pos>(warm_slots_[i].pos, 0);
     }
     return resident;
+}
+
+size_t engine::peak_kv_cells(size_t persistent, size_t group, size_t trunk_len,
+                             size_t branch_wave, size_t branch_len) {
+    return persistent + group * trunk_len + branch_wave * branch_len;
+}
+
+size_t engine::max_branch_tokens(const compiled_fields & plan) {
+    size_t max_branch = 0;
+    for (const auto & fd : plan.p->fields) {
+        for (const auto & p : fd.paths) {
+            max_branch = std::max(max_branch, p.size());
+        }
+    }
+    return max_branch;
+}
+
+void engine::check_decision_capacity(size_t peak, llama_seq_id resident_except) const {
+    const size_t resident = resident_warm_cells(resident_except);
+    const size_t budget = (size_t) llama_n_ctx(ctx) > resident ? (size_t) llama_n_ctx(ctx) - resident : 0;
+    if (peak > budget) {
+        throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
+                             " tokens but the context holds " + std::to_string(budget) +
+                             " (raise --ctx-size)");
+    }
 }
 
 engine::engine(llama_context * ctx, llama_seq_id seq_base, int n_seqs, int n_warm)
@@ -491,18 +513,38 @@ batch_result engine::decide_warm(const tokens_t & tokens, const compiled_fields 
     if (warm_tag.empty() || warm_slots_.empty() || !opt.allow_cache) {
         return decide_batch_tokens({}, { tokens }, plan, opt);
     }
-    int slot = warm_slot_for(warm_tag);
-    bool hit = slot >= 0;
-    if (slot < 0) {
-        slot = alloc_warm_slot();
-        const llama_seq_id seq = seq_pool + (llama_seq_id) n_pool + slot;
-        decode_keep(seq, tokens);
-        warm_slots_[slot].tag = warm_tag;
-        warm_slots_[slot].pos = (llama_pos) tokens.size();
+    if (plan.p == nullptr) {
+        throw std::runtime_error("the decision plan is empty");
     }
-    touch_warm(slot);
-    const llama_seq_id seq = seq_pool + (llama_seq_id) n_pool + slot;
+    const int  slot = warm_slot_for(warm_tag);
+    const bool hit  = slot >= 0;
+    // Preflight before any slot is allocated or cleared: an over-budget warm decision must refuse
+    // without evicting a resident prefix or cold-prefilling a turn. A hit charges only the OTHER
+    // resident prefixes (the forked slot's cells are already in the peak); a miss charges every
+    // resident slot, because the one it would allocate stands in for one of them.
+    const size_t       head_len    = plan.p->plan_common.size();
+    const size_t       max_branch  = max_branch_tokens(plan);
+    const size_t       branch_wave = std::min((size_t) n_pool, (size_t) plan.branches);
+    const llama_seq_id resident_except = hit ? seq_pool + (llama_seq_id) n_pool + slot : (llama_seq_id) -1;
+    check_decision_capacity(peak_kv_cells(tokens.size(), 1, head_len, branch_wave, head_len + max_branch),
+                            resident_except);
+    int    use_slot       = slot;
+    double cold_prefill_ms = 0.0;
+    if (!hit) {
+        use_slot = alloc_warm_slot();
+        const llama_seq_id seq = seq_pool + (llama_seq_id) n_pool + use_slot;
+        const auto         t0  = std::chrono::steady_clock::now();
+        decode_keep(seq, tokens);
+        cold_prefill_ms = ms_since(t0);
+        warm_slots_[use_slot].tag = warm_tag;
+        warm_slots_[use_slot].pos = (llama_pos) tokens.size();
+    }
+    touch_warm(use_slot);
+    const llama_seq_id seq = seq_pool + (llama_seq_id) n_pool + use_slot;
     batch_result b = decide_batch_from_seq(seq, (llama_pos) tokens.size(), plan, opt);
+    // A miss paid for the cold prefill before the fork; bill it to the same accounting a hit's
+    // resident fork reports, so prefill_ms covers every prefill the request performed.
+    b.prefill_ms += cold_prefill_ms;
     b.warm_hit = hit;
     return b;
 }
@@ -609,7 +651,16 @@ std::vector<engine::branch_score> engine::score_branches(const std::vector<branc
     // A single branch does not need its own sequence: decode it on the trunk and trim afterwards.
     // Only bypass when the branch fits one batch; an oversize branch falls through to the chunked
     // path, which rejects it as a capacity error instead of overflowing llama_decode.
-    if (allow_bypass && branches.size() == 1 && active_fork_ == fork_kind::copy &&
+    //
+    // The bypass is exact only for a copy fork. It decodes on the trunk, so the trunk must be
+    // restored to its pre-branch state before any later round of a greedy field decodes on it
+    // again. A copy fork trims exactly the branch's attention cells and keeps the prefix. On a
+    // recurrent or hybrid model the trunk also advances state outside the KV cache, which a trim
+    // cannot undo and the recurrent-only partial parent does not restore, so a later round would
+    // decode on a corrupted trunk. A full restore is exact, but it was measured no faster than the
+    // fork it replaces on every reference model, so the bypass stays dense-only.
+    const bool bypass_has_exact_trim = active_fork_ == fork_kind::copy;
+    if (allow_bypass && branches.size() == 1 && bypass_has_exact_trim &&
         branches[0].toks.size() <= (size_t) llama_n_batch(ctx)) {
         const llama_seq_id seq  = branches[0].trunk;
         const auto &       toks = branches[0].toks;
@@ -823,7 +874,6 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
         total += fd.use_tree ? fd.tree_rows() : (int) (fd.suffix.size() + max_path);
     }
 
-    plan.field_count          = fields.size();
     plan.suffix_tokens        = suffix_tokens;
     plan.common_suffix_tokens = plan_common.size();
     plan.leaf_suffix_tokens   = leaf_suffix_tokens;
@@ -831,11 +881,6 @@ compiled_fields engine::compile_fields(const std::vector<field_input> & inputs, 
     plan.branches             = branches;
     plan.p->plan_common       = std::move(plan_common);
     return plan;
-}
-
-batch_result engine::decide_batch(const std::string & shared_text, const std::vector<std::string> & contexts,
-                                  const std::vector<field_input> & inputs, const options & opt) {
-    return decide_batch(compile_fields(inputs, opt), shared_text, contexts, opt);
 }
 
 batch_result engine::decide_batch(const compiled_fields &          plan,
@@ -883,7 +928,6 @@ batch_result engine::decide_batch_tokens(const tokens_t &              shared,
     yield_ = opt.yield;
     llama_synchronize(ctx); // drain any work left by the previous decision before reusing sequences
     check_cancel();
-    const std::vector<decision_field> & fields          = plan.p->fields;
     const tokens_t &                    plan_common     = plan.p->plan_common;
     const int                           total           = plan.rows;
     const int                           branches        = plan.branches;
@@ -910,12 +954,7 @@ batch_result engine::decide_batch_tokens(const tokens_t &              shared,
     for (const auto & t : tails) {
         max_tail = std::max(max_tail, t.size());
     }
-    size_t max_branch = 0;
-    for (const auto & fd : fields) {
-        for (const auto & p : fd.paths) {
-            max_branch = std::max(max_branch, p.size());
-        }
-    }
+    const size_t max_branch = max_branch_tokens(plan);
 
     // Bounded decision context: reject a request whose peak KV use cannot fit before touching the
     // cache, so the failure is a clean client error. The peak counts only this request's own
@@ -929,16 +968,8 @@ batch_result engine::decide_batch_tokens(const tokens_t &              shared,
     const size_t n_free    = (size_t) std::max(0, n_pool - (int) group);
     const size_t branch_wave = std::min(n_free, (size_t) branches * group);
     const size_t trunk_len   = shared.size() + max_tail;
-    const size_t peak        = shared.size()
-                             + group * trunk_len
-                             + branch_wave * (trunk_len + max_branch);
-    const size_t resident = resident_warm_cells(-1);
-    const size_t budget = (size_t) llama_n_ctx(ctx) > resident ? (size_t) llama_n_ctx(ctx) - resident : 0;
-    if (peak > budget) {
-        throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
-                             " tokens but the context holds " + std::to_string(budget) +
-                             " (raise --ctx-size)");
-    }
+    check_decision_capacity(
+        peak_kv_cells(shared.size(), group, trunk_len, branch_wave, trunk_len + max_branch), -1);
 
     const auto t0 = std::chrono::steady_clock::now();
     out.cache_hit = prepare_prefix(shared, opt.allow_cache, opt.cache_tag);
@@ -996,9 +1027,6 @@ void engine::run_trunk_wave(batch_result & out, const compiled_fields & plan, co
                             bool allow_bypass) {
     const std::vector<decision_field> & fields             = plan.p->fields;
     const std::vector<size_t> &         field_first        = plan.p->field_first;
-    const int                           total              = plan.rows;
-    const size_t                        suffix_tokens      = plan.suffix_tokens;
-    const size_t                        leaf_suffix_tokens = plan.leaf_suffix_tokens;
     const size_t                        n_group            = runs.size();
     if (n_group == 0) {
         return;
@@ -1065,10 +1093,11 @@ void engine::run_trunk_wave(batch_result & out, const compiled_fields & plan, co
             if (fd.use_tree) {
                 tree_scores[i][f].push_back(scores[row].cand_logits);
             } else {
+                // a greedy field takes the argmax of its round's candidate logits; the round-1
+                // winner is the field's answer and later rounds only narrow the surviving options
                 const auto & s    = scores[row].cand_logits;
-                const auto   p    = softmax(s, fd.temperature);
                 const int    best = (int) (std::max_element(s.begin(), s.end()) - s.begin());
-                fd.select(todo[row].cands[best], p[best]);
+                fd.select(todo[row].cands[best]);
             }
         }
         if (first) {
@@ -1085,18 +1114,14 @@ void engine::run_trunk_wave(batch_result & out, const compiled_fields & plan, co
     clear_seqs(seq_pool, (int) n_group);
     for (size_t i = 0; i < n_group; ++i) {
         result & r = out.items[runs[i].out_index];
-        r.context_tokens       = runs[i].context_tokens;
-        r.rows                 = total;
-        r.suffix_tokens        = suffix_tokens;
-        r.common_suffix_tokens = plan.common_suffix_tokens;
-        r.leaf_suffix_tokens   = leaf_suffix_tokens;
+        r.context_tokens = runs[i].context_tokens;
         std::vector<field_result> scored;
         scored.reserve(state[i].size());
         for (auto & fd : state[i]) {
             if (fd.use_tree && fd.probs.empty()) {
                 fd.finish_tree({});
             }
-            scored.push_back({ fd.winner, fd.path_score, fd.scored_nodes, fd.use_tree, fd.probs });
+            scored.push_back({ fd.winner, fd.scored_nodes, fd.probs });
         }
         r.fields.resize(field_first.size());
         for (size_t f = 0; f < field_first.size(); ++f) {
@@ -1144,27 +1169,16 @@ batch_result engine::decide_batch_from_seq(llama_seq_id src, llama_pos base_pos,
     out.leaf_suffix_tokens   = plan.leaf_suffix_tokens;
     out.items.resize(1);
 
-    size_t max_branch = 0;
-    for (const auto & fd : plan.p->fields) {
-        for (const auto & p : fd.paths) {
-            max_branch = std::max(max_branch, p.size());
-        }
-    }
+    const size_t max_branch = max_branch_tokens(plan);
     // The source occupies cells up to base_pos and the trunk copies them, so the peak is the
     // source plus the head and the branch suffixes decoded above it. The source's own cells are
     // already inside that peak, so only the OTHER resident warm prefixes are subtracted from the
     // window; charging the source twice would reject requests that fit. Reject an over-budget
     // request before touching the cache; the decode rc==1 path is the actual guarantee.
     const size_t branch_wave = std::min((size_t) n_pool, (size_t) plan.branches);
-    const size_t peak        = (size_t) std::max<llama_pos>(base_pos, 0) + head.size()
-                             + branch_wave * (head.size() + max_branch);
-    const size_t resident    = resident_warm_cells(src);
-    const size_t budget      = (size_t) llama_n_ctx(ctx) > resident ? (size_t) llama_n_ctx(ctx) - resident : 0;
-    if (peak > budget) {
-        throw capacity_error("decision context budget exceeded: the request needs up to " + std::to_string(peak) +
-                             " tokens but the context holds " + std::to_string(budget) +
-                             " (raise --ctx-size)");
-    }
+    check_decision_capacity(
+        peak_kv_cells((size_t) std::max<llama_pos>(base_pos, 0), 1, head.size(), branch_wave, head.size() + max_branch),
+        src);
 
     // A restore or hybrid fork loads the parent from a saved state; a copy fork ignores it. Saving
     // the live source is read-only for `src`.

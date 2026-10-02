@@ -1,0 +1,25 @@
+{
+  "system_text": "Select the requested field value from its allowed values, based on the context. Respond with the JSON value only.\n\nFields:\n\"team\": owning team\nAllowed values: \"platform-frontend\", \"platform-backend\", \"platform-infra\"\n\"active\": is the incident active\nAllowed values: true, false\n\"count\": affected rows\nAllowed values: 1, 2, 3, 4\n\"impact\": impact factor\nAllowed values: 0.0, 0.5, 1.0\nAnswer from the context.",
+  "scored_lines": {
+    "team": [
+      "  \"team\": \"platform-frontend\"\n",
+      "  \"team\": \"platform-backend\"\n",
+      "  \"team\": \"platform-infra\"\n"
+    ],
+    "active": [
+      "  \"active\": true\n",
+      "  \"active\": false\n"
+    ],
+    "count": [
+      "  \"count\": 1\n",
+      "  \"count\": 2\n",
+      "  \"count\": 3\n",
+      "  \"count\": 4\n"
+    ],
+    "impact": [
+      "  \"impact\": 0.0\n",
+      "  \"impact\": 0.5\n",
+      "  \"impact\": 1.0\n"
+    ]
+  }
+}

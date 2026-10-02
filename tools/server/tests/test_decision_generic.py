@@ -357,6 +357,103 @@ def run_checks(server):
         env.check(status == 422, f"a missing request part is a 422: {status} {text[:160]}")
         env.check(needle in text, f"the refusal names {needle!r}: {text[:160]}")
 
+    # 10. The knobs the generic shape shares with the Jev shape. They used to be parsed and then
+    #     ignored here; both shapes now resolve them the same way, so each accepted value must move
+    #     the answer in the direction it names. Nothing below asserts a particular answer, only that
+    #     the knob is honoured.
+    schema = {
+        "active":   {"type": "boolean", "description": "is the incident active"},
+        "severity": {"type": "enum", "description": "incident severity", "enum": ["low", "medium", "high"]},
+        "count":    {"type": "integer", "description": "affected rows", "minimum": 1, "maximum": 4},
+    }
+
+    def answers_of(**extra):
+        status, text = post_schema(server, schema, **extra)
+        env.check(status == 200, f"the {sorted(extra)} status {status}: {text[:200]}")
+        return json.loads(text)["answers"] if status == 200 else None
+
+    # a forced greedy mode scores the field by argmax, so it reports the point mass it chose
+    greedy = answers_of(mode="greedy", diagnostics=True)
+    if greedy is not None:
+        check_record(greedy["active"], [True, False], False, "greedy boolean", diagnostics=True)
+        env.check(all(rec["scored"] == "argmax" for rec in greedy.values()),
+                  f"mode greedy scores every field by argmax: "
+                  f"{ {k: v['scored'] for k, v in greedy.items()} }")
+    # a tree_max below the widest value space moves that field to greedy and leaves the narrow ones
+    narrow = answers_of(mode="auto", tree_max=2)
+    if narrow is not None:
+        check_record(narrow["severity"], ["low", "medium", "high"], False, "tree_max enum")
+        env.check(narrow["severity"]["scored"] == "argmax",
+                  f"tree_max 2 puts a three-value field on the greedy path: {narrow['severity']['scored']}")
+        env.check(narrow["active"]["scored"] == "tree",
+                  f"tree_max 2 leaves a two-value field on the trie: {narrow['active']['scored']}")
+    # a forced tree mode keeps the distribution however narrow the bound
+    tree = answers_of(mode="tree", tree_max=2)
+    if tree is not None:
+        env.check(all(rec["scored"] == "tree" for rec in tree.values()),
+                  f"mode tree keeps every field on the trie: { {k: v['scored'] for k, v in tree.items()} }")
+
+    # the reported profile follows the request, and never moves a probability
+    default_answers = answers_of()
+    jev_answers = answers_of(confidence_profile="jev")
+    local_answers = answers_of(confidence_profile="local")
+    if default_answers and jev_answers and local_answers:
+        env.check([jev_answers[k]["confidence"] for k in sorted(jev_answers)] ==
+                  [default_answers[k]["confidence"] for k in sorted(default_answers)],
+                  "an explicit jev profile is what the default already reports")
+        env.check(any(abs(local_answers[k]["confidence"] - default_answers[k]["confidence"]) > 1e-9
+                      for k in local_answers),
+                  "the local profile reports a different concentration")
+
+    # temperature is argmax-invariant but not distribution-invariant: a colder field must flatten
+    hot = answers_of(temperature=1.0)
+    cold = answers_of(temperature=0.05)
+    if hot and cold:
+        env.check(all(hot[k]["value"] == cold[k]["value"] for k in hot),
+                  "a temperature change does not move a winner")
+        env.check(any(cold[k]["confidence"] != hot[k]["confidence"] for k in hot),
+                  "a colder temperature sharpens the reported concentration")
+
+    # per-type temperatures resolve against the field's own type, not globally: only the numeric
+    # fields read the `integer` override
+    typed = answers_of(temperatures={"integer": 0.05})
+    if typed and default_answers:
+        numeric_changed = [k for k in typed
+                           if typed[k]["type"] in ("integer", "number")
+                           and typed[k]["probabilities"] != default_answers[k]["probabilities"]]
+        other_unchanged = [k for k in typed
+                           if typed[k]["type"] not in ("integer", "number")
+                           and typed[k]["probabilities"] == default_answers[k]["probabilities"]]
+        env.check(numeric_changed, f"the integer override moved the numeric fields: {sorted(typed)}")
+        env.check(other_unchanged,
+                  f"the integer override left the other types alone: {sorted(typed)}")
+    # an unlisted type key is still refused: the wire vocabulary is the five primitives
+    status, text = post_schema(server, schema, temperatures={"boolean": 0.5})
+    env.check(status == 422, f"an unlisted temperatures key is refused: {status} {text[:160]}")
+    env.check("unknown field" in text, f"the refusal names the rule: {text[:160]}")
+
+    # order de-biasing: more passes is more work, visible in the reported rounds, and the answer is
+    # still a well-formed record over the same value space
+    one_status, one_text = post_schema(server, schema, diagnostics=True)
+    env.check(one_status == 200, f"the one-pass status {one_status}: {one_text[:200]}")
+    two_status, two_text = post_schema(server, schema, permutations=2, diagnostics=True)
+    env.check(two_status == 200, f"the two-pass status {two_status}: {two_text[:200]}")
+    if one_status == 200 and two_status == 200:
+        one_doc, two_doc = json.loads(one_text), json.loads(two_text)
+        allowed = {
+            "active":   [True, False],
+            "severity": ["low", "medium", "high"],
+            "count":    list(range(1, 5)),
+        }
+        env.check(two_doc["timings"]["rounds"] >= one_doc["timings"]["rounds"],
+                  f"two passes score at least as many rounds as one "
+                  f"({one_doc['timings']['rounds']} -> {two_doc['timings']['rounds']})")
+        for name, rec in two_doc["answers"].items():
+            check_record(rec, allowed[name], rec["type"] in ("integer", "number"), f"two-pass {name}",
+                         diagnostics=True)
+            env.check(set(rec["probabilities"]) == set(one_doc["answers"][name]["probabilities"]),
+                      f"two passes cover the same value space as one: {sorted(rec['probabilities'])}")
+
     # 11. A session: the schema is answered against a prefilled slot without re-prefilling it.
     env.prefill_slot(server, 0, env.LETTER_SYSTEM, "State:\n" + STATE + "\n")
     schema = {"severity": {"type": "enum", "description": "incident severity",

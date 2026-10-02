@@ -2541,31 +2541,17 @@ private:
     // so it must use the adapter set that conditioned that K/V: decoding it under base weights
     // would attend adapter-conditioned cells with base queries. Chat re-applies its own set
     // before every batch, so the scope set here never leaks. `scope` is the adapter list to
-    // decode under; null means the base model.
-    void decision_scope_adapters(std::vector<common_adapter_lora_info> * scope) {
+    // decode under; null means the base model. `scope_name` is the identity diagnostics report
+    // for that list ("" = base), so a refusal names the scope the request asked for.
+    void decision_scope_adapters(std::vector<common_adapter_lora_info> * scope,
+                                 const std::string &                 scope_name) {
         if (!ctx_tgt) {
             return;
         }
         // common_set_adapter_lora takes a mutable reference; it only reads the entries
         std::vector<common_adapter_lora_info> base;
-        common_set_adapter_lora(ctx_tgt, scope != nullptr ? *scope : base);
-    }
-
-    // The identity of the active adapter set for a slot: "" for the base model, else a hash of the
-    // enabled (name, scale) pairs. A retained turn captured under one scope is never answered under
-    // another, so the session identity records this and resolve refuses a scope change.
-    static std::string adapter_scope_of(const std::vector<common_adapter_lora_info> & loras) {
-        std::string scope;
-        for (const auto & lora : loras) {
-            if (lora.scale <= 0.0f) {
-                continue;
-            }
-            scope += lora.path + "@" + std::to_string(lora.scale) + ";";
-        }
-        if (scope.empty()) {
-            return std::string();
-        }
-        return "adapter-scope-v1:" + std::to_string(llama_decision::fnv1a64(scope));
+        llama_decision::require_adapter_scope(scope_name,
+                                              common_set_adapter_lora(ctx_tgt, scope != nullptr ? *scope : base));
     }
 
     // One engine on the shared full-logits context (seq ids above the chat slots), created on
@@ -2762,7 +2748,7 @@ private:
             throw llama_decision::semantic_error(
                 "a session decision is served only by the decision sidecar executor; no token snapshot was routed");
         };
-        // The adapter scope a session decodes under: the pool-resolved set of the token snapshot;
+// The adapter scope a session decodes under: the pool-resolved set of the token snapshot;
         // a stateless decision decodes base.
         auto session_scope = [&](const session_resolution & s) -> std::vector<common_adapter_lora_info> * {
             if (s.snapshot && snapshot != nullptr) {
@@ -2770,34 +2756,89 @@ private:
             }
             return nullptr;
         };
+        // One parse for both shapes. Every field the two share - evidence, session, temperature,
+        // per-type temperatures, permutations, the reported-concentration profile and diagnostics -
+        // is resolved here, once, whichever shape the body selected.
+        llama_decision::decision_request req = llama_decision::parse_decision_request(body);
+        // A deployment may opt in to more order-de-bias passes by default; the request field always
+        // wins, so an explicit value is never overridden. A cost/quality knob, never an answer gate.
+        if (!body.contains("permutations") || body.at("permutations").is_null()) {
+            req.envelope.knobs.permutations = params_base.n_decision_permutations;
+        }
+        // the additive diagnostics object (contract identity, provenance) is opt-in;
+        // the default envelope must stay the strict Jev shape
+        const bool             want_diagnostics = req.envelope.diagnostics;
+        const session_resolution sess           = resolve_session(req.envelope.session);
+        const bool             is_session       = sess.snapshot;
+        if (is_session && !req.envelope.evidence.contexts.empty()) {
+            throw std::invalid_argument("a session decision scores exactly one context");
+        }
+        // Whether this server is configured with adapters. Distinct from the decode scope below: a
+        // decision is deliberately base-scoped, so with an adapter loaded this is true while
+        // adapter_scope stays "base".
+        const bool adapters_on = decision.adapters_configured(params_base.lora_adapters);
+        // One full-logits engine on the shared context, shared by both shapes.
+        llama_decision::engine &  eng  = ensure_decision_engine();
+        llama_decision::options   opt  = decision_engine_options(eng, is_session, cancel_flag);
+        // A deployment may ship fitted per-type temperatures; the request's own `temperatures` wins.
+        if (!params_base.decision_temperature.empty()) {
+            if (!decision.decision_temp_loaded) {
+                std::ifstream in(params_base.decision_temperature);
+                if (!in) {
+                    throw std::runtime_error("cannot read --decision-temperature file: " + params_base.decision_temperature);
+                }
+                std::stringstream ss;
+                ss << in.rdbuf();
+                decision.decision_temp_profile = llama_decision::parse_temperature_profile(json::parse(ss.str()));
+
+                const llama_decision::temperature_provenance current =
+                    llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
+                                                                chat_params.tmpls.get(), chat_params.use_jinja);
+                try {
+                    llama_decision::validate_temperature_profile(decision.decision_temp_profile, current);
+                } catch (const llama_decision::semantic_error & e) {
+                    // a stale profile is a server configuration problem, not a client error
+                    throw std::runtime_error(std::string("decision temperature profile: ") + e.what());
+                }
+                decision.decision_temp_loaded = true;
+            }
+            if (!req.envelope.knobs.temperatures.is_object()) {
+                json temps = json::object();
+                for (const auto & kv : decision.decision_temp_profile.temperatures) {
+                    temps[kv.first] = kv.second;
+                }
+                req.envelope.knobs.temperatures = temps;
+            }
+        }
+        // The decode runs inside a yield so metrics and slot requests are served while it computes.
+        // The adapter scope is installed here, once, so both shapes decode under exactly the scope
+        // the session resolved - the readout may not report a scope that was not applied.
+        auto decode_scoped = [&](auto && fn) {
+            queue_tasks.yield_to_queue([&]() {
+                decision_scope_adapters(session_scope(sess), sess.adapter_scope);
+                fn();
+            });
+        };
+
         // Generic front-end: a JSON schema or compact typed fields compiled into engine-facing
         // field inputs and scored by the same engine the Jev readout uses. The evidence source
         // (state, contexts, session) is orthogonal to the front-end.
         if (shape == llama_decision::request_shape::generic) {
-            llama_decision::generic_request greq = llama_decision::parse_generic_request(body);
-            const session_resolution          sess = resolve_session(greq.session);
-            const bool                        is_session = sess.snapshot;
-            if (is_session && !greq.evidence.contexts.empty()) {
-                throw std::invalid_argument("a session decision scores exactly one context");
-            }
-            // One full-logits engine on the shared context, shared with the Jev path.
-            llama_decision::engine & eng = ensure_decision_engine();
-            llama_decision::options gopt = decision_engine_options(eng, is_session, cancel_flag);
-            gopt.mode        = greq.mode;
-            gopt.tree_max    = greq.tree_max;
-            gopt.allow_cache = greq.allow_cache;
+            opt.mode        = req.mode;
+            opt.tree_max    = req.tree_max;
+            opt.allow_cache = req.allow_cache;
 
-            llama_decision::compiled_schema cs = llama_decision::compile_schema(greq.schema, greq.instructions);
+            llama_decision::compiled_schema cs = llama_decision::compile_schema(req.schema, req.instructions,
+                                                                                req.envelope.knobs);
             llama_decision::batch_result    b;
-            queue_tasks.yield_to_queue([&]() {
-                decision_scope_adapters(session_scope(sess));
+            decode_scoped([&]() {
                 if (sess.snapshot) {
                     // A session appends the schema as a fresh user turn, so the snapshot framing and
                     // the stateless framing share one plan; the token snapshot re-prefills the owned
                     // turn tokens (mechanism B).
                     const auto turn = llama_decision::split_user_turn(chat_params.tmpls.get(), chat_params.use_jinja);
                     const auto sinputs = llama_decision::session_field_inputs(cs, turn.first, turn.second);
-                    llama_decision::options so = gopt;
+                    llama_decision::options so = opt;
                     so.cache_tag = llama_decision::make_prefix_tag(cs.system_text, turn.second,
                                                                    llama_decision::GENERIC_PROMPT_VERSION);
                     const auto plan = eng.compile_fields(sinputs, so);
@@ -2805,12 +2846,12 @@ private:
                 } else {
                     // stateless: one rendered evidence per context, or the single state
                     std::vector<std::string> evidence;
-                    if (!greq.evidence.contexts.empty()) {
-                        for (const auto & c : greq.evidence.contexts) {
+                    if (!req.envelope.evidence.contexts.empty()) {
+                        for (const auto & c : req.envelope.evidence.contexts) {
                             evidence.push_back(llama_decision::render_state(c));
                         }
                     } else {
-                        evidence.push_back(llama_decision::render_state(greq.evidence.state));
+                        evidence.push_back(llama_decision::render_state(req.envelope.evidence.state));
                     }
                     std::string shared;
                     std::vector<std::string> dynamic;
@@ -2824,10 +2865,10 @@ private:
                         }
                         dynamic.push_back(parts.second);
                     }
-                    gopt.cache_tag = llama_decision::generic_cache_tag(
+                    opt.cache_tag = llama_decision::generic_cache_tag(
                         chat_params.tmpls.get(), chat_params.use_jinja, cs.system_text);
-                    const auto plan = eng.compile_fields(cs.inputs, gopt);
-                    b = eng.decide_batch(plan, shared, dynamic, gopt);
+                    const auto plan = eng.compile_fields(cs.inputs, opt);
+                    b = eng.decide_batch(plan, shared, dynamic, opt);
                 }
             });
 
@@ -2836,10 +2877,10 @@ private:
             // extra usage counters and timings are additive diagnostics, so they are dropped unless
             // the caller opted in - exactly the Jev discipline.
             const decision_accounting acct = decision_accounting_of(b);
-            const bool                  want_diagnostics = greq.diagnostics;
             std::vector<json>           per_context;
             per_context.reserve(b.items.size());
-            for (const auto & item : b.items) {
+            for (auto & item : b.items) {
+                llama_decision::mean_permuted_passes(cs, item);
                 per_context.push_back(llama_decision::assemble(cs, item, want_diagnostics));
             }
             // the strict envelope carries only input/output tokens; the extra counters are additive
@@ -2857,7 +2898,7 @@ private:
                 return jev_usage;
             };
             json out = json::object();
-            out["model"] = decision_model_echo(greq.model, model_name);
+            out["model"] = decision_model_echo(req.envelope.model, model_name);
             if (per_context.size() == 1) {
                 out["answers"] = per_context[0];
                 out["usage"]   = scoped_usage(0);
@@ -2876,197 +2917,136 @@ private:
         }
         // Decision shape: state + typed questions, scored as one next-token choice over the
         // verified letter labels, sharing one framed state prefix across all questions.
-        if (shape == llama_decision::request_shape::jev) {
-            llama_decision::decision_request req = llama_decision::parse_decision_request(body);
-            // A deployment may opt in to more order-de-bias passes by default; the request field
-            // always wins, so an explicit value is never overridden. This is a cost/quality knob,
-            // never an answer gate.
-            if (!body.contains("permutations") || body.at("permutations").is_null()) {
-                req.permutations = params_base.n_decision_permutations;
-            }
-            // the additive diagnostics object (contract identity, provenance) is opt-in;
-            // the default envelope must stay the strict Jev shape
-            const bool                              want_diagnostics = req.diagnostics;
-            const session_resolution                  sess = resolve_session(req.session);
-            const bool                                is_session = sess.snapshot;
-            if (is_session && !req.contexts.empty()) {
-                throw std::invalid_argument("a session decision scores exactly one context");
-            }
-            // Whether this server is configured with adapters. Distinct from the decode scope
-            // below: a decision is deliberately base-scoped, so with an adapter loaded this is
-            // true while adapter_scope stays "base".
-            const bool adapters_on = decision.adapters_configured(params_base.lora_adapters);
-            // One full-logits engine on the shared context.
-            llama_decision::engine & eng = ensure_decision_engine();
-            llama_decision::readout_sources sources;
-            sources.full = &eng;
-            llama_decision::session_source session_source;
-            if (sess.snapshot) {
-                session_source.tokens   = sess.snapshot_tokens;
-                session_source.warm_tag = sess.warm_tag;
-                sources.session         = &session_source;
-            }
-            if (!decision.decision_label_vocab) {
-                decision.decision_label_vocab = llama_decision::make_llama_label_vocab(
-                    llama_model_get_vocab(llama_get_model(ctx_tgt)));
-                try {
-                    const auto parts = llama_decision::render_letter_prompt(
-                        chat_params.tmpls.get(), chat_params.use_jinja, llama_decision::letter_system_text());
-                    const std::string tail = llama_decision::letter_answer_tail(parts.second);
-                    size_t pool_cap = llama_decision::LABEL_POOL_CAP;
-                    if (const char * e = std::getenv("LLAMA_DECISION_POOL_CAP")) {
-                        const long v = std::atol(e);
-                        if (v >= 2) {
-                            pool_cap = (size_t) v;
-                        }
+        llama_decision::readout_sources sources;
+        sources.full = &eng;
+        llama_decision::session_source session_source;
+        if (sess.snapshot) {
+            session_source.tokens   = sess.snapshot_tokens;
+            session_source.warm_tag = sess.warm_tag;
+            sources.session         = &session_source;
+        }
+        if (!decision.decision_label_vocab) {
+            decision.decision_label_vocab = llama_decision::make_llama_label_vocab(
+                llama_model_get_vocab(llama_get_model(ctx_tgt)));
+            try {
+                const auto parts = llama_decision::render_letter_prompt(
+                    chat_params.tmpls.get(), chat_params.use_jinja, llama_decision::letter_system_text());
+                const std::string tail = llama_decision::letter_answer_tail(parts.second);
+                size_t pool_cap = llama_decision::LABEL_POOL_CAP;
+                if (const char * e = std::getenv("LLAMA_DECISION_POOL_CAP")) {
+                    const long v = std::atol(e);
+                    if (v >= 2) {
+                        pool_cap = (size_t) v;
                     }
-                    decision.decision_labels = llama_decision::build_label_pool(*decision.decision_label_vocab, tail, pool_cap);
-                    llama_decision::verify_label_pool(*decision.decision_label_vocab, decision.decision_labels, tail);
-                    SRV_INF("decision label pool: %zu labels (cap %zu)\n", decision.decision_labels.size(),
-                            llama_decision::LABEL_POOL_CAP);
-                    const std::string template_hash = llama_decision::make_prefix_tag(
-                        parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
-                    decision.decision_contract = llama_decision::decision_contract_hash(
-                        model_name, template_hash, llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
-                    SRV_INF("decision contract: %s\n", decision.decision_contract.c_str());
-                    if (!params_base.decision_contract.empty() && params_base.decision_contract != decision.decision_contract) {
-                        decision.decision_label_error = "decision contract mismatch: expected " + params_base.decision_contract +
-                                               ", running " + decision.decision_contract;
-                    }
-                } catch (const std::exception & e) {
-                    decision.decision_label_error = e.what();
                 }
+                decision.decision_labels = llama_decision::build_label_pool(*decision.decision_label_vocab, tail, pool_cap);
+                SRV_INF("decision label pool: %zu labels (cap %zu)\n", decision.decision_labels.size(), pool_cap);
+                const std::string template_hash = llama_decision::make_prefix_tag(
+                    parts.first, parts.second, llama_decision::LETTER_PROMPT_VERSION);
+                decision.decision_contract = llama_decision::decision_contract_hash(
+                    model_name, template_hash, llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
+                SRV_INF("decision contract: %s\n", decision.decision_contract.c_str());
+                if (!params_base.decision_contract.empty() && params_base.decision_contract != decision.decision_contract) {
+                    decision.decision_label_error = "decision contract mismatch: expected " + params_base.decision_contract +
+                           ", running " + decision.decision_contract;
+                }
+            } catch (const std::exception & e) {
+                decision.decision_label_error = e.what();
             }
-            if (!decision.decision_label_error.empty()) {
-                throw llama_decision::unsupported_error(
-                    "this model cannot serve decision questions: " + decision.decision_label_error);
-            }
+        }
+        if (!decision.decision_label_error.empty()) {
+            throw llama_decision::unsupported_error(
+                "this model cannot serve decision questions: " + decision.decision_label_error);
+        }
 
-            if (!params_base.decision_temperature.empty()) {
-                if (!decision.decision_temp_loaded) {
-                    std::ifstream in(params_base.decision_temperature);
-                    if (!in) {
-                        throw std::runtime_error("cannot read --decision-temperature file: " + params_base.decision_temperature);
-                    }
-                    std::stringstream ss;
-                    ss << in.rdbuf();
-                    decision.decision_temp_profile = llama_decision::parse_temperature_profile(json::parse(ss.str()));
+        llama_decision::readout_metrics metrics;
+        std::vector<std::vector<std::vector<float>>> all_probs;
+        // run inside a yield so metrics/slot requests are served while the decision computes
+        decode_scoped([&]() {
+            all_probs = llama_decision::letter_readout_multi(sources, *decision.decision_label_vocab,
+                                                             chat_params.tmpls.get(),
+                                                             chat_params.use_jinja, req,
+                                                             decision.decision_labels, opt, &metrics);
+        });
 
-                    const llama_decision::temperature_provenance current =
-                        llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
-                                                                    chat_params.tmpls.get(), chat_params.use_jinja);
-                    try {
-                        llama_decision::validate_temperature_profile(decision.decision_temp_profile, current);
-                    } catch (const llama_decision::semantic_error & e) {
-                        // a stale profile is a server configuration problem, not a client error
-                        throw std::runtime_error(std::string("decision temperature profile: ") + e.what());
-                    }
-                    decision.decision_temp_loaded = true;
-                }
-                if (!req.temperatures.is_object()) {
-                    json temps = json::object();
-                    for (const auto & kv : decision.decision_temp_profile.temperatures) {
-                        temps[kv.first] = kv.second;
-                    }
-                    req.temperatures = temps;
-                }
-            }
+        const bool              multi = !req.envelope.evidence.contexts.empty();
+        const decision_accounting acct = decision_accounting_of(metrics);
+        const json               usage   = decision_usage(acct, acct.context_tokens);
+        const json               timings = decision_timings(acct);
 
-            llama_decision::options jopt = decision_engine_options(eng, is_session, cancel_flag);
-            llama_decision::readout_metrics metrics;
-            std::vector<std::vector<std::vector<float>>> all_probs;
-            // run inside a yield so metrics/slot requests are served while the decision computes
-            queue_tasks.yield_to_queue([&]() {
-                // the readout decodes on the shared context, scoped to the slot's adapters for a
-                // live-session fork and to the base model for a stateless request
-                decision_scope_adapters(session_scope(sess));
-                all_probs = llama_decision::letter_readout_multi(sources, *decision.decision_label_vocab,
-                                                                 chat_params.tmpls.get(),
-                                                                 chat_params.use_jinja, req,
-                                                                 decision.decision_labels, jopt, &metrics);
-            });
-
-            const bool              multi = !req.contexts.empty();
-            const decision_accounting acct = decision_accounting_of(metrics);
-            const json               usage   = decision_usage(acct, acct.context_tokens);
-            const json               timings = decision_timings(acct);
-
-            // The echoed model identity: the Jev aliases resolve to the loaded (chat slot) model; any other
-            // requested id is echoed verbatim; an omitted model defaults to the loaded model.
-            const std::string echo = decision_model_echo(req.model, model_name);
-            json decision_diagnostics = json::object();
-            if (want_diagnostics) {
-                // additive diagnostics: the readout contract identity this server is running
-                decision_diagnostics["diagnostics"] = json::object();
-                decision_diagnostics["diagnostics"]["contract_hash"]  = decision.decision_contract;
-                // the readout identity this request ran under. The contract hash covers the tokenizer
-                // and the chat template; prompt_version names the framed prompt layout.
-                decision_diagnostics["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
-                decision_diagnostics["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
-                decision_diagnostics["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
-                decision_diagnostics["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
-                decision_diagnostics["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
-                decision_diagnostics["diagnostics"]["label_pool_size"]      = (long long) metrics.label_pool_size;
-                decision_diagnostics["diagnostics"]["permutations"]         = req.permutations;
-                decision_diagnostics["diagnostics"]["adapters_configured"] = adapters_on;
-                // a live-session readout reports the scope it actually decoded under; the base
-                // scope keeps the historical "base" label. a token-snapshot session reports its
-                // captured scope; a stateless request always decodes on the base model.
-                const std::string readout_scope = sess.snapshot ? sess.adapter_scope : std::string();
-                decision_diagnostics["diagnostics"]["adapter_scope"] = readout_scope.empty() ? "base" : readout_scope;
-                const llama_decision::temperature_provenance prov =
-                    llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
-                                                                chat_params.tmpls.get(), chat_params.use_jinja);
-                decision_diagnostics["diagnostics"]["model"]          = prov.model;
-                decision_diagnostics["diagnostics"]["quantization"]   = prov.quantization;
-                decision_diagnostics["diagnostics"]["template_hash"]  = prov.template_hash;
-                decision_diagnostics["diagnostics"]["backend_flags"]  = prov.backend_flags;
+        // The echoed model identity: the Jev aliases resolve to the loaded (chat slot) model; any other
+        // requested id is echoed verbatim; an omitted model defaults to the loaded model.
+        const std::string echo = decision_model_echo(req.envelope.model, model_name);
+        json decision_diagnostics = json::object();
+        if (want_diagnostics) {
+            // additive diagnostics: the readout contract identity this server is running
+            decision_diagnostics["diagnostics"] = json::object();
+            decision_diagnostics["diagnostics"]["contract_hash"]  = decision.decision_contract;
+            // the readout identity this request ran under. The contract hash covers the tokenizer
+            // and the chat template; prompt_version names the framed prompt layout.
+            decision_diagnostics["diagnostics"]["prompt_version"] = llama_decision::LETTER_PROMPT_VERSION;
+            decision_diagnostics["diagnostics"]["prefill_ms"]     = metrics.prefill_ms;
+            decision_diagnostics["diagnostics"]["scoring_ms"]     = metrics.scoring_ms;
+            decision_diagnostics["diagnostics"]["suffix_tokens"]        = (long long) metrics.suffix_tokens;
+            decision_diagnostics["diagnostics"]["common_suffix_tokens"] = (long long) metrics.common_suffix_tokens;
+            decision_diagnostics["diagnostics"]["label_pool_size"]      = (long long) metrics.label_pool_size;
+            decision_diagnostics["diagnostics"]["permutations"]         = req.envelope.knobs.permutations;
+            decision_diagnostics["diagnostics"]["adapters_configured"] = adapters_on;
+            // a live-session readout reports the scope it actually decoded under; the base
+            // scope keeps the historical "base" label. a token-snapshot session reports its
+            // captured scope; a stateless request always decodes on the base model.
+            const std::string readout_scope = sess.snapshot ? sess.adapter_scope : std::string();
+            decision_diagnostics["diagnostics"]["adapter_scope"] = readout_scope.empty() ? "base" : readout_scope;
+            const llama_decision::temperature_provenance prov =
+                llama_decision::decision_provenance_current(model_name, params_base, llama_get_model(ctx_tgt),
+                                                            chat_params.tmpls.get(), chat_params.use_jinja);
+            decision_diagnostics["diagnostics"]["model"]          = prov.model;
+            decision_diagnostics["diagnostics"]["quantization"]   = prov.quantization;
+            decision_diagnostics["diagnostics"]["template_hash"]  = prov.template_hash;
+            decision_diagnostics["diagnostics"]["backend_flags"]  = prov.backend_flags;
+        }
+        // a session answer reports the fork it took so a caller can tell it apart from a
+        // stateless answer; these are additive and never change an answer
+        if (is_session) {
+            decision_diagnostics["session_fork"] = true;
+            decision_diagnostics["source_slot"]  = sess.source_slot;
+            decision_diagnostics["session_pos"]  = (long long) sess.pos;
+            decision_diagnostics["warm_hit"]     = metrics.warm_hit;
+            if (!sess.session_id.empty()) {
+                decision_diagnostics["session_id"] = sess.session_id;
             }
-            // a session answer reports the fork it took so a caller can tell it apart from a
-            // stateless answer; these are additive and never change an answer
-            if (is_session) {
-                decision_diagnostics["session_fork"] = true;
-                decision_diagnostics["source_slot"]  = sess.source_slot;
-                decision_diagnostics["session_pos"]  = (long long) sess.pos;
-                decision_diagnostics["warm_hit"]     = metrics.warm_hit;
-                if (!sess.session_id.empty()) {
-                    decision_diagnostics["session_id"] = sess.session_id;
-                }
-                if (!sess.turn.empty()) {
-                    decision_diagnostics["turn"] = sess.turn;
-                }
+            if (!sess.turn.empty()) {
+                decision_diagnostics["turn"] = sess.turn;
             }
-            const bool emit_diagnostics = want_diagnostics || is_session;
-            if (!multi) {
-                json out = llama_decision::assemble_decision_response(
-                    req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
-                    echo, usage, emit_diagnostics ? &decision_diagnostics : nullptr);
-                if (emit_diagnostics) {
-                    out["timings"] = timings;
-                }
-                return out;
-            }
-            // Multi-context: answers grouped per context, in request order. The `contexts` key is the
-            // one extension over the Jev single-state envelope, so a single-state client is unchanged.
-            json contexts_resp = json::array();
-            for (size_t ci = 0; ci < all_probs.size(); ++ci) {
-                json ans = llama_decision::assemble_decision_response(
-                    req, all_probs[ci], echo, decision_usage(acct, acct.context_tokens_at(ci)), nullptr);
-                contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
-            }
-            json out = json::object();
-            out["model"]    = echo;
-            out["contexts"] = contexts_resp;
+        }
+        const bool emit_diagnostics = want_diagnostics || is_session;
+        if (!multi) {
+            json out = llama_decision::assemble_decision_response(
+                req, all_probs.empty() ? std::vector<std::vector<float>>{} : all_probs[0],
+                echo, usage, emit_diagnostics ? &decision_diagnostics : nullptr);
             if (emit_diagnostics) {
                 out["timings"] = timings;
-                for (auto it = decision_diagnostics.begin(); it != decision_diagnostics.end(); ++it) {
-                    out[it.key()] = it.value();
-                }
             }
             return out;
         }
-        // unreachable: select_request_shape rejects every other body at the top
-        throw std::invalid_argument("request must be a decision request: schema, or questions with state/contexts");
+        // Multi-context: answers grouped per context, in request order. The `contexts` key is the
+        // one extension over the Jev single-state envelope, so a single-state client is unchanged.
+        json contexts_resp = json::array();
+        for (size_t ci = 0; ci < all_probs.size(); ++ci) {
+            json ans = llama_decision::assemble_decision_response(
+                req, all_probs[ci], echo, decision_usage(acct, acct.context_tokens_at(ci)), nullptr);
+            contexts_resp.push_back({ { "answers", ans.at("answers") }, { "usage", ans.at("usage") } });
+        }
+        json out = json::object();
+        out["model"]    = echo;
+        out["contexts"] = contexts_resp;
+        if (emit_diagnostics) {
+            out["timings"] = timings;
+            for (auto it = decision_diagnostics.begin(); it != decision_diagnostics.end(); ++it) {
+                out[it.key()] = it.value();
+            }
+        }
+        return out;
     }
 
     bool process_single_task(server_task && task, bool is_yielding) {
@@ -3211,8 +3191,6 @@ private:
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
                     } catch (const llama_decision::semantic_error & e) {
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST_SEMANTIC);
-                    } catch (const llama_decision::not_found_error & e) {
-                        send_error(task, e.what(), ERROR_TYPE_NOT_FOUND);
                     } catch (const std::invalid_argument & e) {
                         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
                     } catch (const common_json_error & e) {
@@ -6172,8 +6150,8 @@ void server_routes::init_routes() {
     auto post_decision_route = [this](const server_http_req & req, bool jev_only) {
         auto res = create_response();
 
-        size_t max_body = decision_max_body;
-        int    max_queue = params.decision_max_queue > 0 ? params.decision_max_queue : decision_max_queue;
+        size_t max_body  = DECISION_MAX_BODY_DEFAULT;
+        int    max_queue = params.decision_max_queue;
         if (const char * e = std::getenv("LLAMA_DECISION_MAX_BODY")) {
             const long v = std::atol(e);
             if (v > 0) {

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -155,6 +156,12 @@ struct server_decision_snapshot {
     llama_pos   base_pos = -1;                    // = tokens.size(), the continuation position
     std::string warm_tag;                         // session content hash; resident warm identity ("" = cold replay)
 };
+
+// tokens and loras are values, never views into the pool's session store: an eviction or an expiry
+// may destroy a store entry while a decision is in flight on a snapshot taken from it, and that
+// decision must still complete from its own copy.
+static_assert(std::is_same<decltype(server_decision_snapshot::tokens), std::vector<llama_token>>::value,
+              "a decision snapshot must own its tokens, not view the pool's session store");
 
 struct server_task {
     int id = -1; // to be filled by server_queue
